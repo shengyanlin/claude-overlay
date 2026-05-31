@@ -3,7 +3,7 @@
 > ### Talk to Claude Code without ever leaving the app you're in — and let it actually *see* your screen.
 
 <p align="center">
-  <img src="docs/demo.gif" alt="Claude Overlay demo — ask about an on-screen error, Claude reads the screen and your code, then offers to patch it" width="380">
+  <img src="docs/demo.gif" alt="Browsing the Google Cloud AI agent handbook, then summoning the overlay to ask what the page is about — it reads the screen, answers, and offers to translate" width="640">
 </p>
 
 **Claude Overlay** is a frameless, always-on-top chat window that floats over
@@ -34,6 +34,33 @@ so it uses your **existing Claude subscription — no API key, no metered billin
 - 🎨 **Looks the part, crisp anywhere.** Styled after the Claude desktop app,
   DPI-aware on HiDPI displays, resizable from any edge, with live **Ctrl +/–** zoom.
 - 🔒 **Local & private.** Runs entirely on your machine against your own login.
+
+## Where a floating overlay wins
+
+The CLI and the desktop app are perfect when you're already in a terminal or a chat
+window. The overlay earns its place by floating over **whatever you're doing** and
+**seeing it** — so it shines exactly where those can't:
+
+- 🖥️ **Mid-presentation.** Stay in full-screen slideshow. Summon the overlay to
+  fact-check a number, translate a term, or field an audience question on the spot —
+  then dismiss it without ever leaving the deck.
+- 🌐 **Reading in another language.** On a foreign-language page, PDF, or slide, ask
+  it to translate or explain what's on screen, *in place* — no copy-pasting into a
+  separate translator tab.
+- 📄 **Skimming something long.** "TL;DR this", "what does it say about X?" — about the
+  article, whitepaper, or PDF you're looking at, without selecting or pasting a word.
+- 🧩 **Any GUI with no terminal.** A cryptic error dialog, a settings panel, a BI
+  dashboard, a spreadsheet formula — point your screen at it and ask. It works over
+  apps that have no command line and nothing to copy.
+- 🖥️🖥️ **Across monitors.** It captures every screen, so ask it to reconcile the spec
+  on one monitor against the figure or table on the other.
+- 🎥 **On a call or screen-share.** A discreet, always-on-top helper to look things up
+  about what's being shown — without alt-tabbing away from the meeting.
+
+<p align="center">
+  <img src="docs/ui-demo.gif" alt="Collapsing the overlay to a small orb and clicking it to expand again" width="280">
+  <br><em>Not using it? It collapses to an orb that floats out of the way — click to bring it back.</em>
+</p>
 
 ```
  ┌──────────────────────────────────────────┐
