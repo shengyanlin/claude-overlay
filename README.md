@@ -10,16 +10,16 @@ window that floats over everything.
 
 ```
  ┌──────────────────────────────────────────┐
- │ ✦ Claude                          —    ✕  │  ← drag to move
+ │ ✦ Claude                        —    ✕  │  ← drag to move
  ├──────────────────────────────────────────┤
- │                          what's this error? │  ← you (right)
- │  ✦ Claude                                   │
- │     ▤ Read  screen_1.png                    │  ← it read your screen
- │  The stack trace points to a null ref on …  │  ← Claude (left)
+ │                       what's this error? │  ← you (right)
+ │  ✦ Claude                               │
+ │     ▤ Read  screen_1.png                │  ← it read your screen
+ │The stack trace points to a null ref on …│  ← Claude (left)
  ├──────────────────────────────────────────┤
- │  Reply to Claude…                      ↑   │
- │  ◉ auto-screenshot   Snap   Clear        ◢ │
- │  claude-opus-4-8[1m] ▾   ·   context 3%    │
+ │  Reply to Claude…                      ↑ │
+ │  ◉ auto-screenshot   Snap   Clear     ◢ │
+ │  claude-opus-4-8[1m] ▾   ·   context 3%  │
  └──────────────────────────────────────────┘
 ```
 
