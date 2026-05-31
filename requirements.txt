@@ -1,0 +1,3 @@
+claude-agent-sdk>=0.2.87
+pillow>=10.0
+keyboard>=0.13.5

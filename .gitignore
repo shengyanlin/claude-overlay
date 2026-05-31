@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Machine-specific launchers / shortcuts (recreate locally)
+*.lnk
+
+# Logs & scratch
+*.log
+_*.log
+_*.py
+_*.png
+
+# Runtime screenshots (the app writes these to %TEMP%, but ignore here too)
+claude_overlay_shots/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
