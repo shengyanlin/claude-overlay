@@ -2,6 +2,10 @@
 
 > ### Talk to Claude Code without ever leaving the app you're in — and let it actually *see* your screen.
 
+<p align="center">
+  <img src="docs/demo.gif" alt="Claude Overlay demo — ask about an on-screen error, Claude reads the screen and your code, then offers to patch it" width="380">
+</p>
+
 **Claude Overlay** is a frameless, always-on-top chat window that floats over
 everything you do. Hit a hotkey, ask a question, and Claude looks at your **real
 screen** — every monitor — to answer. No copy-pasting error messages, no
