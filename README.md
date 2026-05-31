@@ -15,7 +15,7 @@ window that floats over everything.
  │                       what's this error? │  ← you (right)
  │  ✦ Claude                               │
  │     ▤ Read  screen_1.png                │  ← it read your screen
- │The stack trace points to a null ref on …│  ← Claude (left)
+ │The stack trace points to a null ref on … │  ← Claude (left)
  ├──────────────────────────────────────────┤
  │  Reply to Claude…                      ↑ │
  │  ◉ auto-screenshot   Snap   Clear     ◢ │
