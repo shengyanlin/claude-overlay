@@ -90,11 +90,21 @@ so it currently runs **on Windows only**.
 The overlay has no brain of its own; it drives the `claude` command line.
 
 **Install** (pick one):
-- **npm** (needs [Node.js](https://nodejs.org/) 18+):
-  ```
-  npm install -g @anthropic-ai/claude-code
-  ```
-- **native installer** (no Node required): see the
+- **Option A — npm** (needs Node.js 18+):
+  1. Install **Node.js LTS** (bundles npm):
+     - winget: `winget install OpenJS.NodeJS.LTS`
+     - or download the LTS installer from <https://nodejs.org/>
+     - (restart your terminal afterwards so PATH updates)
+  2. Verify **Node and npm separately** — both must print a version:
+     ```
+     node --version    # e.g. v20.11.1   (must be >= v18)
+     npm --version     # e.g. 10.2.4
+     ```
+  3. Install the CLI:
+     ```
+     npm install -g @anthropic-ai/claude-code
+     ```
+- **Option B — native installer** (no Node.js needed): see the
   [Claude Code install docs](https://docs.claude.com/en/docs/claude-code/setup).
 
 **Log in** with your own Claude account (Pro/Max subscription — no API key needed):
