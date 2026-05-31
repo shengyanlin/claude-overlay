@@ -17,8 +17,9 @@ _*.png
 # Runtime screenshots (the app writes these to %TEMP%, but ignore here too)
 claude_overlay_shots/
 
-# Local launch / marketing notes (keep out of the public repo)
+# Local launch / marketing / progress notes (keep out of the public repo)
 LAUNCH_KIT.md
+PROGRESS.md
 
 # OS / editor
 .DS_Store
