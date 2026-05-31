@@ -1,12 +1,35 @@
 # Claude Overlay
 
-A frameless, **always-on-top floating chat window** for [Claude Code](https://docs.claude.com/en/docs/claude-code)
-that can **see your screen**. Ask Claude about whatever you're looking at without
-switching apps — it captures your monitors, reads them, and answers in a small
-window that floats over everything.
+> ### Talk to Claude Code without ever leaving the app you're in — and let it actually *see* your screen.
 
-> Built with Tkinter + the Claude Agent SDK. It drives **your own** `claude` CLI
-> login, so it uses **your existing Claude subscription — no API key, no extra cost.**
+**Claude Overlay** is a frameless, always-on-top chat window that floats over
+everything you do. Hit a hotkey, ask a question, and Claude looks at your **real
+screen** — every monitor — to answer. No copy-pasting error messages, no
+describing what you're staring at, no alt-tabbing to a browser. And because it
+runs the full [**Claude Code**](https://docs.claude.com/en/docs/claude-code) agent
+under the hood, it doesn't just chat — it can read, edit, and run things for you,
+right where you work.
+
+Best of all, it costs **nothing extra**: it drives **your own** `claude` CLI login,
+so it uses your **existing Claude subscription — no API key, no metered billing.**
+
+### ✨ Why you'll want it
+
+- 👁️ **It sees what you see.** Auto-captures each monitor on every message and
+  labels primary vs. secondary — just ask *"what's wrong here?"* and it looks.
+- 🪟 **Never breaks your flow.** Always-on-top and frameless; summon or dismiss it
+  from anywhere with **Ctrl+Alt+Space**, and it collapses to a tiny draggable orb
+  when you're not using it.
+- 🧠 **A real agent, not a chatbot.** Full Claude Code (Opus 4.8, **1M-token
+  context**) — it can edit files and run commands, not just answer questions.
+- 💸 **No API key, no extra cost.** Runs on your existing Claude subscription.
+- 🖼️ **Screenshots *and* pasted images.** Snap a screen on demand, or paste any
+  image with **Ctrl+V** to ask about it.
+- ⚡ **Live, polished UI.** Responses stream token-by-token with clean tool-call
+  chips, an in-place model switcher, and a context-usage meter.
+- 🎨 **Looks the part, crisp anywhere.** Styled after the Claude desktop app,
+  DPI-aware on HiDPI displays, resizable from any edge, with live **Ctrl +/–** zoom.
+- 🔒 **Local & private.** Runs entirely on your machine against your own login.
 
 ```
  ┌──────────────────────────────────────────┐
