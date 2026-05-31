@@ -62,21 +62,6 @@ window. The overlay earns its place by floating over **whatever you're doing** a
   <br><em>Not using it? It collapses to an orb that floats out of the way — click to bring it back.</em>
 </p>
 
-```
- ┌──────────────────────────────────────────┐
- │ ✦ Claude                        —    ✕  │  ← drag to move
- ├──────────────────────────────────────────┤
- │                       what's this error? │  ← you (right)
- │  ✦ Claude                               │
- │     ▤ Read  screen_1.png                │  ← it read your screen
- │The stack trace points to a null ref on … │  ← Claude (left)
- ├──────────────────────────────────────────┤
- │  Reply to Claude…                      ↑ │
- │  ◉ auto-screenshot   Snap   Clear     ◢ │
- │  claude-opus-4-8[1m] ▾   ·   context 3%  │
- └──────────────────────────────────────────┘
-```
-
 ## How it works
 
 ```
