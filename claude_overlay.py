@@ -13,6 +13,7 @@ Run:   pythonw claude_overlay.py     (no console)
 """
 
 import asyncio
+import base64
 import ctypes
 import ctypes.wintypes as wt
 import json
@@ -26,7 +27,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import font as tkfont
 
-from PIL import Image, ImageGrab
+from PIL import Image, ImageGrab, ImageDraw, ImageChops, ImageFilter, ImageTk
 
 os.environ["PATH"] = (
     os.path.join(os.environ.get("APPDATA", ""), "npm") + os.pathsep + os.environ.get("PATH", "")
@@ -50,14 +51,18 @@ from claude_agent_sdk import (  # noqa: E402
     ToolUseBlock, ResultMessage, StreamEvent,
 )
 
+__version__ = "1.1.0"
+
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
 # NOTE: the Agent SDK's model=None does NOT follow the CLI's interactive default
 # (which is opus-4-8); SDK 0.2.87 resolves None → opus-4-7. So pin the ID explicitly.
-# The "[1m]" suffix picks the 1M-context variant (verified maxTokens=1_000_000);
-# bare "claude-opus-4-8" is the standard 200K context.
-MODEL = "claude-opus-4-8[1m]"
-MODELS = [("Opus 4.8 (1M)", "claude-opus-4-8[1m]"), ("Sonnet", "sonnet"), ("Haiku", "haiku")]  # click the statusline to switch
+# Default to the standard 200K-context Opus: overlay chats never approach 200K, so the
+# "[1m]" 1M-context variant only buys latency for context we never use. The 1M variant
+# stays one click away in the MODELS switcher.
+MODEL = "claude-opus-4-8"
+MODELS = [("Opus 4.8", "claude-opus-4-8"), ("Opus 4.8 (1M)", "claude-opus-4-8[1m]"),
+          ("Sonnet", "sonnet"), ("Haiku", "haiku")]  # click the statusline to switch
 PERMISSION_MODE = "bypassPermissions"
 AUTO_SCREENSHOT_DEFAULT = True
 HIDE_SCREENSHOT_TOOL = True       # hide the noisy "⚙ Read …shot_*.png" lines every turn
@@ -73,12 +78,24 @@ FONT_SERIF = ["Noto Serif TC", "Georgia", "Cambria"]   # the "Claude" wordmark
 FONT_MONO = ["Consolas", "Cascadia Mono", "Courier New"]
 SHOT_DIR = Path(os.environ.get("TEMP", str(Path.home()))) / "claude_overlay_shots"
 KEEP_SHOTS = 24                  # retain a few captures worth (one file per monitor)
+SHOT_MAX_EDGE = 1568             # downscale captures to this long edge before sending.
+                                 # Claude downsamples larger images internally anyway, so
+                                 # bigger files only cost upload time + vision tokens.
+IMAGE_INPUT = "inline"           # "inline" → attach screenshots as base64 image blocks
+                                 # (no per-turn Read round-trip); "read" → legacy path:
+                                 # save PNG + ask Claude to Read it. Flip to "read" if a
+                                 # future CLI rejects inline images.
+PRECAPTURE_ON_TYPING = True      # grab the screen ~as you type (off the send path) so
+                                 # send latency excludes the capture.
+PRECAPTURE_MAX_AGE = 6.0         # seconds a pre-captured frame stays reusable; older than
+                                 # this at send time → re-grab fresh (bounds staleness).
 
 SYSTEM_APPEND = (
     "You are running as an always-on-top floating overlay assistant on the user's "
     "Windows 11 desktop. The user talks to you without leaving their current app. "
-    "When a message includes a [SCREENSHOT] path, the user is showing you their "
-    "current screen — use the Read tool on that exact path to view it, then help. "
+    "Messages may include live screenshots of the user's screen — attached directly "
+    "as images, or (legacy) as an [ATTACHMENTS] path you open with the Read tool. "
+    "Use them to see what the user is looking at, then help. "
     "Keep replies concise and skimmable since they render in a small floating window; "
     "expand only when asked."
 )
@@ -170,7 +187,8 @@ class ClaudeWorker(threading.Thread):
         self._running = True
         self._saw_stream = False
 
-    def ask(self, prompt: str):       self.req.put(("ask", prompt))
+    def ask(self, text: str, image_paths=None):
+        self.req.put(("ask", (text, list(image_paths or []))))
     def reset(self):                  self.req.put(("reset", None))
     def shutdown(self):
         self._running = False
@@ -203,7 +221,11 @@ class ClaudeWorker(threading.Thread):
         return ClaudeAgentOptions(
             permission_mode=PERMISSION_MODE, cwd=WORKING_DIR, model=MODEL,
             include_partial_messages=True,
-            system_prompt={"type": "preset", "preset": "claude_code", "append": SYSTEM_APPEND},
+            # exclude_dynamic_sections strips the per-turn-changing bits (cwd, git
+            # status, auto-memory) out of the preset system prompt so the big static
+            # prefix stays byte-stable → prompt-cache hits survive across turns.
+            system_prompt={"type": "preset", "preset": "claude_code",
+                           "append": SYSTEM_APPEND, "exclude_dynamic_sections": True},
         )
 
     def run(self):
@@ -258,21 +280,60 @@ class ClaudeWorker(threading.Thread):
                 pass
             self._client = None
 
-    async def _run_turn(self, prompt: str):
+    async def _run_turn(self, payload):
+        text, image_paths = payload if isinstance(payload, tuple) else (payload, [])
         if self._client is None:
             self.ui.put(("error", "Not connected to Claude."))
             self.ui.put(("turn_done", None))
             return
         try:
-            await self._client.query(prompt)
+            await self._client.query(self._build_query(text, image_paths))
             blocks: dict = {}
             async for msg in self._client.receive_response():
                 self._dispatch(msg, blocks)
-            await self._emit_usage()
         except Exception as e:
             self.ui.put(("error", f"{type(e).__name__}: {e}"))
         finally:
             self.ui.put(("turn_done", None))
+            # Refresh context% off the critical path: schedule it rather than
+            # awaiting, so the UI leaves "thinking…" the instant the reply ends
+            # instead of after an extra round-trip.
+            try:
+                self._loop.create_task(self._emit_usage())
+            except Exception:
+                pass
+
+    def _build_query(self, text: str, image_paths: list):
+        """Return the prompt for client.query(). With inline images we yield a
+        structured user message (text + base64 image blocks) so the model sees
+        the screen directly — no per-turn Read round-trip. Otherwise a plain
+        string (the legacy "Read the PNG path" flow builds its own text upstream)."""
+        if IMAGE_INPUT != "inline" or not image_paths:
+            return text
+        content: list = []
+        if text:
+            content.append({"type": "text", "text": text})
+        for p in image_paths:
+            try:
+                data = Path(p).read_bytes()
+            except Exception:
+                continue
+            ext = Path(p).suffix.lower()
+            mt = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
+                  ".gif": "image/gif"}.get(ext, "image/png")
+            content.append({"type": "image", "source": {
+                "type": "base64", "media_type": mt,
+                "data": base64.b64encode(data).decode()}})
+        if not content:
+            return text
+        msg = {"type": "user",
+               "message": {"role": "user", "content": content},
+               "parent_tool_use_id": None}
+
+        async def _one():
+            yield msg
+
+        return _one()
 
     def _dispatch(self, msg, blocks: dict):
         if isinstance(msg, StreamEvent):
@@ -339,6 +400,9 @@ class Overlay:
         self.auto_shot = AUTO_SCREENSHOT_DEFAULT
         self.pending_shot = None
         self.pending_images: list = []
+        self._precaptured = None        # (shots, monotonic_ts) grabbed while typing
+        self._precapture_after = None   # pending debounce timer id
+        self._orb_imgs: dict = {}       # (size, hover) → PhotoImage cache for the orb
         self.busy = False
         self.visible = True
         self.expanded = True
@@ -474,6 +538,8 @@ class Overlay:
         self.entry.bind("<Shift-Insert>", self._on_paste)
         self.entry.bind("<FocusIn>", self._ph_out)
         self.entry.bind("<FocusOut>", self._ph_in)
+        self.entry.bind("<FocusIn>", self._precapture_soon, add="+")
+        self.entry.bind("<KeyRelease>", self._precapture_soon, add="+")
         self._ph_active = False
         self._ph_in()
         self.canvas.bind("<Configure>", self._layout_input)
@@ -526,11 +592,112 @@ class Overlay:
     def _draw_orb(self, hover=False):
         s = self.orb_size
         self.orb.delete("all")
-        p = self.px(1)
-        self.orb.create_oval(p, p, s - p, s - p, fill=T["field"],
-                             outline=(T["accent"] if hover else T["border"]),
-                             width=self.px(2) if hover else 1)
-        self._draw_spark(self.orb, s / 2, s / 2, self.px(13))
+        self._orb_photo = self._orb_image(s, hover)   # keep a ref so Tk won't GC it
+        self.orb.create_image(s // 2, s // 2, image=self._orb_photo)
+
+    # ── glossy 3-D orb (rendered with Pillow, cached per size+state) ──
+    @staticmethod
+    def _rgb(hex_):
+        hex_ = hex_.lstrip("#")
+        return tuple(int(hex_[i:i + 2], 16) for i in (0, 2, 4))
+
+    @staticmethod
+    def _mix(a, b, t):
+        t = 0.0 if t < 0 else 1.0 if t > 1 else t
+        return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
+
+    def _orb_image(self, s, hover):
+        """Render a glossy terracotta sphere: off-centre radial gradient (volume),
+        a soft top-left specular highlight, a darker bottom rim + lighter top rim
+        (bevel), then the cream Claude spark with a faint drop shadow. Supersampled
+        ×4 then LANCZOS-downscaled for crisp edges at any DPI. Cached per (size,hover)."""
+        import math
+        key = (s, hover)
+        if key in self._orb_imgs:
+            return self._orb_imgs[key]
+
+        SS = 4
+        n = s * SS
+        base = self._rgb(T["accent"])
+        WHITE, BLACK = (255, 255, 255), (0, 0, 0)
+        light = self._mix(base, WHITE, 0.55 if hover else 0.42)   # gradient core
+        edge = self._mix(base, BLACK, 0.40)                        # gradient rim
+        inset = SS                                                 # ~1 logical px border
+
+        # sphere alpha mask (anti-aliased via the supersample)
+        mask = Image.new("L", (n, n), 0)
+        ImageDraw.Draw(mask).ellipse([inset, inset, n - inset - 1, n - inset - 1], fill=255)
+
+        def ramp(t):
+            return self._mix(light, base, t / 0.5) if t < 0.5 else self._mix(base, edge, (t - 0.5) / 0.5)
+
+        # directional gradient → concentric rings centred OUTSIDE the top-left, so the
+        # top-left rim is the brightest (lit edge) and shading only deepens toward the
+        # bottom-right. A light centre *inside* the disc would re-darken the top-left rim
+        # and read as an unwanted shadow there.
+        grad = Image.new("RGB", (n, n), edge)
+        gd = ImageDraw.Draw(grad)
+        lx, ly = int(n * -0.12), int(n * -0.15)
+        maxr = int(math.hypot(max(abs(lx), abs(n - lx)), max(abs(ly), abs(n - ly)))) + 2
+        for r in range(maxr, 0, -1):
+            gd.ellipse([lx - r, ly - r, lx + r, ly + r], fill=ramp(r / maxr))
+        orb = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+        orb.paste(grad, (0, 0), mask)
+
+        # bevel: lighter top rim, darker bottom rim
+        rim = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+        rd = ImageDraw.Draw(rim)
+        bb = [inset, inset, n - inset - 1, n - inset - 1]
+        rd.arc(bb, 180, 360, fill=self._mix(light, WHITE, 0.4) + (170,), width=max(2, SS))
+        rd.arc(bb, 0, 180, fill=edge + (150,), width=max(2, SS))
+        rim = rim.filter(ImageFilter.GaussianBlur(SS * 0.6))
+        rim.putalpha(ImageChops.multiply(rim.split()[3], mask))
+        orb = Image.alpha_composite(orb, rim)
+
+        # soft specular highlight near the top-left
+        hl = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+        hw, hh = n * 0.46, n * 0.32
+        hcx, hcy = n * 0.37, n * 0.27
+        ImageDraw.Draw(hl).ellipse([hcx - hw / 2, hcy - hh / 2, hcx + hw / 2, hcy + hh / 2],
+                                   fill=(255, 255, 255, 150 if hover else 120))
+        hl = hl.filter(ImageFilter.GaussianBlur(n * 0.05))
+        hl.putalpha(ImageChops.multiply(hl.split()[3], mask))
+        orb = Image.alpha_composite(orb, hl)
+
+        # Claude spark (cream sunburst) with a faint drop shadow for depth
+        cx = cy = n / 2
+        R = n * 0.24
+        spokes = []
+        for i in range(12):
+            a = math.pi * i / 6
+            r1 = R if i % 2 == 0 else R * 0.46
+            spokes.append((cx, cy, cx + r1 * math.cos(a), cy + r1 * math.sin(a)))
+        wln = max(2, int(SS * 1.6))
+        dot = max(2, int(SS * 1.7))
+
+        sh = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+        sd = ImageDraw.Draw(sh)
+        off = SS
+        for x0, y0, x1, y1 in spokes:
+            sd.line([x0, y0 + off, x1, y1 + off], fill=(60, 24, 12, 110), width=wln)
+        sh = sh.filter(ImageFilter.GaussianBlur(SS * 0.8))
+        sh.putalpha(ImageChops.multiply(sh.split()[3], mask))
+        orb = Image.alpha_composite(orb, sh)
+
+        sp = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+        spd = ImageDraw.Draw(sp)
+        cream = (255, 252, 246, 255)
+        for x0, y0, x1, y1 in spokes:
+            spd.line([x0, y0, x1, y1], fill=cream, width=wln)
+            for (ex, ey) in ((x0, y0), (x1, y1)):           # round the spoke ends
+                spd.ellipse([ex - wln / 2, ey - wln / 2, ex + wln / 2, ey + wln / 2], fill=cream)
+        spd.ellipse([cx - dot, cy - dot, cx + dot, cy + dot], fill=cream)
+        orb = Image.alpha_composite(orb, sp)
+
+        out = orb.resize((s, s), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(out)
+        self._orb_imgs[key] = photo
+        return photo
 
     def _orb_press(self, e):
         self._orb_moved = False
@@ -888,9 +1055,14 @@ class Overlay:
         text = self._entry_text()
         shots = None
         if self.auto_shot:
-            shots = self.capture(announce=False)
+            pc = self._precaptured
+            if pc and (time.monotonic() - pc[1]) < PRECAPTURE_MAX_AGE:
+                shots = pc[0]                     # reuse the frame grabbed while you typed
+            else:
+                shots = self.capture(announce=False)
         elif self.pending_shot:
             shots = self.pending_shot
+        self._precaptured = None
         images = list(self.pending_images)
         if not text and not shots and not images:
             return
@@ -904,8 +1076,47 @@ class Overlay:
         if n:
             label += (f"   🖼×{n}" if n > 1 else "   🖼")
         self.add_user(label)
-        self.worker.ask(self._build_prompt(text, shots, images))
+        if IMAGE_INPUT == "inline":
+            paths = [s["path"] for s in (shots or [])] + list(images)
+            self.worker.ask(self._inline_text(text, shots, images), paths)
+        else:
+            self.worker.ask(self._build_prompt(text, shots, images), [])
         self._set_busy(True)
+
+    def _inline_text(self, text, shots, images):
+        """Short text companion for inline-image turns: the model sees the images
+        directly, so we only add a one-line note about what's attached."""
+        note = []
+        if shots:
+            tags = ", ".join(f"monitor {s['index']}" + (" (primary)" if s["primary"] else "")
+                             for s in shots)
+            note.append(f"[Attached: a live screenshot of my screen — {tags}.]")
+        if images:
+            note.append(f"[Attached: {len(images)} pasted image(s).]")
+        body = text if text else ("Look at the attached screen(s)/image(s) and tell me "
+                                   "what's there / what I might want help with.")
+        return ("\n".join(note) + "\n\n" + body) if note else body
+
+    def _precapture_soon(self, e=None):
+        """Debounced: schedule a screen grab shortly after the last keystroke so a
+        fresh frame is ready at send time, off the critical path."""
+        if not (PRECAPTURE_ON_TYPING and self.auto_shot) or self.busy:
+            return
+        if self._precapture_after:
+            try:
+                self.root.after_cancel(self._precapture_after)
+            except Exception:
+                pass
+        self._precapture_after = self.root.after(180, self._do_precapture)
+
+    def _do_precapture(self):
+        self._precapture_after = None
+        if not (PRECAPTURE_ON_TYPING and self.auto_shot) or self.busy:
+            return
+        try:
+            self._precaptured = (self.capture(announce=False, hide=False), time.monotonic())
+        except Exception:
+            self._precaptured = None
 
     def _build_prompt(self, text, shots, images=None):
         parts = []
@@ -924,30 +1135,38 @@ class Overlay:
                      "Look at the attached image(s)/screen(s) and tell me what's there / what I might want help with.")
         return "\n\n".join(parts)
 
-    def capture(self, announce=True):
+    def capture(self, announce=True, hide=True):
         """Grab one screenshot per monitor; returns a list of
-        {'path', 'primary', 'index'} dicts."""
+        {'path', 'primary', 'index'} dicts. Images are downscaled to
+        SHOT_MAX_EDGE before saving (Claude downsamples larger ones anyway).
+        hide=True withdraws the overlay during the grab so it isn't in the shot
+        (send time); hide=False skips that to avoid a flicker during
+        pre-capture-while-typing."""
         mons = enumerate_monitors() or [{"rect": None, "primary": True}]
         geo = self.root.geometry()
-        self.root.withdraw()
-        self.root.update()
-        time.sleep(0.15)
+        if hide:
+            self.root.withdraw()
+            self.root.update()
+            time.sleep(0.15)
         shots = []
         try:
             ts = int(time.time() * 1000)
             for i, m in enumerate(mons, 1):
                 bbox = m["rect"]
                 img = ImageGrab.grab(bbox=bbox, all_screens=True) if bbox else ImageGrab.grab()
+                if SHOT_MAX_EDGE and max(img.size) > SHOT_MAX_EDGE:
+                    img.thumbnail((SHOT_MAX_EDGE, SHOT_MAX_EDGE), Image.LANCZOS)
                 p = SHOT_DIR / f"shot_{ts}_m{i}.png"
                 img.save(p)
                 shots.append({"path": str(p), "primary": m["primary"], "index": i})
         finally:
-            self.root.deiconify()
-            self.root.overrideredirect(True)
-            self.root.geometry(geo)
-            self.root.attributes("-topmost", True)
-            self.root.lift()
-            self.root.after(20, self._apply_region)
+            if hide:
+                self.root.deiconify()
+                self.root.overrideredirect(True)
+                self.root.geometry(geo)
+                self.root.attributes("-topmost", True)
+                self.root.lift()
+                self.root.after(20, self._apply_region)
         self._prune_shots()
         if announce:
             self.pending_shot = shots
