@@ -29,9 +29,14 @@ from tkinter import font as tkfont
 
 from PIL import Image, ImageGrab, ImageDraw, ImageChops, ImageFilter, ImageTk
 
-os.environ["PATH"] = (
-    os.path.join(os.environ.get("APPDATA", ""), "npm") + os.pathsep + os.environ.get("PATH", "")
-)
+# Make sure both common `claude` install locations are on PATH, in case it was just
+# installed this session (PATH not yet refreshed): the native installer drops it in
+# %USERPROFILE%\.local\bin, and a global npm install in %APPDATA%\npm.
+os.environ["PATH"] = os.pathsep.join(filter(None, [
+    os.path.join(os.environ.get("USERPROFILE", ""), ".local", "bin"),
+    os.path.join(os.environ.get("APPDATA", ""), "npm"),
+    os.environ.get("PATH", ""),
+]))
 
 # Spawn the `claude` CLI subprocess with no console window. Without this, running
 # under pythonw (no console) makes Windows pop a CMD window for the console-mode CLI.
@@ -263,7 +268,11 @@ class ClaudeWorker(threading.Thread):
             await self._emit_usage()
         except Exception as e:
             self._client = None
-            self.ui.put(("error", f"Could not start Claude: {type(e).__name__}: {e}"))
+            self.ui.put(("error",
+                f"Could not start Claude: {type(e).__name__}: {e}\n"
+                "Is the `claude` CLI installed and logged in? Run `claude --version` "
+                "in a terminal; if it's missing, run setup.cmd (or `irm "
+                "https://claude.ai/install.ps1 | iex`), then `claude` to /login."))
 
     async def _emit_usage(self):
         """Push current model + context-window usage % to the UI statusline."""
@@ -1340,8 +1349,10 @@ class Overlay:
 
     def _intro(self):
         self._ins("\n✦ Claude\n", "ah")
-        self._ins("Hi — 我浮在所有視窗最上層，問我任何問題，我會看著你的螢幕幫你。\n"
-                  f"Enter 送出 · Shift+Enter 換行 · Ctrl +/− 縮放文字 · 拖視窗邊框縮放 · {HOTKEY} 叫我出來/收起。", "a")
+        self._ins("Hi — I float on top of everything. Ask me anything and I'll look at "
+                  "your screen to help.\n"
+                  f"Enter to send · Shift+Enter for a new line · Ctrl +/− to zoom text · "
+                  f"drag an edge to resize · {HOTKEY} to summon/hide me.", "a")
         self._claude_header = True
 
     # ── shutdown ──

@@ -107,7 +107,8 @@ Overlay (Tkinter UI)  →  claude-agent-sdk  →  spawns the `claude` CLI  →  
 
 ## Prerequisites
 
-You need three things. Each has a one-time install below.
+You need three things. The included **`setup.cmd`** handles #2 and #3 for you — it
+auto-installs the Claude Code CLI if it's missing and installs the Python packages.
 
 ### 1. Windows 10 / 11
 The app uses Win32 APIs (DPI awareness, rounded corners, multi-monitor capture),
@@ -116,29 +117,18 @@ so it currently runs **on Windows only**.
 ### 2. Claude Code CLI — installed *and logged in*
 The overlay has no brain of its own; it drives the `claude` command line.
 
-**Install** (pick one):
-- **Option A — npm** (needs Node.js 18+):
-  1. Install **Node.js LTS** (bundles npm):
-     - winget: `winget install OpenJS.NodeJS.LTS`
-     - or download the LTS installer from <https://nodejs.org/>
-     - (restart your terminal afterwards so PATH updates)
-  2. Verify **Node and npm separately** — both must print a version:
-     ```
-     node --version    # e.g. v20.11.1   (must be >= v18)
-     npm --version     # e.g. 10.2.4
-     ```
-  3. Install the CLI:
-     ```
-     npm install -g @anthropic-ai/claude-code
-     ```
-- **Option B — native installer** (no Node.js needed): see the
-  [Claude Code install docs](https://docs.claude.com/en/docs/claude-code/setup).
+**Easiest:** just run **`setup.cmd`** (below) — it installs the CLI for you with the
+official native installer if you don't already have it. To install it yourself:
+
+- **Native installer — recommended, no Node.js** (PowerShell):
+  ```powershell
+  irm https://claude.ai/install.ps1 | iex
+  ```
+  (or `winget install Anthropic.ClaudeCode`). It auto-updates itself.
+- **npm** (needs Node.js 18+): `npm install -g @anthropic-ai/claude-code`
 
 **Log in** with your own Claude account (Pro/Max subscription — no API key needed):
-```
-claude
-```
-then run `/login` inside it once.
+run `claude` and follow the browser prompt once.
 
 **Verify** — this must print a version number:
 ```
@@ -165,8 +155,9 @@ cd claude-overlay
 pip install -r requirements.txt
 ```
 
-On Windows you can instead just double-click **`setup.cmd`**, which checks Python
-and the `claude` CLI and installs the packages for you.
+On Windows you can instead just double-click **`setup.cmd`**: it checks Python,
+**auto-installs the `claude` CLI if it's missing** (and offers to log you in), then
+installs the Python packages — so a fresh machine is one double-click from ready.
 
 Dependencies: `claude-agent-sdk`, `pillow`, `keyboard`.
 
