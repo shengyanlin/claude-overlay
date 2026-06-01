@@ -10,6 +10,8 @@
 
 > ### Talk to Claude Code without ever leaving the app you're in — and let it actually *see* your screen.
 
+<p align="center"><sub><b>Windows 10 / 11</b> only (for now) · runs on your existing Claude subscription — no API key</sub></p>
+
 <p align="center">
   <img src="docs/demo.gif" alt="Browsing the Google Cloud AI agent handbook, then summoning the overlay to ask what the page is about — it reads the screen, answers, and offers to translate" width="640">
 </p>
