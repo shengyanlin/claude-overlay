@@ -35,16 +35,21 @@ os.environ["PATH"] = (
 
 # Spawn the `claude` CLI subprocess with no console window. Without this, running
 # under pythonw (no console) makes Windows pop a CMD window for the console-mode CLI.
-import anyio as _anyio  # noqa: E402
-if sys.platform == "win32":
-    _CREATE_NO_WINDOW = 0x08000000
-    _orig_open_process = _anyio.open_process
+# Best-effort: if a future anyio drops/renames open_process, degrade gracefully
+# (worst case a CMD window flashes) rather than crash on import.
+try:
+    import anyio as _anyio  # noqa: E402
+    if sys.platform == "win32":
+        _CREATE_NO_WINDOW = 0x08000000
+        _orig_open_process = _anyio.open_process
 
-    async def _open_process_no_window(*args, **kwargs):
-        kwargs["creationflags"] = kwargs.get("creationflags", 0) | _CREATE_NO_WINDOW
-        return await _orig_open_process(*args, **kwargs)
+        async def _open_process_no_window(*args, **kwargs):
+            kwargs["creationflags"] = kwargs.get("creationflags", 0) | _CREATE_NO_WINDOW
+            return await _orig_open_process(*args, **kwargs)
 
-    _anyio.open_process = _open_process_no_window
+        _anyio.open_process = _open_process_no_window
+except Exception:
+    pass
 
 from claude_agent_sdk import (  # noqa: E402
     ClaudeSDKClient, ClaudeAgentOptions, AssistantMessage, TextBlock,
@@ -313,10 +318,12 @@ class ClaudeWorker(threading.Thread):
         content: list = []
         if text:
             content.append({"type": "text", "text": text})
+        failed = 0
         for p in image_paths:
             try:
                 data = Path(p).read_bytes()
             except Exception:
+                failed += 1
                 continue
             ext = Path(p).suffix.lower()
             mt = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
@@ -324,6 +331,8 @@ class ClaudeWorker(threading.Thread):
             content.append({"type": "image", "source": {
                 "type": "base64", "media_type": mt,
                 "data": base64.b64encode(data).decode()}})
+        if failed:   # tell the user their screen/image didn't actually attach
+            self.ui.put(("error", f"{failed} image(s) couldn't be read and were not sent."))
         if not content:
             return text
         msg = {"type": "user",
@@ -1113,8 +1122,11 @@ class Overlay:
         self._precapture_after = None
         if not (PRECAPTURE_ON_TYPING and self.auto_shot) or self.busy:
             return
+        pc = self._precaptured                       # a recent frame is still fresh enough —
+        if pc and (time.monotonic() - pc[1]) < 2.5:  # skip the redundant grab while typing
+            return
         try:
-            self._precaptured = (self.capture(announce=False, hide=False), time.monotonic())
+            self._precaptured = (self.capture(announce=False, hide=False, quiet=True), time.monotonic())
         except Exception:
             self._precaptured = None
 
@@ -1135,13 +1147,14 @@ class Overlay:
                      "Look at the attached image(s)/screen(s) and tell me what's there / what I might want help with.")
         return "\n\n".join(parts)
 
-    def capture(self, announce=True, hide=True):
+    def capture(self, announce=True, hide=True, quiet=False):
         """Grab one screenshot per monitor; returns a list of
         {'path', 'primary', 'index'} dicts. Images are downscaled to
         SHOT_MAX_EDGE before saving (Claude downsamples larger ones anyway).
         hide=True withdraws the overlay during the grab so it isn't in the shot
         (send time); hide=False skips that to avoid a flicker during
-        pre-capture-while-typing."""
+        pre-capture-while-typing. quiet=True suppresses the in-chat error if a
+        grab fails (used for the silent pre-capture path)."""
         mons = enumerate_monitors() or [{"rect": None, "primary": True}]
         geo = self.root.geometry()
         if hide:
@@ -1149,16 +1162,20 @@ class Overlay:
             self.root.update()
             time.sleep(0.15)
         shots = []
+        err = None
         try:
             ts = int(time.time() * 1000)
             for i, m in enumerate(mons, 1):
-                bbox = m["rect"]
-                img = ImageGrab.grab(bbox=bbox, all_screens=True) if bbox else ImageGrab.grab()
-                if SHOT_MAX_EDGE and max(img.size) > SHOT_MAX_EDGE:
-                    img.thumbnail((SHOT_MAX_EDGE, SHOT_MAX_EDGE), Image.LANCZOS)
-                p = SHOT_DIR / f"shot_{ts}_m{i}.png"
-                img.save(p)
-                shots.append({"path": str(p), "primary": m["primary"], "index": i})
+                try:
+                    bbox = m["rect"]
+                    img = ImageGrab.grab(bbox=bbox, all_screens=True) if bbox else ImageGrab.grab()
+                    if SHOT_MAX_EDGE and max(img.size) > SHOT_MAX_EDGE:
+                        img.thumbnail((SHOT_MAX_EDGE, SHOT_MAX_EDGE), Image.LANCZOS)
+                    p = SHOT_DIR / f"shot_{ts}_m{i}.png"
+                    img.save(p)
+                    shots.append({"path": str(p), "primary": m["primary"], "index": i})
+                except Exception as ex:
+                    err = ex
         finally:
             if hide:
                 self.root.deiconify()
@@ -1168,6 +1185,9 @@ class Overlay:
                 self.root.lift()
                 self.root.after(20, self._apply_region)
         self._prune_shots()
+        if not shots and not quiet:   # total failure — don't silently send no image
+            self.add_err(f"Couldn't capture the screen: {type(err).__name__}: {err}"
+                         if err else "Couldn't capture the screen.")
         if announce:
             self.pending_shot = shots
             n = len(shots)
@@ -1272,6 +1292,9 @@ class Overlay:
             m.grab_release()
 
     def _switch_model(self, val):
+        if self.busy:   # switching mid-stream is undefined against the SDK — defer
+            self.add_sys("⏳ Finish (or Stop) the current reply before switching model.")
+            return
         self._set_status("switching model…")
         self.worker.set_model(val)
 
@@ -1328,7 +1351,18 @@ class Overlay:
                 self._keyboard.unhook_all()
         except Exception:
             pass
+        try:
+            self.worker.interrupt()      # stop any in-flight turn so it can close cleanly
+        except Exception:
+            pass
         self.worker.shutdown()
+        # Let the worker disconnect the agent before we tear down. If Claude is
+        # mid-turn (running a command or editing your open document), a hard kill
+        # could interrupt that write — so wait, but bounded so quit never hangs.
+        try:
+            self.worker.join(timeout=3.0)
+        except Exception:
+            pass
         self.root.destroy()
 
     def run(self):
