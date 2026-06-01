@@ -12,7 +12,9 @@ screen** — every monitor — to answer. No copy-pasting error messages, no
 describing what you're staring at, no alt-tabbing to a browser. And because it
 runs the full [**Claude Code**](https://docs.claude.com/en/docs/claude-code) agent
 under the hood, it doesn't just chat — it can read, edit, and run things for you,
-right where you work.
+right where you work. Point it at the slide deck, document, or spreadsheet you have
+**open** and it can change the file you're looking at — you never have to tell it
+where the file lives or even alt-tab away.
 
 Best of all, it costs **nothing extra**: it drives **your own** `claude` CLI login,
 so it uses your **existing Claude subscription — no API key, no metered billing.**
@@ -24,8 +26,9 @@ so it uses your **existing Claude subscription — no API key, no metered billin
 - 🪟 **Never breaks your flow.** Always-on-top and frameless; summon or dismiss it
   from anywhere with **Ctrl+Alt+Space**, and it collapses to a tiny draggable orb
   when you're not using it.
-- 🧠 **A real agent, not a chatbot.** Full Claude Code (Opus 4.8, **1M-token
-  context**) — it can edit files and run commands, not just answer questions.
+- 🧠 **A real agent that acts, not a chatbot.** Full Claude Code (Opus 4.8) — it
+  edits files, runs commands, and can even reach into the app on your screen (say,
+  fix the wording on your open slide), not just answer questions.
 - 💸 **No API key, no extra cost.** Runs on your existing Claude subscription.
 - 🖼️ **Screenshots *and* pasted images.** Snap a screen on demand, or paste any
   image with **Ctrl+V** to ask about it.
@@ -38,8 +41,19 @@ so it uses your **existing Claude subscription — no API key, no metered billin
 ## Where a floating overlay wins
 
 The CLI and the desktop app are perfect when you're already in a terminal or a chat
-window. The overlay earns its place by floating over **whatever you're doing** and
-**seeing it** — so it shines exactly where those can't:
+window. The overlay earns its place by floating over **whatever you're doing**, **seeing
+it**, and **acting on it** — so it shines exactly where those can't:
+
+- ✍️ **Edit what's right in front of you.** Don't just ask *about* the open
+  document — ask it to *change* it. Fix a typo on the current slide, tighten a
+  paragraph in your draft, fill a cell, or reword a heading. It reaches into the
+  live app through Windows automation and edits the file you're looking at — **no
+  file path needed**, because it targets the app you already have open.
+
+<p align="center">
+  <img src="docs/demo-edit.gif" alt="With a PowerPoint deck open, summon the overlay and ask it to fix a typo in the title and shorten the subtitle — it runs PowerShell against the open presentation and the slide text changes in place" width="660">
+  <br><em>Ask it to fix the open slide — it edits the deck you already have open, no file path given.</em>
+</p>
 
 - 🖥️ **Mid-presentation.** Stay in full-screen slideshow. Summon the overlay to
   fact-check a number, translate a term, or field an audience question on the spot —
@@ -182,9 +196,10 @@ Dependencies: `claude-agent-sdk`, `pillow`, `keyboard`.
 
 All settings are constants at the top of `claude_overlay.py`:
 
-- `MODEL` — pinned to `"claude-opus-4-8[1m]"` (Opus 4.8, **1M context**). The `[1m]`
-  suffix selects the 1M variant; drop it for the standard 200K. Don't use `None`:
-  the Agent SDK resolves `None` to an older model, not the CLI's interactive default.
+- `MODEL` — defaults to `"claude-opus-4-8"` (Opus 4.8, 200K context). Append the
+  `[1m]` suffix for the 1M-context variant (also one click away in the in-app model
+  switcher). Don't use `None`: the Agent SDK resolves `None` to an older model, not
+  the CLI's interactive default.
 - `PERMISSION_MODE` — `"bypassPermissions"` by default (see security note below).
   Use `"acceptEdits"`, `"default"`, or `"plan"` to add confirmation / read-only.
 - `WORKING_DIR` — folder Claude operates in (default: your home directory).
@@ -197,7 +212,12 @@ All settings are constants at the top of `claude_overlay.py`:
 
 The default `PERMISSION_MODE = "bypassPermissions"` makes this a **fully
 autonomous agent**: Claude can edit files and run commands in `WORKING_DIR`
-**without asking**, and it can see your screen. If you don't want that, set
+**without asking**, and it can see your screen. Combined with screen vision, that
+also lets it **act on the app you have open** — e.g. edit the document or slide
+deck on your screen via Windows/COM automation, and (with autosave on) persist
+those edits straight to the original file. That's the magic, but it also means it
+can change important documents without a confirmation step — double-check before
+you let it loose on anything you can't afford to lose. If you don't want that, set
 `PERMISSION_MODE` to `"acceptEdits"` (asks before edits), `"default"` (asks before
 most actions), or `"plan"` (read-only) before running.
 
