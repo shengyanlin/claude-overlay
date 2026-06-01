@@ -1,5 +1,13 @@
 # Claude Overlay
 
+<p align="center">
+  <a href="https://docs.claude.com/en/docs/claude-code"><img src="https://img.shields.io/badge/powered%20by-Claude%20Code-D97757" alt="Powered by Claude Code"></a>
+  <img src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6" alt="Platform: Windows 10 | 11">
+  <img src="https://img.shields.io/badge/python-3.10%2B-3776AB" alt="Python 3.10+">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-3DA639" alt="License: MIT"></a>
+  <a href="https://github.com/shengyanlin/claude-overlay/stargazers"><img src="https://img.shields.io/github/stars/shengyanlin/claude-overlay?style=social" alt="GitHub stars"></a>
+</p>
+
 > ### Talk to Claude Code without ever leaving the app you're in — and let it actually *see* your screen.
 
 <p align="center">
@@ -18,6 +26,8 @@ where the file lives or even alt-tab away.
 
 Best of all, it costs **nothing extra**: it drives **your own** `claude` CLI login,
 so it uses your **existing Claude subscription — no API key, no metered billing.**
+
+> ⭐ **If a screen-aware Claude that floats over your work sounds useful, star the repo** — it helps other people find it.
 
 ### ✨ Why you'll want it
 
@@ -46,9 +56,12 @@ it**, and **acting on it** — so it shines exactly where those can't:
 
 - ✍️ **Edit what's right in front of you.** Don't just ask *about* the open
   document — ask it to *change* it. Fix a typo on the current slide, tighten a
-  paragraph in your draft, fill a cell, or reword a heading. It reaches into the
-  live app through Windows automation and edits the file you're looking at — **no
-  file path needed**, because it targets the app you already have open.
+  paragraph in your draft, fill a cell, or reword a heading. Because it's a full
+  Claude Code agent with a shell, it can drive the app you already have open (e.g.
+  via PowerShell/COM automation) to edit the file you're looking at — **no file
+  path needed**. It works this out at run time rather than from a built-in
+  integration, so it's not infallible: sanity-check important documents first
+  (see the **Security note** near the end of this README).
 
 <p align="center">
   <img src="docs/demo-edit.gif" alt="With a PowerPoint deck open, summon the overlay and ask it to fix a typo in the title and shorten the subtitle — it runs PowerShell against the open presentation and the slide text changes in place" width="660">
@@ -234,6 +247,18 @@ you let it loose on anything you can't afford to lose. If you don't want that, s
 `PERMISSION_MODE` to `"acceptEdits"` (asks before edits), `"default"` (asks before
 most actions), or `"plan"` (read-only) before running.
 
+## Contributing
+
+Issues and PRs are welcome — bug reports, feature ideas, and especially help making
+it **cross-platform** (macOS/Linux capture + windowing). See
+[CONTRIBUTING.md](CONTRIBUTING.md) for how to get started.
+
 ## License
 
 [MIT](LICENSE) © shengyanlin
+
+---
+
+<p align="center">
+  <sub>Built with Claude Code. If it earned a spot on your screen, leave a ⭐ — it genuinely helps.</sub>
+</p>
