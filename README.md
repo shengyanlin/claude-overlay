@@ -166,7 +166,20 @@ Dependencies: `claude-agent-sdk`, `pillow`, `keyboard`.
    - Double-click **`Start Claude Overlay.cmd`** — launches with **no console window**.
    - `pythonw claude_overlay.py` — no console.
    - `python claude_overlay.py` — keeps a console open for logs (good for debugging).
-3. Press **Ctrl+Alt+Space** anytime to show / hide the window.
+3. The window appears (and a global hotkey registers). Type and hit **Enter** — it
+   auto-captures your screen each message, so you can ask about whatever's in front
+   of you right away.
+4. Press **Ctrl+Alt+Space** anytime to show / hide the window; not using it? Hit
+   **–** to collapse it to a small floating orb.
+
+### Put it on your Desktop (optional)
+
+Double-click **`Create Desktop Shortcut.cmd`** to drop a **Claude Overlay** shortcut
+— with the orb icon — on your Desktop, so you can launch it like any other app.
+
+> Don't just drag `Start Claude Overlay.cmd` to your Desktop — it's a portable
+> launcher that must stay next to `claude_overlay.py`. The shortcut points back to it
+> in place, which is why it keeps working.
 
 ---
 
