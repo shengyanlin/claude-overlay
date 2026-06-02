@@ -151,18 +151,32 @@ python --version
 
 ## Install
 
-### ⚡ Let Claude install it (once you have the CLI)
+Pick whichever you like — all three end with the overlay ready to run.
 
-It's an agent — so it can set itself up. With the `claude` CLI installed (step 2),
-just run this from wherever you want it to live:
+### 🖱️ One double-click — `setup.cmd` (recommended)
+
+Get the repo, then double-click **`setup.cmd`**. It checks Python,
+**auto-installs the `claude` CLI if it's missing** (and offers to log you in), and
+installs the Python packages — so even a fresh machine is one double-click from ready.
+
+```
+git clone https://github.com/shengyanlin/claude-overlay.git
+```
+(or download the ZIP from the green **Code** button and unzip it.)
+
+### ⚡ Let Claude install it (if you already have the CLI)
+
+It's an agent — so it can set itself up. With the `claude` CLI already installed
+(see [Prerequisites](#2-claude-code-cli--installed-and-logged-in)), run this from
+wherever you want it to live:
 
 ```
 claude "Set up Claude Overlay for me: clone https://github.com/shengyanlin/claude-overlay, make sure Python 3.10+ is installed (install it if missing), pip install its requirements.txt, then launch it with pythonw. Tell me the hotkey once it's running."
 ```
 
-Claude will ask before each step. Prefer to do it yourself? 👇
+Claude will ask before each step.
 
-### By hand
+### 🛠️ By hand
 
 ```
 git clone https://github.com/shengyanlin/claude-overlay.git
@@ -170,11 +184,8 @@ cd claude-overlay
 pip install -r requirements.txt
 ```
 
-Or on Windows just double-click **`setup.cmd`**: it checks Python,
-**auto-installs the `claude` CLI if it's missing** (and offers to log you in), then
-installs the Python packages — so a fresh machine is one double-click from ready.
-
-Dependencies: `claude-agent-sdk`, `pillow`, `keyboard`.
+This installs only the Python packages (`claude-agent-sdk`, `pillow`, `keyboard`) —
+you still need the `claude` CLI installed and logged in (see Prerequisites).
 
 ---
 
