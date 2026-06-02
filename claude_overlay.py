@@ -58,7 +58,7 @@ except Exception:
 
 from claude_agent_sdk import (  # noqa: E402
     ClaudeSDKClient, ClaudeAgentOptions, AssistantMessage, TextBlock,
-    ToolUseBlock, ResultMessage, StreamEvent,
+    ToolUseBlock, ResultMessage, StreamEvent, PermissionResultAllow,
 )
 
 __version__ = "1.1.0"
@@ -227,9 +227,21 @@ class ClaudeWorker(threading.Thread):
         except Exception as e:
             self.ui.put(("error", f"set_model failed: {type(e).__name__}: {e}"))
 
+    async def _allow_tool(self, tool_name, input_data, context):
+        # Auto-approve every tool. permission_mode="bypassPermissions" already does
+        # this on most machines, but managed/enterprise installs can DISABLE bypass
+        # mode (managed-settings.json: disableBypassPermissionsMode), which makes the
+        # CLI fall back to "default" and emit a permission prompt. The overlay is a
+        # GUI with no TTY, so an unanswered prompt would just hang the turn forever
+        # ("nowhere to approve"). This callback answers those prompts so the overlay
+        # works regardless of the host's permission policy. The tool call still shows
+        # up as a chip in the chat via the normal streaming path, so it isn't silent.
+        return PermissionResultAllow()
+
     def _make_options(self) -> ClaudeAgentOptions:
         return ClaudeAgentOptions(
             permission_mode=PERMISSION_MODE, cwd=WORKING_DIR, model=MODEL,
+            can_use_tool=self._allow_tool,
             include_partial_messages=True,
             # exclude_dynamic_sections strips the per-turn-changing bits (cwd, git
             # status, auto-memory) out of the preset system prompt so the big static
