@@ -3,6 +3,37 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.1.4] — 2026-06-03
+
+### Fixed
+Residual crash/hang/freeze hardening from a second, independent adversarial audit (none
+of these overlap the v1.1.1–v1.1.3 fixes):
+- **A fast reply can no longer freeze the window.** The UI event pump used to drain its
+  whole queue in one go, so a rapid stream could monopolize the main thread for seconds
+  (no repaint, no Stop, no hotkey). The drain is now time-sliced (~12 ms budget) and
+  adjacent text deltas are coalesced into a single insert.
+- **A wedged connection can't hang the app forever.** A hang isn't an exception, so the
+  reconnect/restart guards (which only fire on a *raised* error) couldn't reach an SDK
+  call that never returns. `connect`, `query`, `disconnect`, and the response stream now
+  each have a hard timeout; a timeout is treated as a dead transport and triggers a clean
+  reconnect instead of a permanent "thinking…".
+- **A pasted file that isn't a real image is no longer inlined.** When normalizing a
+  pasted image failed, the original path was still attached — so a multi-GB file with a
+  `.png` name could be read whole into memory. Failures are now skipped (with a notice),
+  and `_build_query` caps the per-image byte size before reading.
+- **Pasting and pre-capture no longer block the UI thread.** Opening/decoding/downscaling a
+  pasted image, and the type-ahead screen pre-capture, now run on a background thread and
+  post their result back — a slow/remote/cloud-placeholder file or a wedged display stack
+  can't freeze typing.
+- **The transcript is now bounded.** A very long session used to keep growing one Tk text
+  widget and an embedded canvas per message; the oldest content is now pruned so layout
+  stays fast and the embedded canvases are freed.
+- **Switching model is serialized** through the worker queue, so it can't interleave with a
+  reset/disconnect tearing down the same client.
+- Minor: screenshot pruning is fully best-effort (a concurrent deleter can't make it throw
+  out of capture/paste), and a failed window-region call frees its GDI region instead of
+  leaking it.
+
 ## [1.1.3] — 2026-06-03
 
 ### Fixed
@@ -115,6 +146,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.1.4]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.4
 [1.1.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.3
 [1.1.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.2
 [1.1.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.1

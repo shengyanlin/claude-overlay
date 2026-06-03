@@ -72,7 +72,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.1.3"
+__version__ = "1.1.4"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -114,6 +114,22 @@ MAX_BUFFER_SIZE = 64 * 1024 * 1024   # the SDK aborts a turn with CLIJSONDecodeE
                                  # single stream-json line exceeds this (default 1MB). Inline
                                  # screenshots (base64, ×monitors) blow past 1MB easily and
                                  # used to crash the worker — 64MB gives huge headroom.
+# A hang is NOT an exception, so the reconnect / bounded-restart guards (which only fire
+# on a raised error) can't preempt an SDK call that never resolves — a wedged transport
+# (broken corporate TLS, half-open socket, CLI waiting on a prompt with no TTY) would pin
+# the worker forever. Bound every SDK lifecycle call so a hang degrades to a clean
+# reconnect instead of a permanent freeze.
+CONNECT_TIMEOUT = 30        # connect() that hasn't resolved by here ⇒ wedged transport
+QUERY_TIMEOUT = 60          # sending the request is near-instant; bound it anyway
+DISCONNECT_TIMEOUT = 10     # don't let a stuck disconnect hang shutdown/reconnect
+RECV_IDLE_TIMEOUT = 300     # no stream activity for this long ⇒ treat the transport as dead
+                            # (generous: a long-running tool can legitimately go quiet a while)
+MAX_INLINE_IMAGE_BYTES = 16 * 1024 * 1024   # never base64-inline a local file bigger than this
+                            # (a multi-GB file with an image extension would otherwise be read
+                            # whole into RAM and explode the query payload)
+MAX_CHAT_LINES = 4000       # cap the rendered transcript; prune oldest lines past this so a
+                            # very long session doesn't slow Tk layout / leak embedded canvases
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
 
 SYSTEM_APPEND = (
     "You are running as an always-on-top floating overlay assistant on the user's "
@@ -162,6 +178,8 @@ _gdi32.CreateRoundRectRgn.restype = wt.HRGN
 _gdi32.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
 _user32.SetWindowRgn.restype = ctypes.c_int
 _user32.SetWindowRgn.argtypes = [wt.HWND, wt.HRGN, ctypes.c_bool]
+_gdi32.DeleteObject.restype = ctypes.c_int
+_gdi32.DeleteObject.argtypes = [ctypes.c_void_p]   # free a region Windows didn't take ownership of
 _user32.GetAncestor.restype = wt.HWND
 _user32.GetAncestor.argtypes = [wt.HWND, ctypes.c_uint]
 _gdi32.CreateEllipticRgn.restype = wt.HRGN
@@ -241,13 +259,11 @@ class ClaudeWorker(threading.Thread):
             pass
 
     def set_model(self, model):
-        loop, client = self._loop, self._client
-        if loop and client:
-            asyncio.run_coroutine_threadsafe(self._do_set_model(client, model), loop)
-        else:
-            # not connected (e.g. _open failed) — otherwise the statusline is left
-            # stuck on "switching model…" forever.
-            self.ui.put(("error", "Not connected to Claude yet — can't switch model."))
+        # Go through the request queue (not run_coroutine_threadsafe) so a model switch is
+        # serialized behind any queued reset/ask and can't interleave with _close() tearing
+        # down the same client — which could leave a half-disconnected client or a status
+        # line stuck on "switching model…".
+        self.req.put(("set_model", model))
 
     async def _do_set_model(self, client, model):
         try:
@@ -334,6 +350,12 @@ class ClaudeWorker(threading.Thread):
                     self.ui.put(("reset_done", None))
                 elif kind == "ask":
                     await self._run_turn(payload)
+                elif kind == "set_model":
+                    if self._client is None:
+                        self.ui.put(("error", "Not connected to Claude yet — can't switch model."))
+                        self.ui.put(("status", ""))
+                    else:
+                        await self._do_set_model(self._client, payload)
             except asyncio.CancelledError:
                 # a cancel (Stop / transport teardown) must not break the loop or be
                 # mistaken for a fatal error — CancelledError is BaseException, not
@@ -360,12 +382,19 @@ class ClaudeWorker(threading.Thread):
     async def _open(self):
         try:
             self._client = ClaudeSDKClient(options=self._make_options())
-            await self._client.connect()
+            # Bound the connect: a wedged transport (TLS MITM, half-open socket, CLI stuck on
+            # a prompt) would otherwise hang the worker here forever, where no reconnect/restart
+            # guard can reach it. A timeout degrades to the normal "couldn't start" path.
+            await asyncio.wait_for(self._client.connect(), CONNECT_TIMEOUT)
             self.ui.put(("ready", None))
             await self._emit_usage()
         except BaseException as e:   # incl. CancelledError — _open must never propagate
             self._client = None
-            if isinstance(e, TypeError):   # ClaudeAgentOptions rejected a kwarg → SDK too old
+            if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+                self.ui.put(("error",
+                    f"Connecting to Claude timed out after {CONNECT_TIMEOUT}s. The next "
+                    "message will try again. (Check your network / `claude --version`.)"))
+            elif isinstance(e, TypeError):   # ClaudeAgentOptions rejected a kwarg → SDK too old
                 self.ui.put(("error",
                     f"Your claude-agent-sdk looks too old ({type(e).__name__}: {e}). "
                     "Update it:  pip install --upgrade claude-agent-sdk  (or run update.cmd)."))
@@ -389,12 +418,14 @@ class ClaudeWorker(threading.Thread):
             pass
 
     async def _close(self):
-        if self._client is not None:
+        # Null the handle FIRST so a disconnect that hangs (bounded below) can't leave the
+        # rest of the worker pointing at a half-dead client.
+        client, self._client = self._client, None
+        if client is not None:
             try:
-                await self._client.disconnect()
+                await asyncio.wait_for(client.disconnect(), DISCONNECT_TIMEOUT)
             except Exception:
                 pass
-            self._client = None
 
     async def _run_turn(self, payload):
         text, image_paths = payload if isinstance(payload, tuple) else (payload, [])
@@ -405,15 +436,30 @@ class ClaudeWorker(threading.Thread):
             self.ui.put(("turn_done", None))
             return
         try:
-            await self._client.query(self._build_query(text, image_paths))
+            await asyncio.wait_for(
+                self._client.query(self._build_query(text, image_paths)), QUERY_TIMEOUT)
             blocks: dict = {}
-            async for msg in self._client.receive_response():
+            # Iterate the stream item-by-item under an idle timeout instead of a bare
+            # `async for`: if the transport goes silent forever (dead CLI, wedged socket)
+            # the turn would otherwise hold "thinking…" indefinitely. A gap longer than
+            # RECV_IDLE_TIMEOUT is treated as a broken transport → reconnect.
+            agen = self._client.receive_response()
+            while True:
+                try:
+                    msg = await asyncio.wait_for(agen.__anext__(), RECV_IDLE_TIMEOUT)
+                except StopAsyncIteration:
+                    break
                 self._dispatch(msg, blocks)
         except asyncio.CancelledError:
             # Stop button / interrupt() / transport cancel — end this turn cleanly.
             # (BaseException, so it'd otherwise escape every `except Exception` and the
             # worker thread would die permanently.) Don't reconnect; shutdown is queue-driven.
             self.ui.put(("system", "⏹ stopped."))
+        except (asyncio.TimeoutError, TimeoutError):
+            # query() wedged or the stream went silent past the idle budget → the transport
+            # is effectively dead; rebuild it so the next turn works instead of hanging here.
+            self.ui.put(("error", "Claude stopped responding — reconnecting with a fresh session."))
+            await self._reconnect()
         except BaseException as e:
             self.ui.put(("error", f"{type(e).__name__}: {e}"))
             # a decode/connection/process error means the transport is dead — the client
@@ -444,6 +490,11 @@ class ClaudeWorker(threading.Thread):
         failed = 0
         for p in image_paths:
             try:
+                # Cap before reading: a path that slipped through (e.g. a huge non-image file)
+                # must not be read whole into RAM and base64-expanded into the query.
+                if Path(p).stat().st_size > MAX_INLINE_IMAGE_BYTES:
+                    failed += 1
+                    continue
                 data = Path(p).read_bytes()
             except Exception:
                 failed += 1
@@ -551,6 +602,7 @@ class Overlay:
         self.pending_images: list = []
         self._precaptured = None        # (shots, monotonic_ts) grabbed while typing
         self._precapture_after = None   # pending debounce timer id
+        self._capture_busy = False      # a background precapture grab is in flight
         self._orb_imgs: dict = {}       # (size, hover) → PhotoImage cache for the orb
         self.busy = False
         self.visible = True
@@ -992,25 +1044,36 @@ class Overlay:
         return "" if self._ph_active else self.entry.get("1.0", "end").strip()
 
     def _on_paste(self, e):
-        """Ctrl+V: if the clipboard holds an image (or image files), attach it."""
+        """Ctrl+V: if the clipboard holds an image (or image files), attach it. The actual
+        open/decode/downscale/save happens on a background thread (_stash_images_bg) so a
+        slow/remote/cloud-placeholder/huge file can't freeze the Tk thread — results come
+        back through ui_q as ("attach", …)."""
         try:
             data = ImageGrab.grabclipboard()
         except Exception:
             data = None
-        paths = []
+        srcs = []
         if isinstance(data, Image.Image):
-            p = self._stash_image(data)
-            if p:
-                paths.append(p)
+            srcs.append(data)
         elif isinstance(data, list):
-            for f in data:
-                if str(f).lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")):
-                    paths.append(self._stash_image(f) or str(f))
-        if paths:
-            self.pending_images.extend(paths)
-            self._refresh_attach()
-            return "break"      # don't paste image bytes as garbage text
-        return None             # plain text → let the normal paste happen
+            srcs = [f for f in data if str(f).lower().endswith(IMAGE_EXTS)]
+        if not srcs:
+            return None             # plain text → let the normal paste happen
+        threading.Thread(target=self._stash_images_bg, args=(srcs,), daemon=True).start()
+        return "break"              # don't paste image bytes as garbage text
+
+    def _stash_images_bg(self, srcs):
+        """Worker-thread side of paste: stash each source, then hand the saved paths back
+        to the UI thread. _stash_image touches no Tk, so this is safe off-thread."""
+        out, failed = [], 0
+        for s in srcs:
+            p = self._stash_image(s)
+            if p:
+                out.append(p)
+            else:
+                failed += 1        # never fall back to the original path — a file we
+                                   # couldn't open/downscale must not be inlined as-is
+        self.ui_q.put(("attach", (out, failed)))
 
     def _stash_image(self, src):
         """Save a clipboard image (or a copy of a pasted image file) into SHOT_DIR,
@@ -1151,7 +1214,12 @@ class Overlay:
                 rgn = _gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, r, r)
             else:
                 rgn = _gdi32.CreateEllipticRgn(0, 0, w + 1, h + 1)   # circular orb
-            _user32.SetWindowRgn(hwnd, rgn, True)
+            # On success Windows owns the region handle; on failure WE still own it and must
+            # free it, or repeated <Configure>/resize churn with a stale hwnd leaks GDI
+            # handles until drawing eventually fails. SetWindowRgn returns 0 on failure.
+            ok = _user32.SetWindowRgn(hwnd, rgn, True)
+            if not ok and rgn:
+                _gdi32.DeleteObject(rgn)
         except Exception:
             pass
 
@@ -1163,12 +1231,28 @@ class Overlay:
             return
         return "break"
 
+    def _prune_chat(self):
+        """Cap the rendered transcript so a long session doesn't slow Tk layout / pile up
+        embedded canvases. Delete oldest lines in a chunk (deleting a text range also
+        destroys any embedded windows inside it, so the user-bubble/tool-chip canvases are
+        freed, not leaked). Chunked so we don't delete on every single insert."""
+        try:
+            n = int(self.chat.index("end-1c").split(".")[0])
+            # Only act once we're a chunk past the cap (so we don't delete on every insert),
+            # then trim back to exactly the cap — never more, or a small cap would wipe the
+            # whole buffer.
+            if n > MAX_CHAT_LINES + 500:
+                self.chat.delete("1.0", f"{n - MAX_CHAT_LINES}.0")
+        except Exception:
+            pass
+
     def _ins(self, text, *tags):
         text = "" if text is None else str(text)   # Tk insert rejects None
         at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", text, tags)
         if at_bottom:
             self.chat.see("end")
+        self._prune_chat()
 
     def add_user(self, text):
         at_bottom = self.chat.yview()[1] > 0.999
@@ -1178,6 +1262,7 @@ class Overlay:
         self._claude_header = False
         if at_bottom:
             self.chat.see("end")
+        self._prune_chat()
 
     @staticmethod
     def _clip_bubble(text):
@@ -1241,6 +1326,7 @@ class Overlay:
         self.chat.insert("end", "\n")
         if at_bottom:
             self.chat.see("end")
+        self._prune_chat()
 
     def _tool_chip(self, name, arg):
         """A compact rounded Claude-style tool pill embedded in the chat."""
@@ -1353,13 +1439,24 @@ class Overlay:
         self._precapture_after = None
         if not (PRECAPTURE_ON_TYPING and self.auto_shot) or self.busy:
             return
+        if self._capture_busy:                       # a grab is already in flight — don't pile up
+            return
         pc = self._precaptured                       # a recent frame is still fresh enough —
         if pc and (time.monotonic() - pc[1]) < 2.5:  # skip the redundant grab while typing
             return
+        # Run the grab off the Tk thread: precapture is hide=False (never touched the window),
+        # so it does no Tk work and a slow/wedged display stack can't freeze typing. Result
+        # comes back via ui_q as ("precapture_done", shots).
+        self._capture_busy = True
+        threading.Thread(target=self._precapture_bg, daemon=True).start()
+
+    def _precapture_bg(self):
+        mons = enumerate_monitors() or [{"rect": None, "primary": True}]
         try:
-            self._precaptured = (self.capture(announce=False, hide=False, quiet=True), time.monotonic())
+            shots, _ = self._grab_shots(mons)
         except Exception:
-            self._precaptured = None
+            shots = None
+        self.ui_q.put(("precapture_done", shots))
 
     def _build_prompt(self, text, shots, images=None):
         parts = []
@@ -1377,6 +1474,29 @@ class Overlay:
         parts.append(text if text else
                      "Look at the attached image(s)/screen(s) and tell me what's there / what I might want help with.")
         return "\n\n".join(parts)
+
+    def _grab_shots(self, mons):
+        """Pure capture: one screenshot per monitor → downscale → save. Touches NO Tk, so
+        it is safe to run on a background thread (used by the precapture path). Returns
+        (shots, last_error)."""
+        shots, err = [], None
+        try:
+            ts = int(time.time() * 1000)
+            for i, m in enumerate(mons, 1):
+                try:
+                    bbox = m["rect"]
+                    img = ImageGrab.grab(bbox=bbox, all_screens=True) if bbox else ImageGrab.grab()
+                    if SHOT_MAX_EDGE and max(img.size) > SHOT_MAX_EDGE:
+                        img.thumbnail((SHOT_MAX_EDGE, SHOT_MAX_EDGE), Image.LANCZOS)
+                    p = SHOT_DIR / f"shot_{ts}_m{i}.png"
+                    img.save(p)
+                    shots.append({"path": str(p), "primary": m["primary"], "index": i})
+                except Exception as ex:
+                    err = ex
+        except Exception as ex:
+            err = ex
+        self._prune_shots()
+        return shots, err
 
     def capture(self, announce=True, hide=True, quiet=False):
         """Grab one screenshot per monitor; returns a list of
@@ -1396,21 +1516,8 @@ class Overlay:
             self.root.withdraw()
             self.root.update()
             time.sleep(0.15)
-        shots = []
-        err = None
         try:
-            ts = int(time.time() * 1000)
-            for i, m in enumerate(mons, 1):
-                try:
-                    bbox = m["rect"]
-                    img = ImageGrab.grab(bbox=bbox, all_screens=True) if bbox else ImageGrab.grab()
-                    if SHOT_MAX_EDGE and max(img.size) > SHOT_MAX_EDGE:
-                        img.thumbnail((SHOT_MAX_EDGE, SHOT_MAX_EDGE), Image.LANCZOS)
-                    p = SHOT_DIR / f"shot_{ts}_m{i}.png"
-                    img.save(p)
-                    shots.append({"path": str(p), "primary": m["primary"], "index": i})
-                except Exception as ex:
-                    err = ex
+            shots, err = self._grab_shots(mons)
         finally:
             if do_hide:
                 self.root.deiconify()
@@ -1419,7 +1526,6 @@ class Overlay:
                 self.root.attributes("-topmost", True)
                 self.root.lift()
                 self.root.after(20, self._apply_region)
-        self._prune_shots()
         if not shots and not quiet:   # total failure — don't silently send no image
             self.add_err(f"Couldn't capture the screen: {type(err).__name__}: {err}"
                          if err else "Couldn't capture the screen.")
@@ -1433,11 +1539,24 @@ class Overlay:
         self.capture(announce=True)
 
     def _prune_shots(self):
-        for old in sorted(SHOT_DIR.glob("shot_*.png"), key=lambda p: p.stat().st_mtime)[:-KEEP_SHOTS]:
-            try:
-                old.unlink()
-            except Exception:
-                pass
+        # Best-effort from the very first filesystem op: a concurrent deleter (AV/quarantine,
+        # a second overlay, a cleanup job) can remove a shot between glob() and stat(), which
+        # used to throw OUT of here (the old try only wrapped unlink) — aborting capture() or
+        # making paste silently fall back to the original path.
+        try:
+            files = []
+            for p in SHOT_DIR.glob("shot_*.png"):
+                try:
+                    files.append((p.stat().st_mtime, p))
+                except Exception:
+                    continue
+            for _, old in sorted(files, key=lambda t: t[0])[:-KEEP_SHOTS]:
+                try:
+                    old.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def toggle_auto(self):
         self.auto_shot = not self.auto_shot
@@ -1562,6 +1681,19 @@ class Overlay:
         # (window still drawn, but no replies, no events ever again). The finally
         # guarantees the next tick; per-message guarding keeps one bad render from
         # dropping the rest of the queue.
+        deadline = time.monotonic() + 0.012   # ~12ms budget per tick, so the drain can never
+        handled = 0                            # monopolize Tk: a fast stream yields back for
+        pending_delta = []                     # repaint / clicks / hotkey between slices.
+
+        def flush_delta():
+            if pending_delta:
+                joined = "".join(pending_delta)
+                pending_delta.clear()
+                try:
+                    self._handle("delta", joined)
+                except Exception:
+                    pass
+
         try:
             if self._toggle_request:
                 self._toggle_request = False
@@ -1569,11 +1701,16 @@ class Overlay:
                     self.toggle_visible()
                 except Exception:
                     pass
-            while True:
+            while handled < 400 and time.monotonic() < deadline:
                 try:
                     kind, payload = self.ui_q.get_nowait()
                 except queue.Empty:
                     break
+                handled += 1
+                if kind == "delta":            # coalesce adjacent deltas into one insert
+                    pending_delta.append("" if payload is None else str(payload))
+                    continue
+                flush_delta()                  # preserve ordering around non-delta messages
                 try:
                     self._handle(kind, payload)
                 except Exception as e:
@@ -1581,10 +1718,12 @@ class Overlay:
                         self.add_err(f"UI hiccup handling '{kind}': {type(e).__name__}: {e}")
                     except Exception:
                         pass
+            flush_delta()
         except Exception:
             pass
         finally:
-            self.root.after(60, self._poll)
+            # If we left messages behind (hit the budget), come back fast; otherwise idle.
+            self.root.after(1 if not self.ui_q.empty() else 60, self._poll)
 
     def _handle(self, kind, payload):
         if kind == "ready":
@@ -1616,6 +1755,17 @@ class Overlay:
             if isinstance(payload, dict) and payload.get("is_error"):
                 self.add_err("The last turn ended with an error.")
             self._set_busy(False)
+        elif kind == "attach":          # background paste finished (paths, failed_count)
+            paths, failed = payload
+            if paths:
+                self.pending_images.extend(paths)
+                self._refresh_attach()
+            if failed:
+                self.add_err(f"{failed} pasted image(s) couldn't be attached.")
+        elif kind == "precapture_done":
+            self._capture_busy = False
+            if payload:
+                self._precaptured = (payload, time.monotonic())
         elif kind == "status":
             self._set_status(str(payload))
         elif kind == "system":
