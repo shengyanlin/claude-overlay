@@ -17,7 +17,7 @@
 </p>
 
 **Claude Overlay** is a frameless, always-on-top chat window that floats over
-everything you do. Hit a hotkey, ask a question, and Claude looks at your **real
+everything you do. Ask a question, and Claude looks at your **real
 screen** — every monitor — to answer. No copy-pasting error messages, no
 describing what you're staring at, no alt-tabbing to a browser. And because it
 runs the full [**Claude Code**](https://docs.claude.com/en/docs/claude-code) agent
@@ -35,12 +35,12 @@ so it uses your **existing Claude subscription — no API key, no metered billin
 
 - 👁️ **It sees what you see.** Auto-captures each monitor on every message and
   labels primary vs. secondary — just ask *"what's wrong here?"* and it looks.
-- 🪟 **Never breaks your flow.** Always-on-top and frameless; summon or dismiss it
-  from anywhere with **Ctrl+Alt+Space**, and it collapses to a tiny draggable orb
-  when you're not using it.
+- 🪟 **Never breaks your flow.** Always-on-top and frameless; it collapses to a
+  tiny draggable orb when you're not using it, and clicks back open when you are.
 - 🧠 **A real agent that acts, not a chatbot.** Full Claude Code (Opus 4.8) — it
   edits files, runs commands, and can even reach into the app on your screen (say,
-  fix the wording on your open slide), not just answer questions.
+  fix the wording on your open slide, or build a model in your open Excel), not just
+  answer questions.
 - 💸 **No API key, no extra cost.** Runs on your existing Claude subscription.
 - 🖼️ **Screenshots *and* pasted images.** Snap a screen on demand, or paste any
   image with **Ctrl+V** to ask about it.
@@ -68,6 +68,16 @@ it**, and **acting on it** — so it shines exactly where those can't:
 <p align="center">
   <img src="docs/demo-edit.gif" alt="With a PowerPoint deck open, summon the overlay and ask it to fix a typo in the title and shorten the subtitle — it runs PowerShell against the open presentation and the slide text changes in place" width="660">
   <br><em>Ask it to fix the open slide — it edits the deck you already have open, no file path given.</em>
+</p>
+
+- 📊 **Build, not just edit.** Ask for a spreadsheet and it builds the real thing in your
+  open Excel — sourced assumptions, live formulas, a top-down calculation, even a
+  low/base/high sensitivity, laid out like a banker's model. One sentence in the overlay,
+  a working model in the sheet.
+
+<p align="center">
+  <img src="docs/excel-demo.gif" alt="Type a request in the overlay — 'size Taiwan's hand-shaken beverage market, top-down' — and it drives Excel via COM to build an investment-banking-style market-sizing model: an assumptions block with a source column, a top-down calculation funnel, a base-case estimate, and a low/base/high sensitivity table" width="660">
+  <br><em>Ask in the overlay; it drives Excel to build the model — assumptions, formulas, and a sensitivity.</em>
 </p>
 
 - 🖥️ **Mid-presentation.** Stay in full-screen slideshow. Summon the overlay to
@@ -171,7 +181,7 @@ It's an agent — so it can set itself up. With the `claude` CLI already install
 wherever you want it to live:
 
 ```
-claude "Set up Claude Overlay for me: clone https://github.com/shengyanlin/claude-overlay, make sure Python 3.10+ is installed (install it if missing), pip install its requirements.txt, then launch it with pythonw. Tell me the hotkey once it's running."
+claude "Set up Claude Overlay for me: clone https://github.com/shengyanlin/claude-overlay, make sure Python 3.10+ is installed (install it if missing), pip install its requirements.txt, then launch it with pythonw. Tell me when it's running."
 ```
 
 Claude will ask before each step.
@@ -196,11 +206,10 @@ you still need the `claude` CLI installed and logged in (see Prerequisites).
    - Double-click **`Start Claude Overlay.cmd`** — launches with **no console window**.
    - `pythonw claude_overlay.py` — no console.
    - `python claude_overlay.py` — keeps a console open for logs (good for debugging).
-3. The window appears (and a global hotkey registers). Type and hit **Enter** — it
-   auto-captures your screen each message, so you can ask about whatever's in front
-   of you right away.
-4. Press **Ctrl+Alt+Space** anytime to show / hide the window; not using it? Hit
-   **–** to collapse it to a small floating orb.
+3. The window appears. Type and hit **Enter** — it auto-captures your screen each
+   message, so you can ask about whatever's in front of you right away.
+4. Not using it? Hit **–** to collapse it to a small floating orb, and click the orb
+   to expand it again.
 
 ### Put it on your Desktop (optional)
 
@@ -229,7 +238,6 @@ Double-click **`Create Desktop Shortcut.cmd`** to drop a **Claude Overlay** shor
 | Collapse to a Claude orb | **–**, or double-click the title bar |
 | Expand from the orb | click the orb (drag it to move) |
 | Quit | **✕** |
-| Show / hide from anywhere | **Ctrl+Alt+Space** (global hotkey) |
 | Move | drag the title bar |
 | Resize | drag **any edge or corner** (or the **◢** grip) |
 
@@ -247,7 +255,6 @@ All settings are constants at the top of `claude_overlay.py`:
   Use `"acceptEdits"`, `"default"`, or `"plan"` to add confirmation / read-only.
 - `WORKING_DIR` — folder Claude operates in (default: your home directory).
 - `THEME` — `"light"` (warm paper) or `"dark"`.
-- `HOTKEY` — global show/hide hotkey (default `ctrl+alt+space`).
 - `AUTO_SCREENSHOT_DEFAULT`, `FONT_SANS/SERIF/MONO`, `CORNER_RADIUS`, `ORB_SIZE`,
   `HIDE_SCREENSHOT_TOOL`, `WINDOW_ALPHA` — see inline comments.
 
