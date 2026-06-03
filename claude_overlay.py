@@ -60,8 +60,19 @@ from claude_agent_sdk import (  # noqa: E402
     ClaudeSDKClient, ClaudeAgentOptions, AssistantMessage, TextBlock,
     ToolUseBlock, ResultMessage, StreamEvent, PermissionResultAllow,
 )
+# Error types used to decide when the transport is broken and we should reconnect.
+# Imported defensively: older/newer SDKs may not export all of them.
+try:
+    from claude_agent_sdk import (  # noqa: E402
+        ClaudeSDKError, CLIConnectionError, CLIJSONDecodeError, ProcessError,
+    )
+except Exception:  # pragma: no cover
+    class ClaudeSDKError(Exception): ...
+    class CLIConnectionError(ClaudeSDKError): ...
+    class CLIJSONDecodeError(ClaudeSDKError): ...
+    class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -99,6 +110,10 @@ PRECAPTURE_ON_TYPING = True      # grab the screen ~as you type (off the send pa
                                  # send latency excludes the capture.
 PRECAPTURE_MAX_AGE = 6.0         # seconds a pre-captured frame stays reusable; older than
                                  # this at send time → re-grab fresh (bounds staleness).
+MAX_BUFFER_SIZE = 64 * 1024 * 1024   # the SDK aborts a turn with CLIJSONDecodeError when a
+                                 # single stream-json line exceeds this (default 1MB). Inline
+                                 # screenshots (base64, ×monitors) blow past 1MB easily and
+                                 # used to crash the worker — 64MB gives huge headroom.
 
 SYSTEM_APPEND = (
     "You are running as an always-on-top floating overlay assistant on the user's "
@@ -254,7 +269,7 @@ class ClaudeWorker(threading.Thread):
         return PermissionResultAllow()
 
     def _make_options(self) -> ClaudeAgentOptions:
-        return ClaudeAgentOptions(
+        opts = dict(
             permission_mode=PERMISSION_MODE, cwd=WORKING_DIR, model=MODEL,
             can_use_tool=self._allow_tool,
             include_partial_messages=True,
@@ -264,28 +279,71 @@ class ClaudeWorker(threading.Thread):
             system_prompt={"type": "preset", "preset": "claude_code",
                            "append": SYSTEM_APPEND, "exclude_dynamic_sections": True},
         )
+        # max_buffer_size was added in a later SDK; pass it only if supported so we
+        # don't break on older installs that would reject the unknown kwarg.
+        try:
+            opts["max_buffer_size"] = MAX_BUFFER_SIZE
+            return ClaudeAgentOptions(**opts)
+        except TypeError:
+            opts.pop("max_buffer_size", None)
+            return ClaudeAgentOptions(**opts)
 
     def run(self):
-        try:
-            asyncio.run(self._amain())
-        except Exception as e:  # pragma: no cover
-            self.ui.put(("error", f"worker crashed: {type(e).__name__}: {e}"))
+        # Bounded auto-restart: even if _amain falls over entirely (e.g. the event loop
+        # dies), bring it back so the overlay self-heals instead of becoming a zombie
+        # window that never answers again.
+        attempts = 0
+        while self._running and attempts < 5:
+            attempts += 1
+            try:
+                asyncio.run(self._amain())
+                return                      # _amain returned cleanly (stop requested)
+            except Exception as e:  # pragma: no cover
+                self.ui.put(("error", f"worker restarting after: {type(e).__name__}: {e}"))
+                self._client = None
+                time.sleep(0.5)
+        if self._running:
+            self.ui.put(("error", "Claude worker stopped after repeated failures — "
+                                  "please restart the overlay."))
 
     async def _amain(self):
         self._loop = asyncio.get_running_loop()
         await self._open()
         while self._running:
-            kind, payload = await self._loop.run_in_executor(None, self.req.get)
+            try:
+                kind, payload = await self._loop.run_in_executor(None, self.req.get)
+            except Exception:
+                continue
             if kind == "stop":
                 break
-            elif kind == "reset":
-                await self._close()
-                self._saw_stream = False
-                await self._open()
-                self.ui.put(("reset_done", None))
-            elif kind == "ask":
-                await self._run_turn(payload)
+            # Each request is fully guarded: a failure here must never break the loop
+            # (that would leave the UI waiting on a worker that's gone). Worst case we
+            # reconnect and keep serving.
+            try:
+                if kind == "reset":
+                    await self._close()
+                    self._saw_stream = False
+                    await self._open()
+                    self.ui.put(("reset_done", None))
+                elif kind == "ask":
+                    await self._run_turn(payload)
+            except Exception as e:
+                self.ui.put(("error", f"{type(e).__name__}: {e}"))
+                self.ui.put(("turn_done", None))
+                await self._reconnect()
         await self._close()
+
+    async def _reconnect(self):
+        """Tear down a broken client and stand up a fresh one so the next turn works.
+        The conversation context is lost (new session), but the app stays alive instead
+        of freezing on a dead transport."""
+        self.ui.put(("system", "↻ Connection hiccup — reconnected with a fresh session."))
+        try:
+            await self._close()
+        except Exception:
+            pass
+        self._saw_stream = False
+        await self._open()
 
     async def _open(self):
         try:
@@ -323,8 +381,10 @@ class ClaudeWorker(threading.Thread):
 
     async def _run_turn(self, payload):
         text, image_paths = payload if isinstance(payload, tuple) else (payload, [])
+        if self._client is None:        # initial connect failed earlier — try once more
+            await self._open()
         if self._client is None:
-            self.ui.put(("error", "Not connected to Claude."))
+            self.ui.put(("error", "Not connected to Claude. Check `claude --version`."))
             self.ui.put(("turn_done", None))
             return
         try:
@@ -334,6 +394,11 @@ class ClaudeWorker(threading.Thread):
                 self._dispatch(msg, blocks)
         except Exception as e:
             self.ui.put(("error", f"{type(e).__name__}: {e}"))
+            # a decode/connection/process error means the transport is dead — the client
+            # is unusable now, so rebuild it before the next turn instead of erroring
+            # forever (the classic "it crashed and won't respond anymore" symptom).
+            if isinstance(e, (CLIJSONDecodeError, CLIConnectionError, ProcessError, ClaudeSDKError)):
+                await self._reconnect()
         finally:
             self.ui.put(("turn_done", None))
             # Refresh context% off the critical path: schedule it rather than
@@ -1403,16 +1468,34 @@ class Overlay:
 
     # ── event pump ──
     def _poll(self):
-        if self._toggle_request:
-            self._toggle_request = False
-            self.toggle_visible()
+        # Whatever happens in here, the pump MUST reschedule itself — an unhandled
+        # exception that skipped the next after() used to silently freeze the whole UI
+        # (window still drawn, but no replies, no events ever again). The finally
+        # guarantees the next tick; per-message guarding keeps one bad render from
+        # dropping the rest of the queue.
         try:
+            if self._toggle_request:
+                self._toggle_request = False
+                try:
+                    self.toggle_visible()
+                except Exception:
+                    pass
             while True:
-                kind, payload = self.ui_q.get_nowait()
-                self._handle(kind, payload)
-        except queue.Empty:
+                try:
+                    kind, payload = self.ui_q.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._handle(kind, payload)
+                except Exception as e:
+                    try:
+                        self.add_err(f"UI hiccup handling '{kind}': {type(e).__name__}: {e}")
+                    except Exception:
+                        pass
+        except Exception:
             pass
-        self.root.after(60, self._poll)
+        finally:
+            self.root.after(60, self._poll)
 
     def _handle(self, kind, payload):
         if kind == "ready":
@@ -1446,6 +1529,8 @@ class Overlay:
             self._set_busy(False)
         elif kind == "status":
             self._set_status(str(payload))
+        elif kind == "system":
+            self.add_sys(str(payload))
         elif kind == "update":
             self._update_available = str(payload)
             self.add_sys(f"🔔 Update available: v{payload} (you have v{__version__}). "

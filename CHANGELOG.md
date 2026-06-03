@@ -3,6 +3,23 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.1.2] — 2026-06-03
+
+### Fixed
+- **No more hard crashes / frozen windows** — hardened the app so a single hiccup can't
+  take it down:
+  - **Stream buffer raised from the SDK default 1 MB to 64 MB** (`max_buffer_size`).
+    Inline screenshots (base64, one per monitor) routinely pushed a single stream line
+    past 1 MB, which raised `CLIJSONDecodeError` and killed the worker — the most common
+    crash. (Passed only if the installed SDK supports it, so older installs still load.)
+  - **The UI event pump now survives any rendering error** and always reschedules itself.
+    A stray exception used to skip the next tick and permanently freeze the window —
+    still drawn, but never responding again.
+  - **The worker auto-reconnects on a dead transport** (decode / connection / process
+    errors) with a fresh session instead of erroring forever, and the worker thread
+    **auto-restarts (bounded)** instead of exiting for good.
+  - A failed initial connection is retried on the next message.
+
 ## [1.1.1] — 2026-06-03
 
 ### Added
@@ -76,6 +93,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.1.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.2
 [1.1.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.1
 [1.1.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.0
 [1.0.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.0.0
