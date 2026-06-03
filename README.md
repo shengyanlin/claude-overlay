@@ -199,6 +199,33 @@ you still need the `claude` CLI installed and logged in (see Prerequisites).
 
 ---
 
+## Update
+
+The overlay shows its version in the bottom status line (e.g. `v1.1.1`) and checks
+GitHub for a newer release on startup — when one exists you'll see a 🔔 note and a `⬆`
+next to the version. To upgrade:
+
+### 🖱️ One double-click — `update.cmd` (recommended)
+
+Double-click **`update.cmd`**. It runs `git pull` and refreshes the Python packages.
+
+### 🛠️ By hand
+
+```
+cd claude-overlay
+git pull
+```
+
+(Installed via **ZIP** instead of `git clone`? Re-download the latest ZIP from the green
+**Code** button and unzip it over the folder — at minimum replace `claude_overlay.py`.)
+
+> **Then restart the overlay.** It's a long-running process and does **not** reload
+> while running — close it and re-open **`Start Claude Overlay.cmd`** for the update to
+> take effect. (On a managed/enterprise machine, updating is what fixes the older
+> versions that could hang on the first tool call.)
+
+---
+
 ## Run
 
 1. Make sure `claude --version` works and you've logged in (`claude` → `/login`).

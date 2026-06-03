@@ -459,6 +459,7 @@ class Overlay:
         self._resize = None
         self._round_after = None
         self._capture_excluded = False   # set once WDA_EXCLUDEFROMCAPTURE is applied
+        self._update_available = None     # set to the newer version string if one exists
 
         SHOT_DIR.mkdir(parents=True, exist_ok=True)
         self._build()
@@ -518,6 +519,32 @@ class Overlay:
         self.root.bind("<Configure>", self._on_configure)
         self.root.after(170, self._apply_region)
         self.root.after(180, self._exclude_from_capture)
+        self.root.after(1200, self._check_for_update)
+
+    @staticmethod
+    def _parse_ver(s):
+        import re
+        nums = re.findall(r"\d+", s or "")
+        return tuple(int(n) for n in nums[:3]) if nums else (0,)
+
+    def _check_for_update(self):
+        """Best-effort: ask GitHub for the newest tag in a background thread and, if it's
+        newer than __version__, flag it. Stays silent on any failure (offline, GitHub
+        down, corporate TLS interception) so it never blocks or nags."""
+        def work():
+            try:
+                import urllib.request
+                req = urllib.request.Request(
+                    "https://api.github.com/repos/shengyanlin/claude-overlay/tags",
+                    headers={"User-Agent": "claude-overlay", "Accept": "application/vnd.github+json"})
+                with urllib.request.urlopen(req, timeout=6) as r:
+                    tags = json.load(r)
+                latest = max((self._parse_ver(t.get("name", "")) for t in tags), default=None)
+                if latest and latest > self._parse_ver(__version__):
+                    self.ui_q.put(("update", ".".join(map(str, latest))))
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
 
     def _exclude_from_capture(self):
         """Ask DWM to omit the overlay from screen captures so our own window never
@@ -1352,7 +1379,10 @@ class Overlay:
 
     def _refresh_statusline(self):
         p = f"{self._ctx_pct:.0f}%" if isinstance(self._ctx_pct, (int, float)) else "—"
-        self.statusline.configure(text=f"{self._model or 'Claude'} ▾   ·   context {p}", fg=T["muted"])
+        # version goes last so it clips first if the window is narrow; ⬆ flags an update
+        ver = f"v{__version__}" + ("  ⬆" if self._update_available else "")
+        self.statusline.configure(
+            text=f"{self._model or 'Claude'} ▾   ·   context {p}   ·   {ver}", fg=T["muted"])
 
     def _model_menu(self, e):
         m = tk.Menu(self.root, tearoff=0, bg=T["field"], fg=T["text"],
@@ -1416,6 +1446,11 @@ class Overlay:
             self._set_busy(False)
         elif kind == "status":
             self._set_status(str(payload))
+        elif kind == "update":
+            self._update_available = str(payload)
+            self.add_sys(f"🔔 Update available: v{payload} (you have v{__version__}). "
+                         "Close the overlay and run update.cmd (or: git pull) to upgrade.")
+            self._refresh_statusline()
 
     def _intro(self):
         self._ins("\n✦ Claude\n", "ah")
