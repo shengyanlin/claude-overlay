@@ -3,6 +3,45 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.1.5] — 2026-06-03
+
+### Fixed
+A full crash sweep by four parallel independent auditors (one per subsystem: threading,
+asyncio/transport, Tk/Win32, external inputs), most findings reproduced with a runnable
+test. 17 residual defects fixed — including a few introduced by the v1.1.4 changes:
+
+- **The response stream is now closed on every turn exit.** v1.1.4's idle-timeout cancelled
+  the stream read but never closed the async generator, which could leave the SDK's reader /
+  pipe half-open (a leak, or a later disconnect that hangs). Now `aclose()`d (bounded).
+- **Type-ahead capture can't get stuck off.** If monitor enumeration threw inside the
+  background pre-capture, the "busy" flag was never cleared and pre-capture silently stopped
+  for the rest of the session. It now always clears.
+- **A streamed reply can't get visually detached from its "Claude" header.** Transcript
+  pruning could delete the active header while the code still thought it was present; it now
+  re-arms so the next chunk re-adds the header. Pruning also caps by characters now, so one
+  giant unbroken line can't slip past the line cap.
+- **Stop / Clear can't crash after the worker has stopped.** Hitting Stop or Clear once the
+  background worker's event loop had closed raised straight into the UI; the interrupt path
+  now tolerates a closed loop.
+- **Quit can't leave an orphaned `claude` process.** Quitting while the worker was stuck
+  connecting now cancels that connect so it can shut down cleanly. Quit is also idempotent
+  (a fast double-close won't error).
+- **A long, *silent* tool run is no longer mistaken for a dead connection** — once a tool is
+  running, the no-activity timeout is much longer, so a quiet build/test isn't cut off.
+- **Pasting is bounded and never blocks the window.** The clipboard read itself now happens
+  off the UI thread (after a cheap "is there an image?" check), one paste runs at a time, the
+  file count per paste and the total queued attachments are capped, and a "decompression
+  bomb" image (tiny file, enormous decoded size) is rejected before it can blow up memory.
+- **A turn's attachments are bounded in aggregate** (count + total bytes + de-duplicated), not
+  just per file, so many accumulated images can't exhaust memory.
+- **The update check can't be abused** to make the app read a huge response — the body and
+  number of tags are capped before parsing.
+- **Zooming no longer garbles existing chat bubbles / tool chips** (they keep their own font
+  snapshot), the input box can't be sized negative during a tiny-width transient, the
+  screenshot folder degrades to a fallback if it can't be created, and the worker's restart
+  budget resets after a stable stretch (so rare failures spread over days don't add up to a
+  permanent stop).
+
 ## [1.1.4] — 2026-06-03
 
 ### Fixed
@@ -146,6 +185,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.1.5]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.5
 [1.1.4]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.4
 [1.1.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.3
 [1.1.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.2
