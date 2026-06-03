@@ -58,10 +58,10 @@ except Exception:
 
 from claude_agent_sdk import (  # noqa: E402
     ClaudeSDKClient, ClaudeAgentOptions, AssistantMessage, TextBlock,
-    ToolUseBlock, ResultMessage, StreamEvent,
+    ToolUseBlock, ResultMessage, StreamEvent, PermissionResultAllow,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -157,6 +157,16 @@ _MONENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p
                                   ctypes.POINTER(wt.RECT), ctypes.c_void_p)
 _user32.EnumDisplayMonitors.argtypes = [ctypes.c_void_p, ctypes.c_void_p, _MONENUMPROC, ctypes.c_void_p]
 _user32.EnumDisplayMonitors.restype = ctypes.c_int
+_user32.SetWindowDisplayAffinity.argtypes = [wt.HWND, ctypes.c_uint]
+_user32.SetWindowDisplayAffinity.restype = ctypes.c_int
+_user32.GetForegroundWindow.restype = wt.HWND
+
+# Exclude the overlay from screen captures at the OS level (DWM): the window stays
+# visible to the user but is omitted from PIL ImageGrab / PrintWindow, so the
+# screenshots we send Claude never contain the overlay obscuring the content — and
+# we no longer have to withdraw() + sleep() on every capture. Verified on this
+# machine (returns the content behind the window, not black).
+WDA_EXCLUDEFROMCAPTURE = 0x11
 
 
 class _MONITORINFO(ctypes.Structure):
@@ -219,17 +229,34 @@ class ClaudeWorker(threading.Thread):
         loop, client = self._loop, self._client
         if loop and client:
             asyncio.run_coroutine_threadsafe(self._do_set_model(client, model), loop)
+        else:
+            # not connected (e.g. _open failed) — otherwise the statusline is left
+            # stuck on "switching model…" forever.
+            self.ui.put(("error", "Not connected to Claude yet — can't switch model."))
 
     async def _do_set_model(self, client, model):
         try:
             await client.set_model(model)
             await self._emit_usage()
+            self.ui.put(("status", ""))   # clear the "switching model…" notice
         except Exception as e:
             self.ui.put(("error", f"set_model failed: {type(e).__name__}: {e}"))
+
+    async def _allow_tool(self, tool_name, input_data, context):
+        # Auto-approve every tool. permission_mode="bypassPermissions" already does
+        # this on most machines, but managed/enterprise installs can DISABLE bypass
+        # mode (managed-settings.json: disableBypassPermissionsMode), which makes the
+        # CLI fall back to "default" and emit a permission prompt. The overlay is a
+        # GUI with no TTY, so an unanswered prompt would just hang the turn forever
+        # ("nowhere to approve"). This callback answers those prompts so the overlay
+        # works regardless of the host's permission policy. The tool call still shows
+        # up as a chip in the chat via the normal streaming path, so it isn't silent.
+        return PermissionResultAllow()
 
     def _make_options(self) -> ClaudeAgentOptions:
         return ClaudeAgentOptions(
             permission_mode=PERMISSION_MODE, cwd=WORKING_DIR, model=MODEL,
+            can_use_tool=self._allow_tool,
             include_partial_messages=True,
             # exclude_dynamic_sections strips the per-turn-changing bits (cwd, git
             # status, auto-memory) out of the preset system prompt so the big static
@@ -431,6 +458,8 @@ class Overlay:
         self._drag = (0, 0)
         self._resize = None
         self._round_after = None
+        self._capture_excluded = False   # set once WDA_EXCLUDEFROMCAPTURE is applied
+        self._update_available = None     # set to the newer version string if one exists
 
         SHOT_DIR.mkdir(parents=True, exist_ok=True)
         self._build()
@@ -489,6 +518,45 @@ class Overlay:
         self.root.after(130, lambda: (self.root.focus_force(), self.entry.focus_set()))
         self.root.bind("<Configure>", self._on_configure)
         self.root.after(170, self._apply_region)
+        self.root.after(180, self._exclude_from_capture)
+        self.root.after(1200, self._check_for_update)
+
+    @staticmethod
+    def _parse_ver(s):
+        import re
+        nums = re.findall(r"\d+", s or "")
+        return tuple(int(n) for n in nums[:3]) if nums else (0,)
+
+    def _check_for_update(self):
+        """Best-effort: ask GitHub for the newest tag in a background thread and, if it's
+        newer than __version__, flag it. Stays silent on any failure (offline, GitHub
+        down, corporate TLS interception) so it never blocks or nags."""
+        def work():
+            try:
+                import urllib.request
+                req = urllib.request.Request(
+                    "https://api.github.com/repos/shengyanlin/claude-overlay/tags",
+                    headers={"User-Agent": "claude-overlay", "Accept": "application/vnd.github+json"})
+                with urllib.request.urlopen(req, timeout=6) as r:
+                    tags = json.load(r)
+                latest = max((self._parse_ver(t.get("name", "")) for t in tags), default=None)
+                if latest and latest > self._parse_ver(__version__):
+                    self.ui_q.put(("update", ".".join(map(str, latest))))
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def _exclude_from_capture(self):
+        """Ask DWM to omit the overlay from screen captures so our own window never
+        appears in the screenshots we send Claude. If it succeeds, capture() can skip
+        the withdraw()+sleep() dance entirely (no flicker, no UI freeze)."""
+        try:
+            self.root.update_idletasks()
+            hwnd = _user32.GetAncestor(self.root.winfo_id(), 2) or self.root.winfo_id()
+            if _user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE):
+                self._capture_excluded = True
+        except Exception:
+            self._capture_excluded = False
 
     def _build_titlebar(self):
         bar = tk.Frame(self.root, bg=T["bg"], height=self.px(44))
@@ -1166,7 +1234,11 @@ class Overlay:
         grab fails (used for the silent pre-capture path)."""
         mons = enumerate_monitors() or [{"rect": None, "primary": True}]
         geo = self.root.geometry()
-        if hide:
+        # If the OS is excluding us from capture, the overlay is already invisible to
+        # ImageGrab — no need to withdraw (which both flickers and freezes the UI for
+        # the 0.15s settle). Only fall back to hiding if exclusion isn't active.
+        do_hide = hide and not self._capture_excluded
+        if do_hide:
             self.root.withdraw()
             self.root.update()
             time.sleep(0.15)
@@ -1186,7 +1258,7 @@ class Overlay:
                 except Exception as ex:
                     err = ex
         finally:
-            if hide:
+            if do_hide:
                 self.root.deiconify()
                 self.root.overrideredirect(True)
                 self.root.geometry(geo)
@@ -1218,6 +1290,10 @@ class Overlay:
         self._paint_screen_toggle()
 
     def reset(self):
+        # Interrupt any in-flight turn FIRST. Otherwise the worker is blocked in
+        # receive_response() and the reset just queues behind it — meanwhile the tail
+        # of the old reply keeps streaming deltas into the chat we just cleared.
+        self.worker.interrupt()
         self.chat.delete("1.0", "end")
         self._claude_header = False
         self.worker.reset()
@@ -1264,18 +1340,33 @@ class Overlay:
     def _hotkey_fired(self):
         self._toggle_request = True
 
+    def _show_window(self):
+        self.root.deiconify()
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        self.root.lift()
+        self.root.after(40, lambda: (self.root.focus_force(), self.entry.focus_set()))
+        self.root.after(60, self._apply_region)
+        self.visible = True
+
     def toggle_visible(self):
-        if self.visible:
+        # Hidden → always show. Visible → only hide if we're already the foreground
+        # window; if we're visible-but-behind/unfocused, pressing the hotkey means
+        # "bring Claude to me", so raise+focus instead of making it vanish (the old
+        # behaviour, which felt like the hotkey "couldn't summon" the app).
+        if not self.visible:
+            self._show_window()
+            return
+        try:
+            hwnd = _user32.GetAncestor(self.root.winfo_id(), 2) or self.root.winfo_id()
+            fg = _user32.GetForegroundWindow()
+        except Exception:
+            hwnd, fg = 1, 0
+        if fg == hwnd:
             self.root.withdraw()
             self.visible = False
         else:
-            self.root.deiconify()
-            self.root.overrideredirect(True)
-            self.root.attributes("-topmost", True)
-            self.root.lift()
-            self.root.after(40, lambda: (self.root.focus_force(), self.entry.focus_set()))
-            self.root.after(60, self._apply_region)
-            self.visible = True
+            self._show_window()
 
     # ── status / busy ──
     def _set_status(self, text):
@@ -1288,7 +1379,10 @@ class Overlay:
 
     def _refresh_statusline(self):
         p = f"{self._ctx_pct:.0f}%" if isinstance(self._ctx_pct, (int, float)) else "—"
-        self.statusline.configure(text=f"{self._model or 'Claude'} ▾   ·   context {p}", fg=T["muted"])
+        # version goes last so it clips first if the window is narrow; ⬆ flags an update
+        ver = f"v{__version__}" + ("  ⬆" if self._update_available else "")
+        self.statusline.configure(
+            text=f"{self._model or 'Claude'} ▾   ·   context {p}   ·   {ver}", fg=T["muted"])
 
     def _model_menu(self, e):
         m = tk.Menu(self.root, tearoff=0, bg=T["field"], fg=T["text"],
@@ -1344,15 +1438,26 @@ class Overlay:
         elif kind == "error":
             self.add_err(str(payload))
             self._set_busy(False)
-        elif kind == "system":
-            self.add_sys(str(payload))
+        elif kind == "result":
+            # the SDK reports a turn that ended in error here even when no exception
+            # was raised on our side; surface it instead of dropping it silently.
+            if isinstance(payload, dict) and payload.get("is_error"):
+                self.add_err("The last turn ended with an error.")
+            self._set_busy(False)
+        elif kind == "status":
+            self._set_status(str(payload))
+        elif kind == "update":
+            self._update_available = str(payload)
+            self.add_sys(f"🔔 Update available: v{payload} (you have v{__version__}). "
+                         "Close the overlay and run update.cmd (or: git pull) to upgrade.")
+            self._refresh_statusline()
 
     def _intro(self):
         self._ins("\n✦ Claude\n", "ah")
         self._ins("Hi — I float on top of everything. Ask me anything and I'll look at "
                   "your screen to help.\n"
-                  f"Enter to send · Shift+Enter for a new line · Ctrl +/− to zoom text · "
-                  f"drag an edge to resize · {HOTKEY} to summon/hide me.", "a")
+                  "Enter to send · Shift+Enter for a new line · Ctrl +/− to zoom text · "
+                  "drag an edge to resize.", "a")
         self._claude_header = True
 
     # ── shutdown ──

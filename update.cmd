@@ -1,0 +1,50 @@
+@echo off
+rem Update Claude Overlay to the latest version (git pull + refresh packages).
+cd /d "%~dp0"
+echo ============================================================
+echo   Claude Overlay - update
+echo ============================================================
+echo.
+
+rem --- needs git + a clone to pull into ---
+where git >nul 2>nul
+if errorlevel 1 (
+  echo [X] git not found. You probably installed via the ZIP download.
+  echo     Re-download the latest ZIP from the green "Code" button at
+  echo       https://github.com/shengyanlin/claude-overlay
+  echo     and unzip it over this folder ^(replace claude_overlay.py^).
+  pause & exit /b 1
+)
+git rev-parse --is-inside-work-tree >nul 2>nul
+if errorlevel 1 (
+  echo [X] This folder isn't a git clone, so there's nothing to pull.
+  echo     Re-download the latest ZIP from
+  echo       https://github.com/shengyanlin/claude-overlay
+  pause & exit /b 1
+)
+
+echo Pulling the latest code...
+git pull
+if errorlevel 1 (
+  echo [X] git pull failed ^(see above^). If you edited files locally, stash or
+  echo     revert them first, then re-run update.cmd.
+  pause & exit /b 1
+)
+
+rem --- refresh Python packages (best-effort: catches occasional SDK fixes) ---
+set "PY="
+where python >nul 2>nul && set "PY=python"
+if not defined PY ( where py >nul 2>nul && set "PY=py -3" )
+if defined PY (
+  echo.
+  echo Refreshing Python packages ^(claude-agent-sdk, pillow, keyboard^)...
+  %PY% -m pip install --upgrade --quiet claude-agent-sdk pillow keyboard
+)
+
+echo.
+echo ============================================================
+echo   [OK] Updated. IMPORTANT: close the running overlay and
+echo   re-open it ^("Start Claude Overlay.cmd"^) for the changes
+echo   to take effect - it does not reload while running.
+echo ============================================================
+pause
