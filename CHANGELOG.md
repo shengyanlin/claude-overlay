@@ -3,6 +3,115 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.1.5] — 2026-06-03
+
+### Fixed
+A full crash sweep by four parallel independent auditors (one per subsystem: threading,
+asyncio/transport, Tk/Win32, external inputs), most findings reproduced with a runnable
+test. 17 residual defects fixed — including a few introduced by the v1.1.4 changes:
+
+- **The response stream is now closed on every turn exit.** v1.1.4's idle-timeout cancelled
+  the stream read but never closed the async generator, which could leave the SDK's reader /
+  pipe half-open (a leak, or a later disconnect that hangs). Now `aclose()`d (bounded).
+- **Type-ahead capture can't get stuck off.** If monitor enumeration threw inside the
+  background pre-capture, the "busy" flag was never cleared and pre-capture silently stopped
+  for the rest of the session. It now always clears.
+- **A streamed reply can't get visually detached from its "Claude" header.** Transcript
+  pruning could delete the active header while the code still thought it was present; it now
+  re-arms so the next chunk re-adds the header. Pruning also caps by characters now, so one
+  giant unbroken line can't slip past the line cap.
+- **Stop / Clear can't crash after the worker has stopped.** Hitting Stop or Clear once the
+  background worker's event loop had closed raised straight into the UI; the interrupt path
+  now tolerates a closed loop.
+- **Quit can't leave an orphaned `claude` process.** Quitting while the worker was stuck
+  connecting now cancels that connect so it can shut down cleanly. Quit is also idempotent
+  (a fast double-close won't error).
+- **A long, *silent* tool run is no longer mistaken for a dead connection** — once a tool is
+  running, the no-activity timeout is much longer, so a quiet build/test isn't cut off.
+- **Pasting is bounded and never blocks the window.** The clipboard read itself now happens
+  off the UI thread (after a cheap "is there an image?" check), one paste runs at a time, the
+  file count per paste and the total queued attachments are capped, and a "decompression
+  bomb" image (tiny file, enormous decoded size) is rejected before it can blow up memory.
+- **A turn's attachments are bounded in aggregate** (count + total bytes + de-duplicated), not
+  just per file, so many accumulated images can't exhaust memory.
+- **The update check can't be abused** to make the app read a huge response — the body and
+  number of tags are capped before parsing.
+- **Zooming no longer garbles existing chat bubbles / tool chips** (they keep their own font
+  snapshot), the input box can't be sized negative during a tiny-width transient, the
+  screenshot folder degrades to a fallback if it can't be created, and the worker's restart
+  budget resets after a stable stretch (so rare failures spread over days don't add up to a
+  permanent stop).
+
+## [1.1.4] — 2026-06-03
+
+### Fixed
+Residual crash/hang/freeze hardening from a second, independent adversarial audit (none
+of these overlap the v1.1.1–v1.1.3 fixes):
+- **A fast reply can no longer freeze the window.** The UI event pump used to drain its
+  whole queue in one go, so a rapid stream could monopolize the main thread for seconds
+  (no repaint, no Stop, no hotkey). The drain is now time-sliced (~12 ms budget) and
+  adjacent text deltas are coalesced into a single insert.
+- **A wedged connection can't hang the app forever.** A hang isn't an exception, so the
+  reconnect/restart guards (which only fire on a *raised* error) couldn't reach an SDK
+  call that never returns. `connect`, `query`, `disconnect`, and the response stream now
+  each have a hard timeout; a timeout is treated as a dead transport and triggers a clean
+  reconnect instead of a permanent "thinking…".
+- **A pasted file that isn't a real image is no longer inlined.** When normalizing a
+  pasted image failed, the original path was still attached — so a multi-GB file with a
+  `.png` name could be read whole into memory. Failures are now skipped (with a notice),
+  and `_build_query` caps the per-image byte size before reading.
+- **Pasting and pre-capture no longer block the UI thread.** Opening/decoding/downscaling a
+  pasted image, and the type-ahead screen pre-capture, now run on a background thread and
+  post their result back — a slow/remote/cloud-placeholder file or a wedged display stack
+  can't freeze typing.
+- **The transcript is now bounded.** A very long session used to keep growing one Tk text
+  widget and an embedded canvas per message; the oldest content is now pruned so layout
+  stays fast and the embedded canvases are freed.
+- **Switching model is serialized** through the worker queue, so it can't interleave with a
+  reset/disconnect tearing down the same client.
+- Minor: screenshot pruning is fully best-effort (a concurrent deleter can't make it throw
+  out of capture/paste), and a failed window-region call frees its GDI region instead of
+  leaking it.
+
+## [1.1.3] — 2026-06-03
+
+### Fixed
+- **Pasting a long unbroken string no longer freezes the UI.** A whitespace-free blob
+  (URL / base64 / minified JSON / hash) sent as a message hit Tk's ~O(n²) canvas
+  word-wrap in the chat bubble — a 1 MB paste froze the window for 25–75 s. The bubble
+  echo is now length-capped and long runs are broken (1 MB → 0.07 s).
+- **`asyncio.CancelledError` no longer kills the worker.** It's a `BaseException`, so it
+  slipped past every `except Exception` (in the turn loop, `_amain`, `run`, `_open`) —
+  a cancelled receive (Stop / transport teardown) permanently zombied the worker. The
+  turn loop, reconnect, and bounded restart now handle `BaseException`/`CancelledError`.
+- **Malformed CLI stream frames can't abort a turn.** `_dispatch` is hardened against a
+  corrupted block table, an unhashable block index, and `content=None`, and skips a bad
+  frame instead of raising (which previously also skipped the reconnect path).
+- **Pasted images are now downscaled** to the same long-edge cap as screenshots, so a
+  pasted 4K/8K image (hundreds of MB of base64) can't overflow the stream buffer.
+- **Old `claude-agent-sdk` installs load with a clear message.** Option kwargs the
+  installed SDK doesn't support are stripped one-by-one (not just `max_buffer_size`), and
+  an SDK-too-old failure now says to upgrade instead of "CLI not installed".
+- Minor hardening: 0-byte images are skipped, `None` chat text is coerced, the update
+  check tolerates absurd version strings, and a malformed theme colour degrades to grey.
+
+## [1.1.2] — 2026-06-03
+
+### Fixed
+- **No more hard crashes / frozen windows** — hardened the app so a single hiccup can't
+  take it down:
+  - **Stream buffer raised from the SDK default 1 MB to 64 MB** (`max_buffer_size`).
+    Inline screenshots (base64, one per monitor) routinely pushed a single stream line
+    past 1 MB, which raised `CLIJSONDecodeError` and killed the worker — the most common
+    crash. (Passed only if the installed SDK supports it, so older installs still load.)
+  - **The UI event pump now survives any rendering error** and always reschedules itself.
+    A stray exception used to skip the next tick and permanently freeze the window —
+    still drawn, but never responding again.
+  - **The worker auto-reconnects on a dead transport** (decode / connection / process
+    errors) with a fresh session instead of erroring forever, and the worker thread
+    **auto-restarts (bounded)** instead of exiting for good.
+  - A failed initial connection is retried on the next message.
+
 ## [1.1.1] — 2026-06-03
 
 ### Added
@@ -76,6 +185,10 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.1.5]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.5
+[1.1.4]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.4
+[1.1.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.3
+[1.1.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.2
 [1.1.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.1
 [1.1.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.0
 [1.0.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.0.0
