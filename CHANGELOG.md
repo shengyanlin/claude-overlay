@@ -3,6 +3,35 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] — 2026-06-03
+
+### Added
+- **In-app version + update check** — the status line shows the running version (e.g.
+  `v1.1.1`), and on startup the overlay checks GitHub for a newer tag in the background.
+  When one exists you get a 🔔 note and a `⬆` next to the version. Best-effort and silent
+  on failure (offline / corporate TLS interception), so it never nags or blocks.
+- **`update.cmd`** — one double-click updater: `git pull` + refresh the Python packages,
+  with a clear "restart the overlay" reminder (and ZIP-install fallback guidance).
+
+### Fixed
+- **Works when bypass-permissions mode is disabled by policy** — a `can_use_tool`
+  callback auto-approves tools, so the overlay no longer hangs forever on the first tool
+  call in managed/enterprise installs (a GUI has no TTY to answer the permission prompt).
+- **Screenshots no longer include the overlay itself** — the window is excluded from
+  screen capture at the OS level (`WDA_EXCLUDEFROMCAPTURE`), so it can't obscure the
+  content you send Claude. This also removes the `withdraw()` + 150 ms sleep on every
+  capture (no flicker, no UI freeze); falls back to the old hide path if exclusion isn't
+  available.
+- **Clear** interrupts the in-flight turn before resetting, so the tail of the old reply
+  no longer streams into the just-cleared chat.
+- **Hotkey** now raises + focuses a visible-but-unfocused window instead of hiding it
+  (the old toggle made the hotkey feel like it "couldn't summon" the app).
+- Turns that end in error (`ResultMessage`) are surfaced instead of dropped; switching
+  model reports when not connected and clears the stuck "switching model…" status.
+
+### Changed
+- The global hotkey is no longer advertised in the first-run greeting (it still works).
+
 ## [1.1.0] — 2026-06-01
 
 ### Added
@@ -47,5 +76,6 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.1.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.1
 [1.1.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.0
 [1.0.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.0.0
