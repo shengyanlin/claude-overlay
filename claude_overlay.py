@@ -72,7 +72,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -279,14 +279,21 @@ class ClaudeWorker(threading.Thread):
             system_prompt={"type": "preset", "preset": "claude_code",
                            "append": SYSTEM_APPEND, "exclude_dynamic_sections": True},
         )
-        # max_buffer_size was added in a later SDK; pass it only if supported so we
-        # don't break on older installs that would reject the unknown kwarg.
-        try:
-            opts["max_buffer_size"] = MAX_BUFFER_SIZE
-            return ClaudeAgentOptions(**opts)
-        except TypeError:
-            opts.pop("max_buffer_size", None)
-            return ClaudeAgentOptions(**opts)
+        opts["max_buffer_size"] = MAX_BUFFER_SIZE
+        # Some kwargs (max_buffer_size, can_use_tool) only exist on newer SDKs. Strip any
+        # the installed SDK rejects, one at a time, so an older install still loads (with
+        # reduced features) instead of failing to construct options at all.
+        droppable = ["max_buffer_size", "can_use_tool", "include_partial_messages"]
+        while True:
+            try:
+                return ClaudeAgentOptions(**opts)
+            except TypeError as e:
+                victim = next((k for k in droppable if k in opts and k in str(e)), None)
+                if victim is None:
+                    victim = next((k for k in droppable if k in opts), None)
+                if victim is None:
+                    raise
+                opts.pop(victim, None)
 
     def run(self):
         # Bounded auto-restart: even if _amain falls over entirely (e.g. the event loop
@@ -298,7 +305,7 @@ class ClaudeWorker(threading.Thread):
             try:
                 asyncio.run(self._amain())
                 return                      # _amain returned cleanly (stop requested)
-            except Exception as e:  # pragma: no cover
+            except BaseException as e:  # pragma: no cover  (BaseException: e.g. CancelledError)
                 self.ui.put(("error", f"worker restarting after: {type(e).__name__}: {e}"))
                 self._client = None
                 time.sleep(0.5)
@@ -327,7 +334,12 @@ class ClaudeWorker(threading.Thread):
                     self.ui.put(("reset_done", None))
                 elif kind == "ask":
                     await self._run_turn(payload)
-            except Exception as e:
+            except asyncio.CancelledError:
+                # a cancel (Stop / transport teardown) must not break the loop or be
+                # mistaken for a fatal error — CancelledError is BaseException, not
+                # Exception, so it would otherwise escape and kill the worker.
+                self.ui.put(("turn_done", None))
+            except BaseException as e:
                 self.ui.put(("error", f"{type(e).__name__}: {e}"))
                 self.ui.put(("turn_done", None))
                 await self._reconnect()
@@ -351,13 +363,18 @@ class ClaudeWorker(threading.Thread):
             await self._client.connect()
             self.ui.put(("ready", None))
             await self._emit_usage()
-        except Exception as e:
+        except BaseException as e:   # incl. CancelledError — _open must never propagate
             self._client = None
-            self.ui.put(("error",
-                f"Could not start Claude: {type(e).__name__}: {e}\n"
-                "Is the `claude` CLI installed and logged in? Run `claude --version` "
-                "in a terminal; if it's missing, run setup.cmd (or `irm "
-                "https://claude.ai/install.ps1 | iex`), then `claude` to /login."))
+            if isinstance(e, TypeError):   # ClaudeAgentOptions rejected a kwarg → SDK too old
+                self.ui.put(("error",
+                    f"Your claude-agent-sdk looks too old ({type(e).__name__}: {e}). "
+                    "Update it:  pip install --upgrade claude-agent-sdk  (or run update.cmd)."))
+            else:
+                self.ui.put(("error",
+                    f"Could not start Claude: {type(e).__name__}: {e}\n"
+                    "Is the `claude` CLI installed and logged in? Run `claude --version` "
+                    "in a terminal; if it's missing, run setup.cmd (or `irm "
+                    "https://claude.ai/install.ps1 | iex`), then `claude` to /login."))
 
     async def _emit_usage(self):
         """Push current model + context-window usage % to the UI statusline."""
@@ -392,7 +409,12 @@ class ClaudeWorker(threading.Thread):
             blocks: dict = {}
             async for msg in self._client.receive_response():
                 self._dispatch(msg, blocks)
-        except Exception as e:
+        except asyncio.CancelledError:
+            # Stop button / interrupt() / transport cancel — end this turn cleanly.
+            # (BaseException, so it'd otherwise escape every `except Exception` and the
+            # worker thread would die permanently.) Don't reconnect; shutdown is queue-driven.
+            self.ui.put(("system", "⏹ stopped."))
+        except BaseException as e:
             self.ui.put(("error", f"{type(e).__name__}: {e}"))
             # a decode/connection/process error means the transport is dead — the client
             # is unusable now, so rebuild it before the next turn instead of erroring
@@ -426,6 +448,9 @@ class ClaudeWorker(threading.Thread):
             except Exception:
                 failed += 1
                 continue
+            if not data:            # 0-byte / unreadable-as-empty → don't send a blank block
+                failed += 1
+                continue
             ext = Path(p).suffix.lower()
             mt = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
                   ".gif": "image/gif"}.get(ext, "image/png")
@@ -446,6 +471,16 @@ class ClaudeWorker(threading.Thread):
         return _one()
 
     def _dispatch(self, msg, blocks: dict):
+        # The contents are untrusted CLI stream-json — a single malformed frame
+        # (non-dict block value, unhashable index, content=None, …) must never abort
+        # the turn (which would also skip the reconnect logic). Skip the bad frame and
+        # keep streaming.
+        try:
+            self._dispatch_inner(msg, blocks)
+        except Exception:
+            pass
+
+    def _dispatch_inner(self, msg, blocks: dict):
         if isinstance(msg, StreamEvent):
             self._saw_stream = True
             ev = msg.event or {}
@@ -461,12 +496,15 @@ class ClaudeWorker(threading.Thread):
                 if dt == "text_delta":
                     self.ui.put(("delta", d.get("text", "")))
                 elif dt == "input_json_delta":
-                    b = blocks.setdefault(idx, {"type": "tool_use", "name": None, "buf": ""})
-                    b["buf"] += d.get("partial_json", "")
+                    b = blocks.get(idx)
+                    if not isinstance(b, dict):   # corrupted/missing → reset to a fresh buf
+                        b = {"type": "tool_use", "name": None, "buf": ""}
+                        blocks[idx] = b
+                    b["buf"] = (b.get("buf") or "") + (d.get("partial_json") or "")
             elif t == "content_block_stop":
                 idx = ev.get("index")
-                b = blocks.get(idx) or {}
-                if b.get("type") == "tool_use":
+                b = blocks.get(idx)
+                if isinstance(b, dict) and b.get("type") == "tool_use":
                     try:
                         inp = json.loads(b.get("buf") or "{}")
                     except Exception:
@@ -476,13 +514,14 @@ class ClaudeWorker(threading.Thread):
             if getattr(msg, "model", None):
                 self.ui.put(("model", msg.model))
             if not self._saw_stream:
-                for blk in msg.content:
+                for blk in (getattr(msg, "content", None) or []):
                     if isinstance(blk, TextBlock):
                         self.ui.put(("delta", blk.text))
                     elif isinstance(blk, ToolUseBlock):
                         self.ui.put(("tool", (blk.name, blk.input)))
         elif isinstance(msg, ResultMessage):
-            self.ui.put(("result", {"cost": msg.total_cost_usd, "is_error": msg.is_error}))
+            self.ui.put(("result", {"cost": getattr(msg, "total_cost_usd", None),
+                                    "is_error": getattr(msg, "is_error", False)}))
 
 
 # ───────────────────────────── the overlay UI ─────────────────────────────
@@ -589,8 +628,10 @@ class Overlay:
     @staticmethod
     def _parse_ver(s):
         import re
-        nums = re.findall(r"\d+", s or "")
-        return tuple(int(n) for n in nums[:3]) if nums else (0,)
+        # str() so a non-string tag name can't throw; [:9] caps digits so a hostile
+        # 1MB-digit "version" can't hit Python's int-from-string limit (ValueError).
+        nums = re.findall(r"\d+", str(s or ""))
+        return tuple(int(n[:9]) for n in nums[:3]) if nums else (0,)
 
     def _check_for_update(self):
         """Best-effort: ask GitHub for the newest tag in a background thread and, if it's
@@ -749,11 +790,19 @@ class Overlay:
     # ── glossy 3-D orb (rendered with Pillow, cached per size+state) ──
     @staticmethod
     def _rgb(hex_):
-        hex_ = hex_.lstrip("#")
-        return tuple(int(hex_[i:i + 2], 16) for i in (0, 2, 4))
+        # tolerate a malformed THEMES hex (empty / short / non-hex) rather than crashing
+        # at startup before any guard exists; fall back to a neutral grey.
+        h = (hex_ or "").lstrip("#")
+        try:
+            if len(h) < 6:
+                raise ValueError(h)
+            return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+        except Exception:
+            return (128, 128, 128)
 
     @staticmethod
     def _mix(a, b, t):
+        t = 0.0 if not (t == t) else t   # NaN guard (NaN fails all comparisons)
         t = 0.0 if t < 0 else 1.0 if t > 1 else t
         return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
 
@@ -950,21 +999,37 @@ class Overlay:
             data = None
         paths = []
         if isinstance(data, Image.Image):
-            p = SHOT_DIR / f"shot_{int(time.time() * 1000)}_paste.png"
-            try:
-                data.save(p)
-            except Exception:
-                data.convert("RGB").save(p)
-            paths.append(str(p))
+            p = self._stash_image(data)
+            if p:
+                paths.append(p)
         elif isinstance(data, list):
             for f in data:
                 if str(f).lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")):
-                    paths.append(str(f))
+                    paths.append(self._stash_image(f) or str(f))
         if paths:
             self.pending_images.extend(paths)
             self._refresh_attach()
             return "break"      # don't paste image bytes as garbage text
         return None             # plain text → let the normal paste happen
+
+    def _stash_image(self, src):
+        """Save a clipboard image (or a copy of a pasted image file) into SHOT_DIR,
+        downscaled to SHOT_MAX_EDGE so a pasted 4K/8K image can't blow past the stream
+        buffer (capture() already does this for screenshots; paste used not to).
+        Returns the saved path, or None on failure so the caller can fall back."""
+        try:
+            img = src if isinstance(src, Image.Image) else Image.open(src)
+            if SHOT_MAX_EDGE and max(img.size) > SHOT_MAX_EDGE:
+                img.thumbnail((SHOT_MAX_EDGE, SHOT_MAX_EDGE), Image.LANCZOS)
+            p = SHOT_DIR / f"shot_{int(time.time() * 1000)}_paste.png"
+            try:
+                img.save(p)
+            except Exception:
+                img.convert("RGB").save(p)
+            self._prune_shots()
+            return str(p)
+        except Exception:
+            return None
 
     def _refresh_attach(self):
         n = len(self.pending_images)
@@ -1099,6 +1164,7 @@ class Overlay:
         return "break"
 
     def _ins(self, text, *tags):
+        text = "" if text is None else str(text)   # Tk insert rejects None
         at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", text, tags)
         if at_bottom:
@@ -1113,14 +1179,37 @@ class Overlay:
         if at_bottom:
             self.chat.see("end")
 
+    @staticmethod
+    def _clip_bubble(text):
+        """Sanitize text for the bubble's *echo* only (the full text already went to
+        Claude). Tk's canvas word-wrap is ~O(n²) on whitespace-free strings, so a pasted
+        URL / base64 / minified-JSON blob would freeze the UI for seconds. Cap the length
+        and break up long unbroken runs so wrapping stays linear."""
+        s = "" if text is None else str(text)
+        if len(s) > 2000:
+            s = s[:2000] + " …"
+        out, run = [], 0
+        for ch in s:
+            if ch.isspace():
+                run = 0
+            else:
+                run += 1
+                if run >= 50:        # force a wrap opportunity in a long unbroken run
+                    out.append(" ")
+                    run = 0
+            out.append(ch)
+        return "".join(out)
+
     def _user_bubble(self, text):
         """A right-aligned rounded chat bubble (drawn on a full-width canvas)."""
+        text = self._clip_bubble(text)
         full = max(self.px(200), self.chat.winfo_width() - 2 * self.px(18))
         maxw = max(self.px(140), int(full * 0.74))
         padx, pady, rad = self.px(13), self.px(9), self.px(14)
         c = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0)
         tmp = c.create_text(0, 0, text=text, font=self.f_body, width=maxw, anchor="nw")
-        x1, y1, x2, y2 = c.bbox(tmp)
+        bb = c.bbox(tmp)
+        x1, y1, x2, y2 = bb if bb else (0, 0, maxw, self.px(18))
         c.delete(tmp)
         bw, bh = (x2 - x1) + 2 * padx, (y2 - y1) + 2 * pady
         bx = full - bw                                  # hug the right edge
@@ -1172,10 +1261,10 @@ class Overlay:
         return c
 
     def add_sys(self, text):
-        self._ins("\n" + text + "\n", "sys")
+        self._ins("\n" + ("" if text is None else str(text)) + "\n", "sys")
 
     def add_err(self, text):
-        self._ins("\n⚠  " + text + "\n", "err")
+        self._ins("\n⚠  " + ("" if text is None else str(text)) + "\n", "err")
 
     @staticmethod
     def _summ(inp, maxlen=84):

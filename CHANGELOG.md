@@ -3,6 +3,28 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.1.3] — 2026-06-03
+
+### Fixed
+- **Pasting a long unbroken string no longer freezes the UI.** A whitespace-free blob
+  (URL / base64 / minified JSON / hash) sent as a message hit Tk's ~O(n²) canvas
+  word-wrap in the chat bubble — a 1 MB paste froze the window for 25–75 s. The bubble
+  echo is now length-capped and long runs are broken (1 MB → 0.07 s).
+- **`asyncio.CancelledError` no longer kills the worker.** It's a `BaseException`, so it
+  slipped past every `except Exception` (in the turn loop, `_amain`, `run`, `_open`) —
+  a cancelled receive (Stop / transport teardown) permanently zombied the worker. The
+  turn loop, reconnect, and bounded restart now handle `BaseException`/`CancelledError`.
+- **Malformed CLI stream frames can't abort a turn.** `_dispatch` is hardened against a
+  corrupted block table, an unhashable block index, and `content=None`, and skips a bad
+  frame instead of raising (which previously also skipped the reconnect path).
+- **Pasted images are now downscaled** to the same long-edge cap as screenshots, so a
+  pasted 4K/8K image (hundreds of MB of base64) can't overflow the stream buffer.
+- **Old `claude-agent-sdk` installs load with a clear message.** Option kwargs the
+  installed SDK doesn't support are stripped one-by-one (not just `max_buffer_size`), and
+  an SDK-too-old failure now says to upgrade instead of "CLI not installed".
+- Minor hardening: 0-byte images are skipped, `None` chat text is coerced, the update
+  check tolerates absurd version strings, and a malformed theme colour degrades to grey.
+
 ## [1.1.2] — 2026-06-03
 
 ### Fixed
@@ -93,6 +115,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.1.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.3
 [1.1.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.2
 [1.1.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.1
 [1.1.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.0
