@@ -3,6 +3,22 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.1.7] — 2026-06-04
+
+### Fixed
+- **The overlay no longer burns a third of the context window on MCP tools you never use.**
+  With the `claude_code` preset, the spawned CLI loaded *every* MCP server configured in your
+  `~/.claude.json` and injected all of their tool schemas into the context — measured at
+  ~72K tokens (36% of a 200K window) on a machine with many MCP servers, materialized on the
+  first message even for a tiny text-only prompt. A single short message could appear to jump
+  the context gauge ~30%. The overlay is a lightweight screen-chat that only needs the core
+  Claude Code tools, so it now sets `strict_mcp_config=True` and does not inherit your MCP
+  servers. Measured before → after (Haiku): a text turn went from 53% → **19%** of context;
+  a 2-screenshot turn from 58% → **20%**. (New top-of-file `STRICT_MCP_CONFIG` constant —
+  flip to `False` if you *want* your MCP tools available in the overlay.) Note: this is not a
+  gauge bug — `get_context_usage()` was reporting real usage; and screenshots were never the
+  culprit (two downscaled monitors cost only ~3K tokens).
+
 ## [1.1.6] — 2026-06-04
 
 ### Fixed

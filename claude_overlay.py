@@ -72,7 +72,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.1.6"
+__version__ = "1.1.7"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -85,6 +85,12 @@ MODEL = "claude-opus-4-8"
 MODELS = [("Opus 4.8", "claude-opus-4-8"), ("Opus 4.8 (1M)", "claude-opus-4-8[1m]"),
           ("Sonnet", "sonnet"), ("Haiku", "haiku")]  # click the statusline to switch
 PERMISSION_MODE = "bypassPermissions"
+STRICT_MCP_CONFIG = True          # do NOT inherit the user's ~/.claude MCP servers. The overlay
+                                  # is a lightweight screen-chat that only needs the core Claude
+                                  # Code tools; inheriting every MCP server the user has configured
+                                  # (Atlassian, Figma, M365, …) injects their tool schemas into the
+                                  # context — easily 50-70K+ tokens, a third of a 200K window, gone
+                                  # before you type. Flip to False to expose your MCP tools here.
 AUTO_SCREENSHOT_DEFAULT = True
 HIDE_SCREENSHOT_TOOL = True       # hide the noisy "⚙ Read …shot_*.png" lines every turn
 HOTKEY = "ctrl+alt+space"
@@ -338,10 +344,18 @@ class ClaudeWorker(threading.Thread):
                            "append": SYSTEM_APPEND, "exclude_dynamic_sections": True},
         )
         opts["max_buffer_size"] = MAX_BUFFER_SIZE
-        # Some kwargs (max_buffer_size, can_use_tool) only exist on newer SDKs. Strip any
-        # the installed SDK rejects, one at a time, so an older install still loads (with
-        # reduced features) instead of failing to construct options at all.
-        droppable = ["max_buffer_size", "can_use_tool", "include_partial_messages"]
+        if STRICT_MCP_CONFIG:
+            # Use ONLY the (empty) MCP servers defined here, ignoring the user's filesystem
+            # config. Without this the spawned CLI loads every MCP server from ~/.claude.json
+            # and injects all their tool schemas — measured at 72K tokens (36% of Haiku's
+            # 200K window) on one BCG machine, gone before the first message. setting_sources
+            # alone does NOT stop this; the CLI loads MCP servers via a separate path.
+            opts["strict_mcp_config"] = True
+        # Some kwargs (max_buffer_size, can_use_tool, strict_mcp_config) only exist on newer
+        # SDKs. Strip any the installed SDK rejects, one at a time, so an older install still
+        # loads (with reduced features) instead of failing to construct options at all.
+        droppable = ["strict_mcp_config", "max_buffer_size", "can_use_tool",
+                     "include_partial_messages"]
         while True:
             try:
                 return ClaudeAgentOptions(**opts)
