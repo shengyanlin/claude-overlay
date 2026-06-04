@@ -20,6 +20,7 @@ claude_overlay_shots/
 # Local launch / marketing / progress notes (keep out of the public repo)
 LAUNCH_KIT.md
 PROGRESS.md
+CODEX_CRASH_AUDIT.md
 
 # OS / editor
 .DS_Store

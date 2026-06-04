@@ -3,6 +3,18 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.1.6] — 2026-06-04
+
+### Fixed
+- **`Create Desktop Shortcut.cmd` no longer fails on install.** The launcher passed its
+  own folder to PowerShell as `"%~dp0"`, which always ends in a backslash — so the closing
+  `\"` was parsed as an escaped literal quote (CommandLineToArgvW rules), baking a stray `"`
+  into the path. `Test-Path` then threw `Illegal characters in path` and no shortcut was
+  created. The script now relies on PowerShell's built-in `$PSScriptRoot` (no path argument),
+  and `create-shortcut.ps1` additionally strips any stray quote / trailing backslash from
+  `-Dir` so it tolerates any caller. (The other `.cmd` files use `cd /d "%~dp0"`, a cmd
+  builtin that isn't affected.)
+
 ## [1.1.5] — 2026-06-03
 
 ### Fixed

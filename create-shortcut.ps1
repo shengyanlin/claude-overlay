@@ -3,6 +3,11 @@
 # location, so it works wherever you cloned the repo.
 param([string]$Dir = $PSScriptRoot)
 
+# Defensive: tolerate a caller that passes a quoted path or a trailing backslash
+# (e.g. "%~dp0" expands to "...\claude-overlay\" and CommandLineToArgvW turns the
+# closing \" into a literal quote, which would otherwise poison the path).
+$Dir = $Dir.Trim('"').TrimEnd('\')
+
 $launcher = Join-Path $Dir 'Start Claude Overlay.cmd'
 if (-not (Test-Path $launcher)) {
     Write-Host "ERROR: 'Start Claude Overlay.cmd' not found next to this script ($Dir)." -ForegroundColor Red
