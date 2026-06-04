@@ -72,7 +72,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.1.8"
+__version__ = "1.1.9"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -765,6 +765,7 @@ class Overlay:
         self._drag = (0, 0)
         self._resize = None
         self._round_after = None
+        self._last_cfg_size = None   # last (w,h) we re-applied the window region for
         self._capture_excluded = False   # set once WDA_EXCLUDEFROMCAPTURE is applied
         self._update_available = None     # set to the newer version string if one exists
 
@@ -1402,10 +1403,23 @@ class Overlay:
             pass
 
     def _on_configure(self, e):
-        if e.widget is self.root:
-            if self._round_after:
-                self.root.after_cancel(self._round_after)
-            self._round_after = self.root.after(50, self._apply_region)
+        if e.widget is not self.root:
+            return
+        # The rounded/elliptic region depends ONLY on the window SIZE (and expanded state),
+        # not its position. Re-applying on every <Configure> — move-only events, and the
+        # redraw that SetWindowRgn(…, bRedraw=True) itself triggers — spun _apply_region in a
+        # ~50 ms self-feeding loop (SetWindowRgn → repaint → <Configure> → reschedule), and
+        # each pass ran update_idletasks() (a full layout flush, expensive on a big chat).
+        # That intermittently starved the UI thread: scrolling froze, the reply only rendered
+        # in the gaps. Only re-apply when the size actually changed; collapse/expand still
+        # re-apply explicitly via their own after(_apply_region) calls.
+        size = (e.width, e.height)
+        if size == self._last_cfg_size:
+            return
+        self._last_cfg_size = size
+        if self._round_after:
+            self.root.after_cancel(self._round_after)
+        self._round_after = self.root.after(50, self._apply_region)
 
     def _apply_region(self):
         try:

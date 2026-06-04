@@ -3,6 +3,20 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.1.9] — 2026-06-04
+
+### Fixed
+- **The window no longer intermittently freezes / refuses to scroll.** The rounded-corner
+  window region was re-applied on *every* `<Configure>` event. Because `SetWindowRgn(…,
+  bRedraw=True)` forces a repaint that itself emits another `<Configure>`, this self-fed a
+  ~50 ms loop, and each pass also ran `update_idletasks()` (a full layout flush). On a busy
+  window that intermittently monopolized the UI thread: scrolling locked up and a streamed
+  reply only rendered in the gaps. The region depends only on the window **size** (and
+  collapsed/expanded state), not its position, so it's now re-applied only when the size
+  actually changes — measured idle CPU dropped from ~9% to ~2%. (Found by sampling the live
+  process with `py-spy`: `_apply_region`/`SetWindowRgn` was ~56% of the UI thread's active
+  time. Transcript rendering was ruled out — inserts stay ~0.16 ms even on a 300K-char chat.)
+
 ## [1.1.8] — 2026-06-04
 
 ### Fixed
@@ -226,6 +240,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.1.9]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.9
 [1.1.8]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.8
 [1.1.7]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.7
 [1.1.6]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.6
