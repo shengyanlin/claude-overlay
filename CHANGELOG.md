@@ -3,6 +3,19 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.1.8] — 2026-06-04
+
+### Fixed
+- **Clear now actually drops the context gauge instead of leaving the old conversation's
+  usage on screen.** Clicking Clear interrupts the in-flight turn, whose cleanup schedules a
+  context-usage refresh against the *old* session. That refresh round-trips to the CLI and
+  could land *after* the new session was already up, overwriting the fresh (low) baseline with
+  the old conversation's high %. Now: (1) the worker discards a usage reading if the client was
+  swapped out mid-flight (the core race fix); (2) Clear blanks the shown % immediately on click
+  rather than waiting for the async reset; (3) the reset-complete handler no longer nulls the
+  freshly-reported new-session baseline. (The underlying session was always reset correctly —
+  this was a stale-display race, not a failure to start a new conversation.)
+
 ## [1.1.7] — 2026-06-04
 
 ### Fixed

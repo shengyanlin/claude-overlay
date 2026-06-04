@@ -72,7 +72,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.1.7"
+__version__ = "1.1.8"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -479,8 +479,18 @@ class ClaudeWorker(threading.Thread):
 
     async def _emit_usage(self):
         """Push current model + context-window usage % to the UI statusline."""
+        # Capture the client we're measuring. A turn's finally schedules this against the
+        # *current* client; if a Clear/reconnect swaps the client out while the (slow,
+        # round-trips to the CLI) get_context_usage() is in flight, the result describes a
+        # session that no longer exists. Emitting it would overwrite the fresh post-reset
+        # baseline with the OLD conversation's high % — the "Clear didn't drop context" bug.
+        client = self._client
+        if client is None:
+            return
         try:
-            u = await asyncio.wait_for(self._client.get_context_usage(), timeout=6)
+            u = await asyncio.wait_for(client.get_context_usage(), timeout=6)
+            if client is not self._client:   # reset/reconnect happened mid-flight → stale
+                return
             if isinstance(u, dict):
                 if u.get("model"):
                     self.ui.put(("model", u["model"]))
@@ -1805,6 +1815,11 @@ class Overlay:
         self.worker.interrupt()
         self.chat.delete("1.0", "end")
         self._claude_header = False
+        # Clear the shown % immediately so the OLD conversation's usage can't linger while the
+        # async reset (close + reconnect) runs; the new session's true baseline arrives via the
+        # worker's post-_open _emit_usage.
+        self._ctx_pct = None
+        self._refresh_statusline()
         self.worker.reset()
         self._set_status("resetting…")
 
@@ -1967,7 +1982,9 @@ class Overlay:
             self._refresh_statusline()
         elif kind == "reset_done":
             self.add_sys("🔄 new conversation.")
-            self._ctx_pct = None
+            # Don't null _ctx_pct here: reset() already cleared it on click, and the worker's
+            # post-_open _emit_usage has (just before this) pushed the NEW session's real
+            # baseline. Nulling now would discard that correct value and leave a bare "—".
             self._refresh_statusline()
             self._set_busy(False)
         elif kind == "delta":
