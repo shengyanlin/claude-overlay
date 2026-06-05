@@ -207,7 +207,8 @@ next to the version. To upgrade:
 
 ### 🖱️ One double-click — `update.cmd` (recommended)
 
-Double-click **`update.cmd`**. It runs `git pull` and refreshes the Python packages.
+Double-click **`update.cmd`**. It runs `git pull`, refreshes the Python packages, and — if you
+already have a Desktop shortcut — refreshes its icon to match the current version.
 
 ### 🛠️ By hand
 
@@ -223,6 +224,10 @@ git pull
 > while running — close it and re-open **`Start Claude Overlay.cmd`** for the update to
 > take effect. (On a managed/enterprise machine, updating is what fixes the older
 > versions that could hang on the first tool call.)
+>
+> Updated **by hand** (`git pull`) and the Desktop icon still looks old? Re-run
+> **`Create Desktop Shortcut.cmd`** once — the shortcut is a machine-specific file that
+> `git pull` can't refresh (`update.cmd` does this for you).
 
 ---
 

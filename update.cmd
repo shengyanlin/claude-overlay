@@ -41,6 +41,12 @@ if defined PY (
   %PY% -m pip install --upgrade --quiet claude-agent-sdk pillow keyboard
 )
 
+rem --- refresh the desktop shortcut icon IF one already exists ---
+rem The .lnk is machine-specific (gitignored), so git pull can't touch it. If a "Claude
+rem Overlay" shortcut is on the Desktop, re-point it at the current icon. We skip this when
+rem there's no shortcut, so update.cmd never creates one the user didn't ask for.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$d=[Environment]::GetFolderPath('Desktop'); if (Test-Path (Join-Path $d 'Claude Overlay.lnk')) { & '.\create-shortcut.ps1'; Write-Host '[OK] Desktop shortcut icon refreshed.' }"
+
 echo.
 echo ============================================================
 echo   [OK] Updated. IMPORTANT: close the running overlay and

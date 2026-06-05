@@ -3,6 +3,14 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.3] — 2026-06-06
+
+### Changed
+- **`update.cmd` now refreshes your Desktop shortcut's icon** (only if you already have one).
+  The shortcut is a machine-specific `.lnk` that `git pull` can't touch, so after an update an
+  existing shortcut kept showing the old icon; `update.cmd` now re-points it at the current icon
+  automatically. (Updated by hand with `git pull`? Re-run `Create Desktop Shortcut.cmd` once.)
+
 ## [1.2.2] — 2026-06-06
 
 ### Changed
@@ -278,6 +286,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.2.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.3
 [1.2.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.2
 [1.2.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.1
 [1.2.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.0
