@@ -27,3 +27,7 @@ CODEX_CRASH_AUDIT.md
 Thumbs.db
 .idea/
 .vscode/
+
+# Inbound contribution archives (kept locally as provenance only - may carry a
+# contributor's private email / unsanitized patch; never commit to the public repo)
+*-submission.zip

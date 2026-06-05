@@ -3,6 +3,16 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.2] — 2026-06-06
+
+### Changed
+- **Docs & setup: clearer, consistent install + login.** `SETUP.md`, `README.md`, and
+  `setup.cmd` now lead with the native installer (no Node.js) and log in with
+  `claude auth login` run in **PowerShell or CMD** — with an explicit warning that the
+  sign-in screen renders blank in **Git Bash / MINGW** (which made it look frozen). Also
+  noted that pip's "not on PATH" warnings are harmless and that reopening the terminal picks
+  up the freshly-installed CLI.
+
 ## [1.2.1] — 2026-06-06
 
 ### Changed
@@ -268,6 +278,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.2.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.2
 [1.2.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.1
 [1.2.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.0
 [1.1.9]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.9

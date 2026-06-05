@@ -41,15 +41,15 @@ if errorlevel 1 (
 rem --- 2b. make sure you're logged in (uses YOUR subscription, no API key) ---
 claude --version >nul 2>nul
 echo.
-echo If you haven't logged in yet, a browser login will be needed once.
-echo This opens 'claude' so you can run /login with YOUR Claude subscription.
-echo (Close it with Ctrl+C or /exit when done — then setup continues.)
-set /p DOLOGIN="Open 'claude' to log in now? [Y/n] "
-if /i not "%DOLOGIN%"=="n" ( claude )
+echo If you haven't logged in yet, you need to do it once (a browser opens).
+echo Tip: run setup in PowerShell or CMD, NOT Git Bash (the sign-in screen is blank there).
+set /p DOLOGIN="Log in now with 'claude auth login'? [Y/n] "
+if /i not "%DOLOGIN%"=="n" ( claude auth login )
 
 rem --- 3. Python packages ---
 echo.
 echo Installing Python packages: claude-agent-sdk, pillow, keyboard ...
+echo (Any "installed in ... which is not on PATH" warnings below are harmless.)
 %PY% -m pip install --upgrade claude-agent-sdk pillow keyboard
 if errorlevel 1 (
   echo [X] pip install failed. See the error above.
@@ -58,8 +58,8 @@ if errorlevel 1 (
 
 echo.
 echo ============================================================
-echo   Done. Before first launch make sure you have run 'claude'
-echo   and logged in with YOUR OWN Claude subscription.
+echo   Done. Before first launch make sure you have logged in
+echo   with YOUR OWN Claude subscription (claude auth login).
 echo   Then double-click:  "Start Claude Overlay.cmd"
 echo ============================================================
 pause

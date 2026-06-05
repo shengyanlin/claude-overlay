@@ -140,7 +140,7 @@ official native installer if you don't already have it. To install it yourself:
 - **npm** (needs Node.js 18+): `npm install -g @anthropic-ai/claude-code`
 
 **Log in** with your own Claude account (Pro/Max subscription — no API key needed):
-run `claude` and follow the browser prompt once.
+run `claude auth login` (in PowerShell or CMD — not Git Bash) and follow the browser prompt once.
 
 **Verify** — this must print a version number:
 ```
@@ -228,7 +228,7 @@ git pull
 
 ## Run
 
-1. Make sure `claude --version` works and you've logged in (`claude` → `/login`).
+1. Make sure `claude --version` works and you've logged in (`claude auth login`).
 2. Start it (any of):
    - Double-click **`Start Claude Overlay.cmd`** — launches with **no console window**.
    - `pythonw claude_overlay.py` — no console.
