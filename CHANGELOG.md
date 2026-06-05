@@ -3,6 +3,13 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] — 2026-06-06
+
+### Changed
+- The bundled desktop-shortcut icon now uses the **Clawd sprite** (matching the v1.2.0
+  default orb look) instead of the old glossy sphere. Added `claude_overlay_2.ico`
+  (multi-resolution, generated from the sprite); `create-shortcut.ps1` points at it.
+
 ## [1.2.0] — 2026-06-05
 
 ### Added
@@ -261,6 +268,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.2.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.1
 [1.2.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.0
 [1.1.9]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.9
 [1.1.8]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.8
