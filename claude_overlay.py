@@ -72,7 +72,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.1.9"
+__version__ = "1.2.0"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -98,6 +98,20 @@ THEME = "light"                  # "light" (Claude paper) or "dark" (warm dark)
 WINDOW_ALPHA = 1.0
 CORNER_RADIUS = 18
 ORB_SIZE = 56                    # diameter (logical px) of the collapsed Claude orb
+ORB_IMAGE = "claude_overlay_2.png"  # collapsed-orb artwork. "" → procedural glossy
+                                 # terracotta sphere (original look). A path (relative
+                                 # to this script, or absolute) to a PNG/ICO renders that
+                                 # image instead: it's auto-scaled + centred so the whole
+                                 # opaque shape fits inside the circular orb. RGBA with a
+                                 # transparent background works best.
+ORB_IMAGE_MARGIN = 0.04          # fraction of the radius kept clear around the artwork
+                                 # (0 = touches the circle edge; 0.04 = tiny breathing room)
+ORB_FLOAT = True                 # True + an ORB_IMAGE → the collapsed orb is clipped to the
+                                 # artwork's own silhouette (a free-floating pixel sprite, no
+                                 # circular frame; clicks outside the shape pass through).
+                                 # False → the classic circular orb. Ignored without artwork.
+ORB_ALPHA_THRESHOLD = 110        # pixels at/above this alpha (0-255) count as "solid" when
+                                 # building the silhouette — higher = tighter, crisper edge
 # Fonts. Noto Sans/Serif TC cover Chinese + English in one family (closest free
 # stand-in for Claude's proprietary Styrene/Copernicus). First available wins.
 FONT_SANS = ["Noto Sans TC", "Inter", "Segoe UI Variable Text", "Segoe UI"]
@@ -204,6 +218,14 @@ _user32.GetAncestor.restype = wt.HWND
 _user32.GetAncestor.argtypes = [wt.HWND, ctypes.c_uint]
 _gdi32.CreateEllipticRgn.restype = wt.HRGN
 _gdi32.CreateEllipticRgn.argtypes = [ctypes.c_int] * 4
+# Region from arbitrary silhouette (used to float the collapsed orb as a pixel sprite,
+# with no circular frame): OR together one rect per opaque run of the artwork's alpha.
+_gdi32.CreateRectRgn.restype = wt.HRGN
+_gdi32.CreateRectRgn.argtypes = [ctypes.c_int] * 4
+_gdi32.SetRectRgn.restype = ctypes.c_int
+_gdi32.SetRectRgn.argtypes = [wt.HRGN] + [ctypes.c_int] * 4
+_gdi32.CombineRgn.restype = ctypes.c_int
+_gdi32.CombineRgn.argtypes = [wt.HRGN, wt.HRGN, wt.HRGN, ctypes.c_int]
 _user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 _user32.GetMonitorInfoW.restype = ctypes.c_int
 _MONENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
@@ -348,7 +370,8 @@ class ClaudeWorker(threading.Thread):
             # Use ONLY the (empty) MCP servers defined here, ignoring the user's filesystem
             # config. Without this the spawned CLI loads every MCP server from ~/.claude.json
             # and injects all their tool schemas — measured at 72K tokens (36% of Haiku's
-            # 200K window) on one BCG machine, gone before the first message. setting_sources
+            # 200K window) on one machine with many MCP servers, gone before the first
+            # message. setting_sources
             # alone does NOT stop this; the CLI loads MCP servers via a separate path.
             opts["strict_mcp_config"] = True
         # Some kwargs (max_buffer_size, can_use_tool, strict_mcp_config) only exist on newer
@@ -755,6 +778,8 @@ class Overlay:
         self._paste_busy = False        # a background clipboard paste is in flight
         self._quitting = False          # make quit() idempotent (double-close → one teardown)
         self._orb_imgs: dict = {}       # (size, hover) → PhotoImage cache for the orb
+        self._send_imgs: dict = {}      # (diameter, state) → PhotoImage cache for the send button
+        self._send_hover = False
         self.busy = False
         self.visible = True
         self.expanded = True
@@ -1015,6 +1040,59 @@ class Overlay:
         t = 0.0 if t < 0 else 1.0 if t > 1 else t
         return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
 
+    def _orb_image_from_file(self, s, hover):
+        """Render the collapsed orb from ORB_IMAGE instead of the procedural sphere.
+        The artwork is auto-scaled so its whole opaque silhouette fits inside the
+        circular orb (the collapsed window is clipped to a circle), then centred.
+        Supersampled ×4 + LANCZOS for crisp edges at any DPI. Returns a PhotoImage,
+        or None if the file is missing/unreadable (caller falls back to the sphere)."""
+        import math
+        try:
+            from PIL import ImageEnhance
+            p = Path(ORB_IMAGE)
+            if not p.is_absolute():
+                p = Path(__file__).resolve().parent / p
+            if not p.exists():
+                return None
+            art = Image.open(p).convert("RGBA")
+        except Exception:
+            return None
+
+        SS = 4
+        n = s * SS
+        try:
+            alpha = art.split()[3]
+            bbox = alpha.getbbox() or (0, 0, art.width, art.height)
+        except Exception:
+            bbox = (0, 0, art.width, art.height)
+
+        if ORB_FLOAT:
+            # Floating sprite: the window is clipped to the artwork's own silhouette, so no
+            # circle to fit inside — scale the opaque content to fill the orb box (minus a hair).
+            bw, bh = max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
+            scale = (n * (1.0 - max(0.0, min(0.4, ORB_IMAGE_MARGIN)))) / max(bw, bh)
+        else:
+            # Circular orb: fit the farthest opaque pixel just inside the circle so nothing clips.
+            cx, cy = art.width / 2.0, art.height / 2.0
+            corners = [(bbox[0], bbox[1]), (bbox[2], bbox[1]),
+                       (bbox[0], bbox[3]), (bbox[2], bbox[3])]
+            opaque_r = max(math.hypot(x - cx, y - cy) for x, y in corners) or max(cx, cy)
+            scale = ((n / 2.0) * (1.0 - max(0.0, min(0.4, ORB_IMAGE_MARGIN)))) / opaque_r
+
+        nw, nh = max(1, int(round(art.width * scale))), max(1, int(round(art.height * scale)))
+        art = art.resize((nw, nh), Image.LANCZOS)
+
+        if hover:                                   # gentle lift on hover
+            art = ImageEnhance.Brightness(art).enhance(1.08)
+
+        canvas = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+        canvas.alpha_composite(art, ((n - nw) // 2, (n - nh) // 2))
+        out = canvas.resize((s, s), Image.LANCZOS)
+        # Stash the alpha at window size so _apply_region can clip the window to the sprite.
+        self._orb_mask = out.split()[3]
+        self._orb_mask_size = (s, s)
+        return ImageTk.PhotoImage(out)
+
     def _orb_image(self, s, hover):
         """Render a glossy terracotta sphere: off-centre radial gradient (volume),
         a soft top-left specular highlight, a darker bottom rim + lighter top rim
@@ -1024,6 +1102,14 @@ class Overlay:
         key = (s, hover)
         if key in self._orb_imgs:
             return self._orb_imgs[key]
+
+        # Custom artwork path: load ORB_IMAGE, auto-fit it inside the circular orb.
+        if ORB_IMAGE:
+            photo = self._orb_image_from_file(s, hover)
+            if photo is not None:
+                self._orb_imgs[key] = photo
+                return photo
+            # fall through to the procedural orb if the file is missing/unreadable
 
         SS = 4
         n = s * SS
@@ -1171,18 +1257,73 @@ class Overlay:
         c.itemconfigure(self.entry_win, width=max(self.px(40), bx - rad - self.px(8) - ex1),
                         height=max(self.px(20), h - 2 * pad - self.px(14)))
         c.delete("send")
-        col = T["err"] if self.busy else T["accent"]
-        c.create_oval(bx - rad, by - rad, bx + rad, by + rad, fill=col, outline="", tags=("send", "sc"))
-        c.create_text(bx, by - self.px(1), text=("■" if self.busy else "↑"),
-                      fill=T["on_accent"], font=self.f_send, tags=("send", "sa"))
+        # Pillow-rendered (supersampled, anti-aliased) button — Tk's create_oval is aliased
+        # and looked low-res. Centred PhotoImage; state (idle/hover/busy) swaps the cached image.
+        self._send_d = 2 * rad
+        self._send_item = c.create_image(bx, by, image=self._send_img(self._send_d, self._send_state()),
+                                         tags=("send",))
         c.tag_bind("send", "<Button-1>", lambda ev: self._send_or_stop())
-        c.tag_bind("send", "<Enter>", lambda ev: c.itemconfigure("sc", fill=T["accent_hi"]))
-        c.tag_bind("send", "<Leave>", lambda ev: c.itemconfigure(
-            "sc", fill=(T["err"] if self.busy else T["accent"])))
+        c.tag_bind("send", "<Enter>", lambda ev: self._on_send_hover(True))
+        c.tag_bind("send", "<Leave>", lambda ev: self._on_send_hover(False))
+
+    def _send_state(self):
+        return ("busy" if self.busy else "idle") + ("_hover" if self._send_hover else "")
+
+    def _on_send_hover(self, hovering):
+        self._send_hover = hovering
+        self._paint_send()
+
+    def _paint_send(self):
+        item = getattr(self, "_send_item", None)
+        d = getattr(self, "_send_d", None)
+        if item is None or not d:
+            return
+        try:
+            self.canvas.itemconfigure(item, image=self._send_img(d, self._send_state()))
+        except Exception:
+            pass
+
+    def _send_img(self, d, state):
+        """Render the round send/stop button with Pillow (×4 supersample + LANCZOS) so the
+        circle is smoothly anti-aliased and the glyph is a crisp vector, not a font character.
+        Cached per (diameter, state). state ∈ {idle, idle_hover, busy, busy_hover}."""
+        key = (d, state)
+        if key in self._send_imgs:
+            return self._send_imgs[key]
+        busy = state.startswith("busy")
+        hover = state.endswith("hover")
+        base = self._rgb(T["err"] if busy else T["accent"])
+        if hover:
+            base = self._mix(base, (255, 255, 255), 0.12) if busy else self._rgb(T["accent_hi"])
+        fg = self._rgb(T["on_accent"])
+
+        SS = 4
+        n = max(4, d * SS)
+        img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(img)
+        dr.ellipse([0, 0, n - 1, n - 1], fill=base + (255,))
+        if busy:                                   # rounded "stop" square
+            sq = n * 0.30
+            o = (n - sq) / 2
+            dr.rounded_rectangle([o, o, o + sq, o + sq], radius=n * 0.055, fill=fg + (255,))
+        else:                                      # upward "send" arrow (stem + chevron)
+            cx = n / 2
+            topy, boty = n * 0.31, n * 0.71
+            wln = max(2, int(round(n * 0.11)))
+            hw = n * 0.18
+            r = wln / 2
+            dr.line([cx, boty, cx, topy], fill=fg + (255,), width=wln)
+            dr.line([cx - hw, topy + hw, cx, topy], fill=fg + (255,), width=wln)
+            dr.line([cx + hw, topy + hw, cx, topy], fill=fg + (255,), width=wln)
+            for (ex, ey) in ((cx, topy), (cx, boty), (cx - hw, topy + hw), (cx + hw, topy + hw)):
+                dr.ellipse([ex - r, ey - r, ex + r, ey + r], fill=fg + (255,))   # round the caps
+        out = img.resize((d, d), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(out)
+        self._send_imgs[key] = photo
+        return photo
 
     def _refresh_send(self):
-        self.canvas.itemconfigure("sc", fill=(T["err"] if self.busy else T["accent"]))
-        self.canvas.itemconfigure("sa", text=("■" if self.busy else "↑"))
+        self._paint_send()
 
     # ── placeholder ──
     def _ph_in(self, e=None):
@@ -1430,7 +1571,12 @@ class Overlay:
                 r = self.px(CORNER_RADIUS)
                 rgn = _gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, r, r)
             else:
-                rgn = _gdi32.CreateEllipticRgn(0, 0, w + 1, h + 1)   # circular orb
+                rgn = None
+                if ORB_FLOAT and getattr(self, "_orb_mask", None) is not None \
+                        and self._orb_mask_size == (w, h):
+                    rgn = self._build_alpha_region(self._orb_mask)   # float as the raw sprite
+                if not rgn:
+                    rgn = _gdi32.CreateEllipticRgn(0, 0, w + 1, h + 1)   # circular orb fallback
             # On success Windows owns the region handle; on failure WE still own it and must
             # free it, or repeated <Configure>/resize churn with a stale hwnd leaks GDI
             # handles until drawing eventually fails. SetWindowRgn returns 0 on failure.
@@ -1439,6 +1585,38 @@ class Overlay:
                 _gdi32.DeleteObject(rgn)
         except Exception:
             pass
+
+    def _build_alpha_region(self, mask, thr=None):
+        """Build a Win32 region matching an alpha mask's opaque silhouette: one rect per
+        horizontal run of pixels at/above the threshold, OR-ed together. Lets the collapsed
+        window float as the raw pixel sprite (hard binary edge — ideal for pixel art).
+        Returns an HRGN owned by the caller, or None on failure."""
+        try:
+            thr = ORB_ALPHA_THRESHOLD if thr is None else thr
+            w, h = mask.size
+            px = mask.load()
+            full = _gdi32.CreateRectRgn(0, 0, 0, 0)
+            tmp = _gdi32.CreateRectRgn(0, 0, 0, 0)
+            if not full or not tmp:
+                for r in (full, tmp):
+                    if r:
+                        _gdi32.DeleteObject(r)
+                return None
+            for y in range(h):
+                x = 0
+                while x < w:
+                    if px[x, y] >= thr:
+                        x0 = x
+                        while x < w and px[x, y] >= thr:
+                            x += 1
+                        _gdi32.SetRectRgn(tmp, x0, y, x, y + 1)
+                        _gdi32.CombineRgn(full, full, tmp, 2)   # RGN_OR
+                    else:
+                        x += 1
+            _gdi32.DeleteObject(tmp)
+            return full
+        except Exception:
+            return None
 
     # ── chat rendering (main thread only) ──
     def _readonly_keys(self, e):

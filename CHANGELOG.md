@@ -3,6 +3,27 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] — 2026-06-05
+
+### Added
+- **Custom collapsed-orb artwork (`ORB_IMAGE`).** The collapsed orb can now render an
+  image instead of the procedural glossy sphere. Point `ORB_IMAGE` at a PNG/ICO (relative
+  to the script or absolute) and it's auto-scaled + centred so the whole opaque shape fits.
+  Leave it `""` for the original sphere. Ships with a pixel-art "Clawd" sprite as the new
+  default look.
+- **Free-floating sprite mode (`ORB_FLOAT`).** With artwork set, the collapsed window is
+  clipped to the *artwork's own silhouette* (built from its alpha via `CreateRectRgn`/
+  `CombineRgn`) rather than a circle — so the orb floats as the raw sprite and clicks
+  outside the shape pass through. Binary edges keep pixel art crisp; the expanded window
+  keeps its rounded corners (no layered-window/colour-key tricks). `ORB_ALPHA_THRESHOLD`
+  tunes the silhouette tightness. Set `ORB_FLOAT = False` for a circular badge instead.
+
+### Changed
+- **The send/stop button is now rendered with Pillow (×4 supersampled + LANCZOS) instead
+  of a Tk `create_oval` + font glyph.** Tk canvas ovals aren't anti-aliased, so the old
+  button looked jagged/low-res; the circle is now smoothly anti-aliased and the arrow is a
+  crisp vector chevron. Cached per (diameter, state) with idle/hover/busy variants.
+
 ## [1.1.9] — 2026-06-04
 
 ### Fixed
@@ -240,6 +261,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.2.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.0
 [1.1.9]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.9
 [1.1.8]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.8
 [1.1.7]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.7
