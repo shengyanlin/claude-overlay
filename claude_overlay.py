@@ -72,7 +72,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.2.3"
+__version__ = "1.3.0"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -165,6 +165,85 @@ MAX_INLINE_TOTAL_BYTES = 32 * 1024 * 1024   # ... and aggregate bytes (the per-f
 MAX_UPDATE_BODY = 1 * 1024 * 1024   # cap the update-check response body before json.loads
 MAX_UPDATE_TAGS = 300       # and the number of tags parsed
 
+# ── debug / activity log (monitoring) ──────────────────────────────────────
+# Under pythonw the overlay has no console and exposes no IPC, so its work can't be
+# watched from outside. Opt in by setting the CLAUDE_OVERLAY_DEBUG_LOG environment
+# variable to a file path: you then get a timestamped, one-line-per-event trace of the
+# worker (turn start, tool calls, results, errors, reconnects, a throttled streaming
+# heartbeat) — enough to see what it's doing and whether a turn is stuck. Default is OFF
+# (empty) so nothing is written. Privacy note: even when enabled, reply text is NEVER
+# logged (deltas/thinking are logged only as a ~2s heartbeat + char count), but a
+# turn-start prompt preview (≤120 chars) IS written — so only enable it on a trusted
+# machine. Each PID tags its own lines so several overlays don't get confused.
+DEBUG_LOG = os.environ.get("CLAUDE_OVERLAY_DEBUG_LOG", "")
+DEBUG_LOG_MAX_BYTES = 2_000_000     # truncate (best-effort) once the log grows past this
+_dbg_lock = threading.Lock()
+_dbg_stream_last = [0.0]             # throttle high-frequency streaming deltas to a heartbeat
+_dbg_think_last = [0.0]             # ditto for thinking deltas (separate, so a thinking heartbeat
+                                    # can't suppress the first answer delta we use to time TTFT)
+
+
+def dbg(kind, payload=None):
+    """Append one best-effort line to DEBUG_LOG. Never raises into the caller."""
+    if not DEBUG_LOG:
+        return
+    try:
+        if kind in ("delta", "think"):   # streaming token text → heartbeat only, NEVER the content
+            now = time.monotonic()       # (thinking is reply content too — must not hit disk verbatim)
+            last = _dbg_stream_last if kind == "delta" else _dbg_think_last
+            if now - last[0] < 2.0:
+                return
+            last[0] = now
+            n = len(payload) if isinstance(payload, str) else 0
+            payload = f"<{'streaming' if kind == 'delta' else 'thinking'} +{n} chars>"
+        elif kind == "tool":        # (name, input_dict) → name + a short arg preview
+            name, inp = payload if isinstance(payload, tuple) and len(payload) == 2 else (payload, None)
+            arg = ""
+            if isinstance(inp, dict):
+                arg = " ".join(f"{k}={str(v)[:40]}" for k, v in list(inp.items())[:2])
+            payload = f"{name} {arg}".strip()
+        elif isinstance(payload, dict):
+            payload = " ".join(f"{k}={v}" for k, v in payload.items())
+        elif isinstance(payload, str):
+            payload = payload[:200].replace("\n", " ")
+        _now = time.time()
+        _ts = time.strftime('%H:%M:%S', time.localtime(_now)) + f".{int((_now % 1) * 1000):03d}"
+        line = f"{_ts} pid={os.getpid()} {kind} {payload if payload is not None else ''}".rstrip() + "\n"
+        with _dbg_lock:
+            try:
+                if os.path.exists(DEBUG_LOG) and os.path.getsize(DEBUG_LOG) > DEBUG_LOG_MAX_BYTES:
+                    open(DEBUG_LOG, "w", encoding="utf-8").close()
+            except Exception:
+                pass
+            with open(DEBUG_LOG, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception:
+        pass
+
+
+class _UIQueueTap:
+    """Wraps the worker→UI queue so every event the worker emits is also written to the
+    debug log. The worker's entire observable behavior already flows through this one
+    queue (`ready`/`tool`/`result`/`error`/`system`/`turn_done`/`delta`/…), so a single
+    tap here logs all of it without scattering calls through the worker. The UI keeps
+    reading the underlying queue directly; only the worker's `put` side is wrapped."""
+    def __init__(self, q):
+        self._q = q
+
+    def put(self, item, *a, **k):
+        try:
+            if isinstance(item, tuple) and len(item) == 2:
+                dbg(item[0], item[1])
+            else:
+                dbg(item)
+        except Exception:
+            pass
+        return self._q.put(item, *a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._q, name)
+
+
 SYSTEM_APPEND = (
     "You are running as an always-on-top floating overlay assistant on the user's "
     "Windows 11 desktop. The user talks to you without leaving their current app. "
@@ -172,7 +251,18 @@ SYSTEM_APPEND = (
     "as images, or (legacy) as an [ATTACHMENTS] path you open with the Read tool. "
     "Use them to see what the user is looking at, then help. "
     "Keep replies concise and skimmable since they render in a small floating window; "
-    "expand only when asked."
+    "expand only when asked. "
+    "When automating Office (PowerPoint/Excel/Word) via PowerShell+COM, optimize for "
+    "speed: a NEW PowerShell process runs per tool call and COM state does NOT persist "
+    "across calls, and every property access is a slow cross-process round-trip. So: "
+    "(1) BATCH — do all inspection in ONE script (return what you need, e.g. as JSON), "
+    "then apply ALL edits in ONE script; never one tool call per shape/cell/slide. "
+    "(2) Within a script cache COM references in variables (grab the slide/shape/table "
+    "once) instead of re-walking the object model, and don't re-read everything to verify "
+    "after each write. (3) For Excel bulk writes, set Application.ScreenUpdating=$false, "
+    "Calculation=xlManual and EnableEvents=$false around them, then restore. (4) For large "
+    "purely-textual edits where the live open document isn't needed, python-pptx/openpyxl "
+    "on the file is far faster than COM — but only when the file is NOT open in Office."
 )
 
 THEMES = {
@@ -281,7 +371,9 @@ def enumerate_monitors():
 class ClaudeWorker(threading.Thread):
     def __init__(self, ui_queue: "queue.Queue"):
         super().__init__(daemon=True)
-        self.ui = ui_queue
+        # Tap the UI channel so the debug log captures every worker→UI event (no-op when
+        # DEBUG_LOG is ""). The UI side keeps reading the raw queue.
+        self.ui = _UIQueueTap(ui_queue) if DEBUG_LOG else ui_queue
         self.req: "queue.Queue" = queue.Queue()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._client: ClaudeSDKClient | None = None
@@ -394,6 +486,7 @@ class ClaudeWorker(threading.Thread):
         # Bounded auto-restart: even if _amain falls over entirely (e.g. the event loop
         # dies), bring it back so the overlay self-heals instead of becoming a zombie
         # window that never answers again.
+        dbg("worker_start")
         attempts = 0
         last_start = 0.0
         while self._running and attempts < 5:
@@ -537,6 +630,9 @@ class ClaudeWorker(threading.Thread):
 
     async def _run_turn(self, payload):
         text, image_paths = payload if isinstance(payload, tuple) else (payload, [])
+        dbg("turn_start", f"imgs={len(image_paths or [])} | {str(text)[:120]}")
+        _dbg_stream_last[0] = 0.0   # force this turn's FIRST delta to log → measures time-to-first-token
+        _dbg_think_last[0] = 0.0    # and its first thinking token → time-to-first-thinking
         if self._client is None:        # initial connect failed earlier — try once more
             await self._open()
         if self._client is None:
@@ -699,6 +795,8 @@ class ClaudeWorker(threading.Thread):
                 dt = d.get("type")
                 if dt == "text_delta":
                     self.ui.put(("delta", d.get("text", "")))
+                elif dt == "thinking_delta":   # extended-thinking tokens (stream them so the
+                    self.ui.put(("think", d.get("thinking", "")))   # pre-answer wait looks alive
                 elif dt == "input_json_delta":
                     b = blocks.get(idx)
                     if not isinstance(b, dict):   # corrupted/missing → reset to a fresh buf
@@ -787,6 +885,7 @@ class Overlay:
         self._model = None
         self._ctx_pct = None
         self._claude_header = False
+        self._thinking_active = False   # a thinking block is open in the current turn
         self._drag = (0, 0)
         self._resize = None
         self._round_after = None
@@ -834,6 +933,7 @@ class Overlay:
         self.f_chip  = mk(self.sans, 11, weight="bold")
         self.f_mono  = mk(self.mono, 12)
         self.f_send  = mk(self.sans, 17, weight="bold")
+        self.f_think = mk(self.sans, 13, slant="italic")   # streamed extended-thinking text
 
         self._build_titlebar()
         self.hairline = tk.Frame(self.root, bg=T["border"], height=1)
@@ -926,7 +1026,7 @@ class Overlay:
             spacing1=self.px(2), spacing3=self.px(3),
         )
         self.chat.pack(fill="both", expand=True)
-        self.chat.bind("<MouseWheel>", lambda e: self.chat.yview_scroll(int(-e.delta / 120), "units"))
+        self.chat.bind("<MouseWheel>", self._on_wheel)
         self.chat.bind("<Key>", self._readonly_keys)
 
         m = self.f_body.measure("0") * 5
@@ -945,6 +1045,14 @@ class Overlay:
                                 spacing1=self.px(6), spacing3=self.px(4))
         self.chat.tag_configure("err", foreground=T["err"], font=self.f_small,
                                 spacing1=self.px(6), spacing3=self.px(4))
+        # extended-thinking: a muted "✻ thinking" label + faint italic body, indented so it
+        # reads as a side-channel before the answer (mirrors how the CLI streams thinking, so
+        # the long pre-answer wait isn't a dead, frozen-looking screen).
+        self.chat.tag_configure("think_label", foreground=T["faint"], font=self.f_chip,
+                                lmargin1=self.px(18), spacing1=self.px(8), spacing3=self.px(2))
+        self.chat.tag_configure("think", foreground=T["faint"], font=self.f_think,
+                                lmargin1=self.px(18), lmargin2=self.px(18), rmargin=self.px(14),
+                                spacing2=self.px(1))
 
     def _build_input(self):
         wrap = tk.Frame(self.root, bg=T["bg"])
@@ -1652,6 +1760,8 @@ class Overlay:
             # next delta re-inserts the header.
             if self._claude_header and not self.chat.tag_ranges("current_ah"):
                 self._claude_header = False
+                self._thinking_active = False   # header was pruned mid-thinking → re-arm the
+                                                # "✻ thinking" label with the re-inserted header
         except Exception:
             pass
 
@@ -1673,6 +1783,7 @@ class Overlay:
         except Exception:                                       # is no longer the "active" one
             pass
         self._claude_header = False
+        self._thinking_active = False    # new turn → next thinking re-inserts its label
         if at_bottom:
             self.chat.see("end")
         self._prune_chat()
@@ -1736,8 +1847,21 @@ class Overlay:
                 pass
             self._claude_header = True
 
+    def add_think(self, text):
+        # Stream extended-thinking tokens as a muted block under the Claude header, before
+        # the answer. The "✻ thinking" label is inserted once per turn; subsequent thinking
+        # text just appends. This keeps the (often 10-20s) pre-answer wait visibly alive.
+        self._ensure_header()
+        if not self._thinking_active:
+            self._ins("\n✻ thinking\n", "think_label")
+            self._thinking_active = True
+        self._ins(text, "think")
+
     def add_delta(self, text):
         self._ensure_header()
+        if self._thinking_active:        # the visible answer is starting → close the thinking block
+            self._ins("\n", "a")
+            self._thinking_active = False
         self._ins(text, "a")
 
     def add_tool(self, name, inp):
@@ -2007,6 +2131,7 @@ class Overlay:
         self.worker.interrupt()
         self.chat.delete("1.0", "end")
         self._claude_header = False
+        self._thinking_active = False    # don't carry a half-open thinking block into the new turn
         # Clear the shown % immediately so the OLD conversation's usage can't linger while the
         # async reset (close + reconnect) runs; the new session's true baseline arrives via the
         # worker's post-_open _emit_usage.
@@ -2117,6 +2242,24 @@ class Overlay:
         self._set_status("switching model…")
         self.worker.set_model(val)
 
+    def _on_wheel(self, e):
+        # Same scroll as before (no "break", so behavior is unchanged) — but timed. Tk
+        # relayouts a Text holding many embedded canvases (our message bubbles + tool
+        # chips) synchronously inside yview_scroll, so a janky scroll frame shows up as a
+        # slow call here. Log only the slow frames (>50 ms) plus whether a reply is
+        # streaming and how big the transcript is, so the intermittent scroll lag can be
+        # caught in the act and attributed (large transcript vs. streaming contention).
+        t0 = time.monotonic()
+        self.chat.yview_scroll(int(-e.delta / 120), "units")
+        if DEBUG_LOG:
+            dt = (time.monotonic() - t0) * 1000
+            if dt > 50:
+                try:
+                    lines = int(self.chat.index("end-1c").split(".")[0])
+                except Exception:
+                    lines = -1
+                dbg("scroll_slow", f"{dt:.0f}ms streaming={getattr(self, 'busy', False)} lines={lines}")
+
     # ── event pump ──
     def _poll(self):
         # Whatever happens in here, the pump MUST reschedule itself — an unhandled
@@ -2127,6 +2270,7 @@ class Overlay:
         deadline = time.monotonic() + 0.012   # ~12ms budget per tick, so the drain can never
         handled = 0                            # monopolize Tk: a fast stream yields back for
         pending_delta = []                     # repaint / clicks / hotkey between slices.
+        pending_think = []                     # thinking tokens, coalesced the same way
 
         def flush_delta():
             if pending_delta:
@@ -2134,6 +2278,15 @@ class Overlay:
                 pending_delta.clear()
                 try:
                     self._handle("delta", joined)
+                except Exception:
+                    pass
+
+        def flush_think():
+            if pending_think:
+                joined = "".join(pending_think)
+                pending_think.clear()
+                try:
+                    self._handle("think", joined)
                 except Exception:
                     pass
 
@@ -2150,10 +2303,15 @@ class Overlay:
                 except queue.Empty:
                     break
                 handled += 1
-                if kind == "delta":            # coalesce adjacent deltas into one insert
+                if kind == "delta":            # coalesce adjacent text deltas into one insert
+                    flush_think()              # ordering: any pending thinking renders first
                     pending_delta.append("" if payload is None else str(payload))
                     continue
-                flush_delta()                  # preserve ordering around non-delta messages
+                if kind == "think":            # coalesce adjacent thinking deltas too
+                    flush_delta()
+                    pending_think.append("" if payload is None else str(payload))
+                    continue
+                flush_think(); flush_delta()   # preserve ordering around non-stream messages
                 try:
                     self._handle(kind, payload)
                 except Exception as e:
@@ -2161,7 +2319,7 @@ class Overlay:
                         self.add_err(f"UI hiccup handling '{kind}': {type(e).__name__}: {e}")
                     except Exception:
                         pass
-            flush_delta()
+            flush_think(); flush_delta()
         except Exception:
             pass
         finally:
@@ -2181,6 +2339,8 @@ class Overlay:
             self._set_busy(False)
         elif kind == "delta":
             self.add_delta(payload)
+        elif kind == "think":
+            self.add_think(payload)
         elif kind == "tool":
             self.add_tool(payload[0], payload[1])
         elif kind == "model":
@@ -2259,6 +2419,19 @@ class Overlay:
             self.root.destroy()
         except Exception:
             pass
+        # Guarantee the process actually exits. Normally destroy() ends mainloop() and the
+        # interpreter exits on its own — every thread we start (worker, paste, pre-capture,
+        # update check) and even the `keyboard` listener are daemons, so nothing *should*
+        # keep it alive. But "should" isn't "will": one wedged daemon thread stuck in a
+        # C call (a hung SDK transport, an OS hook), or any non-daemon thread a future change
+        # introduces, would leave a headless pythonw process running in the background after
+        # the user clicked ✕ — exactly the "I closed it but it's still running" symptom.
+        # os._exit is the unconditional terminator. We've already asked the worker to
+        # interrupt + disconnect cleanly (bounded by the join above), so this can't cut short
+        # a mid-turn write; and when this process dies its stdio pipes to the `claude` CLI
+        # child close, so the child exits too (no orphaned agent left behind).
+        dbg("quit", "terminating")
+        os._exit(0)
 
     def run(self):
         self.root.mainloop()

@@ -3,6 +3,32 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] — 2026-06-07
+
+### Added
+- **Streaming "thinking".** Extended-thinking tokens now stream into the chat as a muted
+  `✻ thinking` block *before* the answer, instead of being discarded. The (often 15–30 s)
+  wait before the first answer token is now visibly alive — you can watch Claude reason,
+  the way the CLI shows it — rather than staring at a frozen "thinking…". The model's
+  speed is unchanged; what changes is that the wait no longer *looks* dead.
+- **Office COM efficiency guidance.** The system prompt now nudges Claude to drive
+  PowerPoint / Excel / Word automation efficiently — batch all inspection into one
+  PowerShell script and all edits into another (instead of a call per shape/cell/slide),
+  cache COM references, and (Excel) disable `ScreenUpdating`/`Calculation`/`EnableEvents`
+  around bulk writes. On a controlled Excel benchmark this cut wall-time ~30% and cost
+  ~43% with no loss of correctness.
+- **Opt-in activity log.** Set the `CLAUDE_OVERLAY_DEBUG_LOG` environment variable to a
+  file path to record a timestamped, one-line-per-event trace of the worker (turn start,
+  tool calls, results, errors, reconnects, a throttled streaming heartbeat) — useful for
+  diagnosing a slow or stuck turn from outside the (console-less) app. **Off by default**;
+  reply/thinking text is never written (only a heartbeat + character count).
+
+### Fixed
+- **Closing the window (✕) now always exits the process.** A wedged background thread
+  could previously leave a headless `pythonw` process (and its `claude` CLI child) running
+  after you closed the overlay. Quit now does its graceful, bounded shutdown and then
+  guarantees the process terminates, so nothing lingers in the background.
+
 ## [1.2.3] — 2026-06-06
 
 ### Changed
@@ -286,6 +312,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.3.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.3.0
 [1.2.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.3
 [1.2.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.2
 [1.2.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.1
