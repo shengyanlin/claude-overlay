@@ -18,6 +18,7 @@ import ctypes
 import ctypes.wintypes as wt
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -72,7 +73,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -886,6 +887,13 @@ class Overlay:
         self._ctx_pct = None
         self._claude_header = False
         self._thinking_active = False   # a thinking block is open in the current turn
+        # streaming-Markdown renderer state (per turn): the current unfinished answer line
+        # (re-rendered live so inline emphasis lands the moment its closing marker streams in),
+        # a table being assembled across lines, and whether we're inside a ``` code fence.
+        self._md_tail = ""
+        self._md_tbl = None
+        self._md_fence = False
+        self._md_last_scroll = 0.0   # throttle yview()/see() — both are O(line) on a giant line
         self._drag = (0, 0)
         self._resize = None
         self._round_after = None
@@ -934,6 +942,13 @@ class Overlay:
         self.f_mono  = mk(self.mono, 12)
         self.f_send  = mk(self.sans, 17, weight="bold")
         self.f_think = mk(self.sans, 13, slant="italic")   # streamed extended-thinking text
+        # Markdown answer styling — registered with self._fonts so they live-zoom with the body.
+        self.f_bold  = mk(self.sans, 15, weight="bold")
+        self.f_ital  = mk(self.sans, 15, slant="italic")
+        self.f_code  = mk(self.mono, 13)
+        self.f_h1    = mk(self.sans, 19, weight="bold")
+        self.f_h2    = mk(self.sans, 17, weight="bold")
+        self.f_h3    = mk(self.sans, 15, weight="bold")
 
         self._build_titlebar()
         self.hairline = tk.Frame(self.root, bg=T["border"], height=1)
@@ -1053,6 +1068,23 @@ class Overlay:
         self.chat.tag_configure("think", foreground=T["faint"], font=self.f_think,
                                 lmargin1=self.px(18), lmargin2=self.px(18), rmargin=self.px(14),
                                 spacing2=self.px(1))
+        # Markdown styling for the answer. These tags layer ON TOP of "a" (which owns the
+        # answer's foreground colour + paragraph spacing) and are created AFTER it, so on the
+        # font/background options they conflict on, the md_* tag wins while "a" still supplies
+        # the colour — i.e. a range tagged ("a", "md_b") keeps the answer colour but renders bold.
+        code_bg = T["tool_bg"]
+        self.chat.tag_configure("md_b", font=self.f_bold)
+        self.chat.tag_configure("md_i", font=self.f_ital)
+        self.chat.tag_configure("md_code", font=self.f_code, background=code_bg)
+        self.chat.tag_configure("md_h1", font=self.f_h1, spacing1=self.px(14), spacing3=self.px(5))
+        self.chat.tag_configure("md_h2", font=self.f_h2, spacing1=self.px(11), spacing3=self.px(4))
+        self.chat.tag_configure("md_h3", font=self.f_h3, spacing1=self.px(9), spacing3=self.px(3))
+        self.chat.tag_configure("md_bullet", lmargin1=self.px(20), lmargin2=self.px(36))
+        self.chat.tag_configure("md_quote", font=self.f_ital, foreground=T["muted"],
+                                lmargin1=self.px(20), lmargin2=self.px(20))
+        self.chat.tag_configure("md_codeblock", font=self.f_code, background=code_bg,
+                                lmargin1=self.px(20), lmargin2=self.px(20), rmargin=self.px(14),
+                                spacing1=self.px(1), spacing3=self.px(1))
 
     def _build_input(self):
         wrap = tk.Frame(self.root, bg=T["bg"])
@@ -1774,6 +1806,7 @@ class Overlay:
         self._prune_chat()
 
     def add_user(self, text):
+        self._md_finalize()              # commit the previous turn's last line before a new bubble
         at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", "\n")
         self.chat.window_create("end", window=self._user_bubble(text), pady=self.px(3))
@@ -1851,6 +1884,7 @@ class Overlay:
         # Stream extended-thinking tokens as a muted block under the Claude header, before
         # the answer. The "✻ thinking" label is inserted once per turn; subsequent thinking
         # text just appends. This keeps the (often 10-20s) pre-answer wait visibly alive.
+        self._md_finalize()              # seal any answer text before a (re-opened) thinking block
         self._ensure_header()
         if not self._thinking_active:
             self._ins("\n✻ thinking\n", "think_label")
@@ -1860,15 +1894,344 @@ class Overlay:
     def add_delta(self, text):
         self._ensure_header()
         if self._thinking_active:        # the visible answer is starting → close the thinking block
-            self._ins("\n", "a")
+            self._raw_ins("\n", "a")
             self._thinking_active = False
-        self._ins(text, "a")
+        self._md_feed(text)
+
+    # ── streaming Markdown renderer ───────────────────────────────────────────────────
+    # Claude streams Markdown token-by-token, so markup spans deltas. We commit BLOCK
+    # elements (headings, lists, blockquotes, code fences, tables) when a line completes,
+    # and render INLINE emphasis (**bold**, *italic*, `code`) live by re-rendering only the
+    # current unfinished line on every delta — so a marker turns into formatting the instant
+    # its closing token arrives. A table can't align row-by-row, so its raw rows show as they
+    # stream, then snap into a real Tk grid the moment the table block ends.
+    MD_INLINE = {"b": "md_b", "i": "md_i", "code": "md_code"}
+
+    def _raw_ins(self, text, *tags):
+        """Append text + tags without the per-insert see()/_prune_chat() that _ins does;
+        the md feed batches scroll + prune once at the end (many tiny inline inserts otherwise)."""
+        if text:
+            self.chat.insert("end", text, tags)
+
+    def _md_feed(self, chunk):
+        if chunk is None:
+            return
+        chunk = str(chunk)
+        if not chunk:
+            return
+        # Auto-scroll-follow: measure "am I at the bottom" BEFORE mutating content (an append
+        # below the fold would otherwise read as "not at bottom" and break following). yview()/
+        # see() are cheap for normal multi-line content (Tk caches per-line heights) but
+        # O(line length) on a pathological newline-free GIANT line — so only for such a giant
+        # current line do we throttle the scroll to ~25/s (a long stream of one huge line would
+        # otherwise monopolise the UI thread → the v1.1.9-class freeze). Normal replies keep the
+        # exact, correct per-delta follow.
+        giant = len(self._md_tail) > self.MD_LIVE_REPARSE_MAX
+        scroll = (time.monotonic() - self._md_last_scroll) >= 0.04 if giant else True
+        at_bottom = False
+        if scroll:
+            try:
+                at_bottom = self.chat.yview()[1] > 0.999
+            except Exception:
+                at_bottom = False
+            if giant:
+                self._md_last_scroll = time.monotonic()
+        parts = chunk.split("\n")
+        for i, part in enumerate(parts):
+            if i < len(parts) - 1:                  # this part is terminated by a newline → commit
+                self._md_clear_tail()               # lift whatever of the line is rendered
+                self._md_unset_tail_mark()          # the next line re-anchors its own tail mark
+                line = self._md_tail + part
+                self._md_tail = ""
+                self._md_commit_line(line)
+            elif part:                              # the trailing, still-unfinished line
+                self._md_grow_tail(part)
+        if scroll and at_bottom:
+            try:
+                self.chat.see("end")
+            except Exception:
+                pass
+        self._prune_chat()
+
+    # cap live inline re-parsing on absurdly long single lines; formatting still finalizes
+    # correctly when the line completes / on _md_finalize.
+    MD_LIVE_REPARSE_MAX = 2000
+
+    def _md_grow_tail(self, part):
+        """Extend the current unfinished line. To stay O(n) over a long, newline-free line we
+        APPEND new text cheaply and only re-parse the whole tail when a marker char (`*` or
+        `` ` ``) arrives: plain text can't change existing spans (an unclosed span already
+        renders raw until its closing marker, which is itself a marker char and so triggers the
+        re-parse). Re-rendering the whole growing line on *every* delta was O(n²) and froze
+        scrolling on long replies — this is the fix."""
+        if "md_tail" not in self.chat.mark_names():
+            self.chat.mark_set("md_tail", "end-1c")
+            self.chat.mark_gravity("md_tail", "left")   # stays at the tail start as we append after it
+        self._md_tail += part
+        if self._md_fence:
+            self._raw_ins(part, "a", "md_codeblock")    # fenced: raw monospace, never inline
+        elif ("*" in part or "`" in part) and len(self._md_tail) <= self.MD_LIVE_REPARSE_MAX:
+            self._md_clear_tail()                       # a marker arrived → re-parse the whole tail
+            self._md_render_inline(self._md_tail, ("a",))
+        else:
+            self._raw_ins(part, "a")                    # no marker (or line too long) → cheap append
+
+    def _md_autoscroll_final(self):
+        """One-shot scroll-to-end at turn end (a giant line's last deltas may have been throttled
+        out, leaving the view a hair off the bottom). Loose threshold so 'slightly behind due to
+        throttling' still snaps to the end, while a user who clearly scrolled up to read earlier
+        content is left alone."""
+        try:
+            if self.chat.yview()[1] > 0.90:
+                self.chat.see("end")
+        except Exception:
+            pass
+        self._md_last_scroll = time.monotonic()
+
+    def _md_clear_tail(self):
+        """Delete the live-rendered tail (md_tail mark → end) so it can be re-rendered."""
+        try:
+            if "md_tail" in self.chat.mark_names():
+                self.chat.delete("md_tail", "end-1c")
+        except Exception:
+            pass
+
+    def _md_unset_tail_mark(self):
+        try:
+            if "md_tail" in self.chat.mark_names():
+                self.chat.mark_unset("md_tail")
+        except Exception:
+            pass
+
+    def _md_commit_line(self, line, trailing_nl=True):
+        """A complete line: classify it (fence / table row / heading / list / quote / text)
+        and render it permanently."""
+        if line.lstrip().startswith("```"):
+            self._md_fence = not self._md_fence     # the fence line itself is not rendered
+            return
+        if self._md_fence:
+            self._raw_ins(line + ("\n" if trailing_nl else ""), "a", "md_codeblock")
+            return
+        if self._md_is_table_row(line):
+            if self._md_tbl is None:
+                self._md_tbl = []
+                self.chat.mark_set("md_tbl", "end-1c")
+                self.chat.mark_gravity("md_tbl", "left")
+            self._md_tbl.append(line)
+            self._raw_ins(line + "\n", "a")         # raw preview; replaced by the grid on flush
+            return
+        if self._md_tbl is not None:                # a non-table line ends the table block
+            self._md_flush_table()
+        self._md_render_block_line(line, trailing_nl)
+
+    def _md_render_block_line(self, line, trailing_nl=True):
+        nl = "\n" if trailing_nl else ""
+        m = re.match(r'^(#{1,6})\s+(.*)$', line)
+        if m:
+            lvl = min(3, len(m.group(1)))
+            tag = "md_h%d" % lvl
+            self._md_render_inline(m.group(2), ("a", tag))
+            self._raw_ins(nl, "a", tag)              # carry the tag onto the newline so spacing3 applies
+            return
+        m = re.match(r'^\s*[-*+]\s+(.*)$', line)
+        if m:
+            self._raw_ins("•  ", "a", "md_bullet")
+            self._md_render_inline(m.group(1), ("a", "md_bullet"))
+            self._raw_ins(nl, "a", "md_bullet")
+            return
+        m = re.match(r'^\s*(\d+)[.)]\s+(.*)$', line)
+        if m:
+            self._raw_ins("%s. " % m.group(1), "a", "md_bullet")
+            self._md_render_inline(m.group(2), ("a", "md_bullet"))
+            self._raw_ins(nl, "a", "md_bullet")
+            return
+        if line.lstrip().startswith(">"):
+            self._md_render_inline(line.lstrip()[1:].lstrip(), ("a", "md_quote"))
+            self._raw_ins(nl, "a", "md_quote")
+            return
+        if re.match(r'^\s*([-*_])\1{2,}\s*$', line):      # horizontal rule
+            self._raw_ins("─" * 16 + nl, "a", "md_quote")
+            return
+        self._md_render_inline(line, ("a",))             # plain paragraph line
+        self._raw_ins(nl, "a")
+
+    def _md_render_inline(self, text, base):
+        for seg, kind in self._md_inline_segments(text):
+            if not seg:
+                continue
+            self._raw_ins(seg, *(base + ((self.MD_INLINE[kind],) if kind else ())))
+
+    @staticmethod
+    def _md_inline_segments(text):
+        """Split a line into (text, kind) segments where kind ∈ {None,'b','i','code'}. Only
+        COMPLETE spans get a kind; an unclosed `**`/`*`/`` ` `` is emitted as plain text so the
+        live tail shows raw markers until the closing token streams in (then a re-render snaps
+        it to formatting)."""
+        segs, buf, i, n = [], [], 0, len(text)
+
+        def flush():
+            if buf:
+                segs.append(("".join(buf), None))
+                buf.clear()
+
+        while i < n:
+            c = text[i]
+            if c == '`':
+                j = text.find('`', i + 1)
+                if j != -1:
+                    flush(); segs.append((text[i + 1:j], "code")); i = j + 1; continue
+                buf.append(text[i:]); break                      # unclosed → raw
+            if c == '*':
+                if text[i:i + 2] == '**':
+                    j = text.find('**', i + 2)
+                    if j != -1 and j > i + 2:
+                        flush(); segs.append((text[i + 2:j], "b")); i = j + 2; continue
+                    buf.append(text[i:]); break                  # unclosed → raw
+                j = text.find('*', i + 1)
+                if j != -1 and j > i + 1 and text[i + 1] != ' ':
+                    flush(); segs.append((text[i + 1:j], "i")); i = j + 1; continue
+                buf.append(c); i += 1; continue                  # lone '*' (e.g. a*b) → literal
+            buf.append(c); i += 1
+        flush()
+        return segs
+
+    @staticmethod
+    def _md_is_table_row(line):
+        t = line.strip()
+        return t.startswith("|") and t.count("|") >= 2
+
+    @staticmethod
+    def _md_is_separator(line):
+        t = line.strip().strip("|").strip()
+        return bool(t) and set(t) <= set("-: |") and "-" in t
+
+    @staticmethod
+    def _md_strip_inline(text):
+        """Table cells are plain Labels (no partial styling), so drop emphasis/code markers
+        instead of showing them raw."""
+        return text.replace("**", "").replace("`", "")
+
+    def _md_split_table_cells(self, row):
+        """Split a table row into cells on pipe boundaries — but NOT on a pipe inside an
+        inline-code span (`` `a|b` ``) or one that's backslash-escaped (`\\|`). Splitting on
+        every pipe byte would wrongly break a cell like `a|b` into two. Outer pipes are
+        stripped; emphasis/code markers dropped (cells are plain Labels)."""
+        s = row.strip()
+        if s.startswith("|"):
+            s = s[1:]
+        if s.endswith("|"):
+            s = s[:-1]
+        out, buf, in_code, esc = [], [], False, False
+        for ch in s:
+            if esc:
+                buf.append(ch); esc = False; continue
+            if ch == "\\":
+                buf.append(ch); esc = True; continue
+            if ch == "`":
+                in_code = not in_code; buf.append(ch); continue
+            if ch == "|" and not in_code:
+                out.append(self._md_strip_inline("".join(buf).strip())); buf = []
+            else:
+                buf.append(ch)
+        out.append(self._md_strip_inline("".join(buf).strip()))
+        return out
+
+    def _md_flush_table(self):
+        """Replace the raw rows buffered since md_tbl with a real Tk grid (or, if it wasn't a
+        valid table after all, re-render them as plain lines)."""
+        rows = self._md_tbl or []
+        self._md_tbl = None
+        try:
+            if "md_tbl" in self.chat.mark_names():
+                self.chat.delete("md_tbl", "end-1c")
+                self.chat.mark_unset("md_tbl")
+        except Exception:
+            pass
+        if len(rows) >= 2 and self._md_is_separator(rows[1]):
+            try:
+                header = self._md_split_table_cells(rows[0])
+                body = [self._md_split_table_cells(r) for r in rows[2:]]
+                tbl = self._build_table(header, body)
+                self._raw_ins("\n", "a")
+                self.chat.window_create("end", window=tbl, pady=self.px(4))
+                self._raw_ins("\n", "a")
+                return
+            except Exception:
+                pass                                  # fall through to a plain re-render
+        for r in rows:
+            self._md_render_block_line(r)
+
+    def _build_table(self, header, body):
+        """A real grid of Labels embedded in the chat: each cell auto-sizes via grid geometry,
+        so CJK and ASCII columns line up perfectly (a monospace text grid can't). Thin grid
+        lines come from a border-coloured backing Frame showing through 1px cell gaps. Fonts
+        are snapshotted at the current zoom (fixed-size embedded widget, like the bubbles/chips)
+        and kept on _overlay_fonts so Tk won't GC them; _prune_chat frees the frame with its
+        text range."""
+        ncol = max([len(header)] + [len(r) for r in body]) if (header or body) else 1
+        ncol = max(1, ncol)
+        cell_f = tkfont.Font(root=self.root, font=self.f_body)
+        head_f = tkfont.Font(root=self.root, font=self.f_chip)
+        outer = tk.Frame(self.chat, bg=T["border"], highlightthickness=0)
+        outer._overlay_fonts = [cell_f, head_f]
+        avail = max(self.px(220), self.chat.winfo_width() - self.px(56))
+        wrap = max(self.px(70), int(avail / ncol) - self.px(20))
+
+        def cell(text, r, c, head):
+            lbl = tk.Label(outer, text=text, font=(head_f if head else cell_f),
+                           bg=(T["tool_bg"] if head else T["bg"]), fg=T["text"],
+                           padx=self.px(9), pady=self.px(5), anchor="w", justify="left",
+                           wraplength=wrap)
+            lbl.grid(row=r, column=c, sticky="nsew", padx=1, pady=1)
+
+        for c in range(ncol):
+            cell(header[c] if c < len(header) else "", 0, c, True)
+        for ri, row in enumerate(body, start=1):
+            for c in range(ncol):
+                cell(row[c] if c < len(row) else "", ri, c, False)
+        return outer
+
+    def _md_seal_mark(self):
+        """Forget the live-tail / table marks (nothing left to re-render or delete)."""
+        for m in ("md_tail", "md_tbl"):
+            try:
+                if m in self.chat.mark_names():
+                    self.chat.mark_unset(m)
+            except Exception:
+                pass
+
+    def _md_finalize(self):
+        """Commit any in-flight table/tail into permanent content. Called before non-answer
+        content (tool chip, thinking, system line, new turn) is appended at the end — otherwise
+        the next _md_clear_tail would delete that content along with the tail — and at turn end
+        so the last line gets full block styling. Idempotent."""
+        try:
+            self._md_clear_tail()
+            tail = self._md_tail
+            self._md_tail = ""
+            if tail:
+                self._md_commit_line(tail, trailing_nl=False)
+            if self._md_tbl is not None:
+                self._md_flush_table()
+            self._md_autoscroll_final()       # giant-line throttling may have left us off-bottom
+        except Exception:
+            pass
+        self._md_fence = False
+        self._md_seal_mark()
+
+    def _md_reset(self):
+        """Drop md state without committing (the caller has wiped the chat)."""
+        self._md_tail = ""
+        self._md_tbl = None
+        self._md_fence = False
+        self._md_seal_mark()
 
     def add_tool(self, name, inp):
         # Skip the auto-screenshot Read so the chat isn't cluttered every turn.
         if HIDE_SCREENSHOT_TOOL and name == "Read" and isinstance(inp, dict) \
                 and "claude_overlay_shots" in str(inp.get("file_path", "")):
             return
+        self._md_finalize()              # seal the answer text streamed so far, then the tool chip
         self._ensure_header()
         at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", "\n")
@@ -1903,9 +2266,11 @@ class Overlay:
         return c
 
     def add_sys(self, text):
+        self._md_finalize()
         self._ins("\n" + ("" if text is None else str(text)) + "\n", "sys")
 
     def add_err(self, text):
+        self._md_finalize()
         self._ins("\n⚠  " + ("" if text is None else str(text)) + "\n", "err")
 
     @staticmethod
@@ -2130,6 +2495,7 @@ class Overlay:
         # of the old reply keeps streaming deltas into the chat we just cleared.
         self.worker.interrupt()
         self.chat.delete("1.0", "end")
+        self._md_reset()                 # chat wiped → drop md tail/table/fence state + marks
         self._claude_header = False
         self._thinking_active = False    # don't carry a half-open thinking block into the new turn
         # Clear the shown % immediately so the OLD conversation's usage can't linger while the
@@ -2253,12 +2619,13 @@ class Overlay:
         self.chat.yview_scroll(int(-e.delta / 120), "units")
         if DEBUG_LOG:
             dt = (time.monotonic() - t0) * 1000
-            if dt > 50:
+            if dt > 50:   # only genuinely janky frames
                 try:
                     lines = int(self.chat.index("end-1c").split(".")[0])
+                    wins = len(self.chat.window_names())   # embedded widgets (bubbles+chips+tables) in play
                 except Exception:
-                    lines = -1
-                dbg("scroll_slow", f"{dt:.0f}ms streaming={getattr(self, 'busy', False)} lines={lines}")
+                    lines = -1; wins = -1
+                dbg("scroll_slow", f"{dt:.0f}ms streaming={getattr(self, 'busy', False)} lines={lines} embeds={wins}")
 
     # ── event pump ──
     def _poll(self):
@@ -2350,11 +2717,13 @@ class Overlay:
             self._ctx_pct = payload
             self._refresh_statusline()
         elif kind == "turn_done":
+            self._md_finalize()          # the turn ended → give the last line full block styling
             self._set_busy(False)
         elif kind == "error":
             self.add_err(str(payload))
             self._set_busy(False)
         elif kind == "result":
+            self._md_finalize()          # finalize before any error line is appended
             # the SDK reports a turn that ended in error here even when no exception
             # was raised on our side; surface it instead of dropping it silently.
             if isinstance(payload, dict) and payload.get("is_error"):

@@ -3,7 +3,30 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## [1.3.0] — 2026-06-07
+## [1.4.0] — 2026-06-08
+
+### Added
+- **Markdown is now rendered in Claude's replies.** Previously the chat showed Claude's raw
+  Markdown — literal `**asterisks**` around bold text and `| pipe | tables |` that didn't line
+  up. The overlay now renders it:
+  - **Bold**, *italic*, and `inline code` — formatted live *as the reply streams* (the markers
+    turn into styling the instant their closing token arrives, so you never see them linger).
+  - **Headings** (`#`/`##`/`###`), **bulleted and numbered lists**, **blockquotes**, and
+    horizontal rules.
+  - **Fenced code blocks** (` ``` `) render as a monospace block, kept verbatim (so `**` or `|`
+    inside code stays literal).
+  - **Tables** render as a real grid with thin cell borders. Each cell is laid out by the grid,
+    so Chinese and English columns line up exactly — something a monospace text table can't do
+    with a non-CJK code font. The raw rows show as they stream, then snap into the grid the
+    moment the table block ends.
+
+  Streaming, scroll position, the transcript cap, and live text-zoom (Ctrl +/−) all still work;
+  embedded tables are freed with the rest of the transcript when it's pruned.
+
+  Rendering is designed to stay light during streaming: text is appended incrementally (the
+  current line is only re-parsed when an emphasis marker actually arrives), and the auto-scroll
+  is throttled on pathologically long unbroken lines, so a long reply can't bog down scrolling.
+  A pipe inside `inline code` no longer splits a table cell.
 
 ### Added
 - **Streaming "thinking".** Extended-thinking tokens now stream into the chat as a muted
