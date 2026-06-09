@@ -3,6 +3,175 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.4.1] — 2026-06-09
+
+### Added
+- **A scrollbar.** A thin draggable scrollbar now sits on the right edge of the chat: it shows
+  where you are in the transcript, you can drag the thumb (or click the track) to move through a
+  long reply, and it auto-hides when everything fits. It's also a wheel-independent way to
+  scroll.
+
+### Fixed
+- **The mouse wheel / trackpad now scrolls when the cursor is over a table** (or any embedded
+  element). Embedded widgets were swallowing the wheel event, so scrolling did nothing while
+  hovering a table — which, when a table filled the view, felt like the whole window had frozen
+  (the arrow keys still scrolled). Embedded elements now forward the wheel to the chat.
+
+### Changed
+- Tables are now drawn on a single lightweight canvas instead of a grid of label widgets — same
+  look and column alignment, far less per-table layout work, and a single place to forward the
+  wheel from.
+
+## [1.4.0] — 2026-06-08
+
+### Added
+- **Markdown is now rendered in Claude's replies.** Previously the chat showed Claude's raw
+  Markdown — literal `**asterisks**` around bold text and `| pipe | tables |` that didn't line
+  up. The overlay now renders it:
+  - **Bold**, *italic*, and `inline code` — formatted live *as the reply streams* (the markers
+    turn into styling the instant their closing token arrives, so you never see them linger).
+  - **Headings** (`#`/`##`/`###`), **bulleted and numbered lists**, **blockquotes**, and
+    horizontal rules.
+  - **Fenced code blocks** (` ``` `) render as a monospace block, kept verbatim (so `**` or `|`
+    inside code stays literal).
+  - **Tables** render as a real grid with thin cell borders. Each cell is laid out by the grid,
+    so Chinese and English columns line up exactly — something a monospace text table can't do
+    with a non-CJK code font. The raw rows show as they stream, then snap into the grid the
+    moment the table block ends.
+
+  Streaming, scroll position, the transcript cap, and live text-zoom (Ctrl +/−) all still work;
+  embedded tables are freed with the rest of the transcript when it's pruned.
+
+  Rendering is designed to stay light during streaming: text is appended incrementally (the
+  current line is only re-parsed when an emphasis marker actually arrives), and the auto-scroll
+  is throttled on pathologically long unbroken lines, so a long reply can't bog down scrolling.
+  A pipe inside `inline code` no longer splits a table cell.
+
+### Added
+- **Streaming "thinking".** Extended-thinking tokens now stream into the chat as a muted
+  `✻ thinking` block *before* the answer, instead of being discarded. The (often 15–30 s)
+  wait before the first answer token is now visibly alive — you can watch Claude reason,
+  the way the CLI shows it — rather than staring at a frozen "thinking…". The model's
+  speed is unchanged; what changes is that the wait no longer *looks* dead.
+- **Office COM efficiency guidance.** The system prompt now nudges Claude to drive
+  PowerPoint / Excel / Word automation efficiently — batch all inspection into one
+  PowerShell script and all edits into another (instead of a call per shape/cell/slide),
+  cache COM references, and (Excel) disable `ScreenUpdating`/`Calculation`/`EnableEvents`
+  around bulk writes. On a controlled Excel benchmark this cut wall-time ~30% and cost
+  ~43% with no loss of correctness.
+- **Opt-in activity log.** Set the `CLAUDE_OVERLAY_DEBUG_LOG` environment variable to a
+  file path to record a timestamped, one-line-per-event trace of the worker (turn start,
+  tool calls, results, errors, reconnects, a throttled streaming heartbeat) — useful for
+  diagnosing a slow or stuck turn from outside the (console-less) app. **Off by default**;
+  reply/thinking text is never written (only a heartbeat + character count).
+
+### Fixed
+- **Closing the window (✕) now always exits the process.** A wedged background thread
+  could previously leave a headless `pythonw` process (and its `claude` CLI child) running
+  after you closed the overlay. Quit now does its graceful, bounded shutdown and then
+  guarantees the process terminates, so nothing lingers in the background.
+
+## [1.2.3] — 2026-06-06
+
+### Changed
+- **`update.cmd` now refreshes your Desktop shortcut's icon** (only if you already have one).
+  The shortcut is a machine-specific `.lnk` that `git pull` can't touch, so after an update an
+  existing shortcut kept showing the old icon; `update.cmd` now re-points it at the current icon
+  automatically. (Updated by hand with `git pull`? Re-run `Create Desktop Shortcut.cmd` once.)
+
+## [1.2.2] — 2026-06-06
+
+### Changed
+- **Docs & setup: clearer, consistent install + login.** `SETUP.md`, `README.md`, and
+  `setup.cmd` now lead with the native installer (no Node.js) and log in with
+  `claude auth login` run in **PowerShell or CMD** — with an explicit warning that the
+  sign-in screen renders blank in **Git Bash / MINGW** (which made it look frozen). Also
+  noted that pip's "not on PATH" warnings are harmless and that reopening the terminal picks
+  up the freshly-installed CLI.
+
+## [1.2.1] — 2026-06-06
+
+### Changed
+- The bundled desktop-shortcut icon now uses the **Clawd sprite** (matching the v1.2.0
+  default orb look) instead of the old glossy sphere. Added `claude_overlay_2.ico`
+  (multi-resolution, generated from the sprite); `create-shortcut.ps1` points at it.
+
+## [1.2.0] — 2026-06-05
+
+### Added
+- **Custom collapsed-orb artwork (`ORB_IMAGE`).** The collapsed orb can now render an
+  image instead of the procedural glossy sphere. Point `ORB_IMAGE` at a PNG/ICO (relative
+  to the script or absolute) and it's auto-scaled + centred so the whole opaque shape fits.
+  Leave it `""` for the original sphere. Ships with a pixel-art "Clawd" sprite as the new
+  default look.
+- **Free-floating sprite mode (`ORB_FLOAT`).** With artwork set, the collapsed window is
+  clipped to the *artwork's own silhouette* (built from its alpha via `CreateRectRgn`/
+  `CombineRgn`) rather than a circle — so the orb floats as the raw sprite and clicks
+  outside the shape pass through. Binary edges keep pixel art crisp; the expanded window
+  keeps its rounded corners (no layered-window/colour-key tricks). `ORB_ALPHA_THRESHOLD`
+  tunes the silhouette tightness. Set `ORB_FLOAT = False` for a circular badge instead.
+
+### Changed
+- **The send/stop button is now rendered with Pillow (×4 supersampled + LANCZOS) instead
+  of a Tk `create_oval` + font glyph.** Tk canvas ovals aren't anti-aliased, so the old
+  button looked jagged/low-res; the circle is now smoothly anti-aliased and the arrow is a
+  crisp vector chevron. Cached per (diameter, state) with idle/hover/busy variants.
+
+## [1.1.9] — 2026-06-04
+
+### Fixed
+- **The window no longer intermittently freezes / refuses to scroll.** The rounded-corner
+  window region was re-applied on *every* `<Configure>` event. Because `SetWindowRgn(…,
+  bRedraw=True)` forces a repaint that itself emits another `<Configure>`, this self-fed a
+  ~50 ms loop, and each pass also ran `update_idletasks()` (a full layout flush). On a busy
+  window that intermittently monopolized the UI thread: scrolling locked up and a streamed
+  reply only rendered in the gaps. The region depends only on the window **size** (and
+  collapsed/expanded state), not its position, so it's now re-applied only when the size
+  actually changes — measured idle CPU dropped from ~9% to ~2%. (Found by sampling the live
+  process with `py-spy`: `_apply_region`/`SetWindowRgn` was ~56% of the UI thread's active
+  time. Transcript rendering was ruled out — inserts stay ~0.16 ms even on a 300K-char chat.)
+
+## [1.1.8] — 2026-06-04
+
+### Fixed
+- **Clear now actually drops the context gauge instead of leaving the old conversation's
+  usage on screen.** Clicking Clear interrupts the in-flight turn, whose cleanup schedules a
+  context-usage refresh against the *old* session. That refresh round-trips to the CLI and
+  could land *after* the new session was already up, overwriting the fresh (low) baseline with
+  the old conversation's high %. Now: (1) the worker discards a usage reading if the client was
+  swapped out mid-flight (the core race fix); (2) Clear blanks the shown % immediately on click
+  rather than waiting for the async reset; (3) the reset-complete handler no longer nulls the
+  freshly-reported new-session baseline. (The underlying session was always reset correctly —
+  this was a stale-display race, not a failure to start a new conversation.)
+
+## [1.1.7] — 2026-06-04
+
+### Fixed
+- **The overlay no longer burns a third of the context window on MCP tools you never use.**
+  With the `claude_code` preset, the spawned CLI loaded *every* MCP server configured in your
+  `~/.claude.json` and injected all of their tool schemas into the context — measured at
+  ~72K tokens (36% of a 200K window) on a machine with many MCP servers, materialized on the
+  first message even for a tiny text-only prompt. A single short message could appear to jump
+  the context gauge ~30%. The overlay is a lightweight screen-chat that only needs the core
+  Claude Code tools, so it now sets `strict_mcp_config=True` and does not inherit your MCP
+  servers. Measured before → after (Haiku): a text turn went from 53% → **19%** of context;
+  a 2-screenshot turn from 58% → **20%**. (New top-of-file `STRICT_MCP_CONFIG` constant —
+  flip to `False` if you *want* your MCP tools available in the overlay.) Note: this is not a
+  gauge bug — `get_context_usage()` was reporting real usage; and screenshots were never the
+  culprit (two downscaled monitors cost only ~3K tokens).
+
+## [1.1.6] — 2026-06-04
+
+### Fixed
+- **`Create Desktop Shortcut.cmd` no longer fails on install.** The launcher passed its
+  own folder to PowerShell as `"%~dp0"`, which always ends in a backslash — so the closing
+  `\"` was parsed as an escaped literal quote (CommandLineToArgvW rules), baking a stray `"`
+  into the path. `Test-Path` then threw `Illegal characters in path` and no shortcut was
+  created. The script now relies on PowerShell's built-in `$PSScriptRoot` (no path argument),
+  and `create-shortcut.ps1` additionally strips any stray quote / trailing backslash from
+  `-Dir` so it tolerates any caller. (The other `.cmd` files use `cd /d "%~dp0"`, a cmd
+  builtin that isn't affected.)
+
 ## [1.1.5] — 2026-06-03
 
 ### Fixed
@@ -185,6 +354,15 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.3.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.3.0
+[1.2.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.3
+[1.2.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.2
+[1.2.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.1
+[1.2.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.0
+[1.1.9]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.9
+[1.1.8]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.8
+[1.1.7]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.7
+[1.1.6]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.6
 [1.1.5]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.5
 [1.1.4]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.4
 [1.1.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.1.3

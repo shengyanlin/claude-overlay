@@ -9,21 +9,42 @@ else.**
 
 ## Prerequisites (per person, one time)
 
-1. **Claude Code CLI**, logged in with your own subscription
+1. **Claude Code CLI** — installed and logged in with your own subscription.
+
+   **Install** (native installer, no Node.js needed) — run in **PowerShell**:
+   ```powershell
+   irm https://claude.ai/install.ps1 | iex
    ```
-   npm install -g @anthropic-ai/claude-code
-   claude            # then run /login  (use your Claude account)
+   (or `winget install Anthropic.ClaudeCode`; or, if you prefer npm and have Node 18+,
+   `npm install -g @anthropic-ai/claude-code`.)
+
+   **Log in** — run in **PowerShell or CMD (not Git Bash / MINGW)**:
    ```
-   (Needs Node.js. If `npm` is missing, install Node LTS from nodejs.org first.)
+   claude auth login
+   ```
+   A browser opens once; sign in with your own Claude account (Pro/Max — no API key).
+   > ⚠️ Don't log in from **Git Bash / MINGW** — the sign-in screen renders blank there and
+   > looks frozen (nothing happens when you press a key). Use **PowerShell** or **CMD**.
+
+   **Verify** — both should succeed:
+   ```
+   claude --version
+   claude auth status
+   ```
+   > If `claude` says "command not found", **close and reopen your terminal** — the native
+   > installer drops it in `%USERPROFILE%\.local\bin` and a fresh terminal picks up the PATH.
 2. **Python 3.10+** — https://www.python.org/downloads/
    (In the installer, tick **"Add python.exe to PATH"**.)
 
 ## Install
 
 1. Copy this whole `claude-overlay` folder to the new machine (anywhere).
-2. Double-click **`setup.cmd`** — it checks Python + the `claude` CLI and
-   installs the three Python packages (`claude-agent-sdk`, `pillow`, `keyboard`).
-3. Make sure you've already run `claude` once and logged in (step 1 above).
+2. Double-click **`setup.cmd`** — it checks Python + the `claude` CLI (auto-installing the
+   CLI if it's missing) and installs the three Python packages (`claude-agent-sdk`,
+   `pillow`, `keyboard`).
+   > pip may print a few `… is installed in … which is not on PATH` warnings here —
+   > **they're harmless**; the overlay doesn't use those scripts.
+3. Make sure you've already logged in (`claude auth login`, step 1 above).
 
 ## Run
 

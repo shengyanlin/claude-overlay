@@ -20,9 +20,14 @@ claude_overlay_shots/
 # Local launch / marketing / progress notes (keep out of the public repo)
 LAUNCH_KIT.md
 PROGRESS.md
+CODEX_CRASH_AUDIT.md
 
 # OS / editor
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
+
+# Inbound contribution archives (kept locally as provenance only - may carry a
+# contributor's private email / unsanitized patch; never commit to the public repo)
+*-submission.zip

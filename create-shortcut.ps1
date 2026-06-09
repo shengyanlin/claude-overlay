@@ -1,7 +1,12 @@
 # Creates a "Claude Overlay" shortcut on the current user's Desktop, pointing to
-# this folder's launcher, with the orb icon. Portable: derives paths from its own
+# this folder's launcher, with the Clawd orb icon. Portable: derives paths from its own
 # location, so it works wherever you cloned the repo.
 param([string]$Dir = $PSScriptRoot)
+
+# Defensive: tolerate a caller that passes a quoted path or a trailing backslash
+# (e.g. "%~dp0" expands to "...\claude-overlay\" and CommandLineToArgvW turns the
+# closing \" into a literal quote, which would otherwise poison the path).
+$Dir = $Dir.Trim('"').TrimEnd('\')
 
 $launcher = Join-Path $Dir 'Start Claude Overlay.cmd'
 if (-not (Test-Path $launcher)) {
@@ -12,7 +17,7 @@ if (-not (Test-Path $launcher)) {
 
 $desktop = [Environment]::GetFolderPath('Desktop')
 $lnk = Join-Path $desktop 'Claude Overlay.lnk'
-$icon = Join-Path $Dir 'claude_overlay.ico'
+$icon = Join-Path $Dir 'claude_overlay_2.ico'
 
 $ws = New-Object -ComObject WScript.Shell
 $sc = $ws.CreateShortcut($lnk)

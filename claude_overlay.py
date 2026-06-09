@@ -18,6 +18,7 @@ import ctypes
 import ctypes.wintypes as wt
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -72,7 +73,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.1.5"
+__version__ = "1.4.1"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -85,6 +86,12 @@ MODEL = "claude-opus-4-8"
 MODELS = [("Opus 4.8", "claude-opus-4-8"), ("Opus 4.8 (1M)", "claude-opus-4-8[1m]"),
           ("Sonnet", "sonnet"), ("Haiku", "haiku")]  # click the statusline to switch
 PERMISSION_MODE = "bypassPermissions"
+STRICT_MCP_CONFIG = True          # do NOT inherit the user's ~/.claude MCP servers. The overlay
+                                  # is a lightweight screen-chat that only needs the core Claude
+                                  # Code tools; inheriting every MCP server the user has configured
+                                  # (Atlassian, Figma, M365, …) injects their tool schemas into the
+                                  # context — easily 50-70K+ tokens, a third of a 200K window, gone
+                                  # before you type. Flip to False to expose your MCP tools here.
 AUTO_SCREENSHOT_DEFAULT = True
 HIDE_SCREENSHOT_TOOL = True       # hide the noisy "⚙ Read …shot_*.png" lines every turn
 HOTKEY = "ctrl+alt+space"
@@ -92,6 +99,20 @@ THEME = "light"                  # "light" (Claude paper) or "dark" (warm dark)
 WINDOW_ALPHA = 1.0
 CORNER_RADIUS = 18
 ORB_SIZE = 56                    # diameter (logical px) of the collapsed Claude orb
+ORB_IMAGE = "claude_overlay_2.png"  # collapsed-orb artwork. "" → procedural glossy
+                                 # terracotta sphere (original look). A path (relative
+                                 # to this script, or absolute) to a PNG/ICO renders that
+                                 # image instead: it's auto-scaled + centred so the whole
+                                 # opaque shape fits inside the circular orb. RGBA with a
+                                 # transparent background works best.
+ORB_IMAGE_MARGIN = 0.04          # fraction of the radius kept clear around the artwork
+                                 # (0 = touches the circle edge; 0.04 = tiny breathing room)
+ORB_FLOAT = True                 # True + an ORB_IMAGE → the collapsed orb is clipped to the
+                                 # artwork's own silhouette (a free-floating pixel sprite, no
+                                 # circular frame; clicks outside the shape pass through).
+                                 # False → the classic circular orb. Ignored without artwork.
+ORB_ALPHA_THRESHOLD = 110        # pixels at/above this alpha (0-255) count as "solid" when
+                                 # building the silhouette — higher = tighter, crisper edge
 # Fonts. Noto Sans/Serif TC cover Chinese + English in one family (closest free
 # stand-in for Claude's proprietary Styrene/Copernicus). First available wins.
 FONT_SANS = ["Noto Sans TC", "Inter", "Segoe UI Variable Text", "Segoe UI"]
@@ -145,6 +166,85 @@ MAX_INLINE_TOTAL_BYTES = 32 * 1024 * 1024   # ... and aggregate bytes (the per-f
 MAX_UPDATE_BODY = 1 * 1024 * 1024   # cap the update-check response body before json.loads
 MAX_UPDATE_TAGS = 300       # and the number of tags parsed
 
+# ── debug / activity log (monitoring) ──────────────────────────────────────
+# Under pythonw the overlay has no console and exposes no IPC, so its work can't be
+# watched from outside. Opt in by setting the CLAUDE_OVERLAY_DEBUG_LOG environment
+# variable to a file path: you then get a timestamped, one-line-per-event trace of the
+# worker (turn start, tool calls, results, errors, reconnects, a throttled streaming
+# heartbeat) — enough to see what it's doing and whether a turn is stuck. Default is OFF
+# (empty) so nothing is written. Privacy note: even when enabled, reply text is NEVER
+# logged (deltas/thinking are logged only as a ~2s heartbeat + char count), but a
+# turn-start prompt preview (≤120 chars) IS written — so only enable it on a trusted
+# machine. Each PID tags its own lines so several overlays don't get confused.
+DEBUG_LOG = os.environ.get("CLAUDE_OVERLAY_DEBUG_LOG", "")
+DEBUG_LOG_MAX_BYTES = 2_000_000     # truncate (best-effort) once the log grows past this
+_dbg_lock = threading.Lock()
+_dbg_stream_last = [0.0]             # throttle high-frequency streaming deltas to a heartbeat
+_dbg_think_last = [0.0]             # ditto for thinking deltas (separate, so a thinking heartbeat
+                                    # can't suppress the first answer delta we use to time TTFT)
+
+
+def dbg(kind, payload=None):
+    """Append one best-effort line to DEBUG_LOG. Never raises into the caller."""
+    if not DEBUG_LOG:
+        return
+    try:
+        if kind in ("delta", "think"):   # streaming token text → heartbeat only, NEVER the content
+            now = time.monotonic()       # (thinking is reply content too — must not hit disk verbatim)
+            last = _dbg_stream_last if kind == "delta" else _dbg_think_last
+            if now - last[0] < 2.0:
+                return
+            last[0] = now
+            n = len(payload) if isinstance(payload, str) else 0
+            payload = f"<{'streaming' if kind == 'delta' else 'thinking'} +{n} chars>"
+        elif kind == "tool":        # (name, input_dict) → name + a short arg preview
+            name, inp = payload if isinstance(payload, tuple) and len(payload) == 2 else (payload, None)
+            arg = ""
+            if isinstance(inp, dict):
+                arg = " ".join(f"{k}={str(v)[:40]}" for k, v in list(inp.items())[:2])
+            payload = f"{name} {arg}".strip()
+        elif isinstance(payload, dict):
+            payload = " ".join(f"{k}={v}" for k, v in payload.items())
+        elif isinstance(payload, str):
+            payload = payload[:200].replace("\n", " ")
+        _now = time.time()
+        _ts = time.strftime('%H:%M:%S', time.localtime(_now)) + f".{int((_now % 1) * 1000):03d}"
+        line = f"{_ts} pid={os.getpid()} {kind} {payload if payload is not None else ''}".rstrip() + "\n"
+        with _dbg_lock:
+            try:
+                if os.path.exists(DEBUG_LOG) and os.path.getsize(DEBUG_LOG) > DEBUG_LOG_MAX_BYTES:
+                    open(DEBUG_LOG, "w", encoding="utf-8").close()
+            except Exception:
+                pass
+            with open(DEBUG_LOG, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception:
+        pass
+
+
+class _UIQueueTap:
+    """Wraps the worker→UI queue so every event the worker emits is also written to the
+    debug log. The worker's entire observable behavior already flows through this one
+    queue (`ready`/`tool`/`result`/`error`/`system`/`turn_done`/`delta`/…), so a single
+    tap here logs all of it without scattering calls through the worker. The UI keeps
+    reading the underlying queue directly; only the worker's `put` side is wrapped."""
+    def __init__(self, q):
+        self._q = q
+
+    def put(self, item, *a, **k):
+        try:
+            if isinstance(item, tuple) and len(item) == 2:
+                dbg(item[0], item[1])
+            else:
+                dbg(item)
+        except Exception:
+            pass
+        return self._q.put(item, *a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._q, name)
+
+
 SYSTEM_APPEND = (
     "You are running as an always-on-top floating overlay assistant on the user's "
     "Windows 11 desktop. The user talks to you without leaving their current app. "
@@ -152,7 +252,18 @@ SYSTEM_APPEND = (
     "as images, or (legacy) as an [ATTACHMENTS] path you open with the Read tool. "
     "Use them to see what the user is looking at, then help. "
     "Keep replies concise and skimmable since they render in a small floating window; "
-    "expand only when asked."
+    "expand only when asked. "
+    "When automating Office (PowerPoint/Excel/Word) via PowerShell+COM, optimize for "
+    "speed: a NEW PowerShell process runs per tool call and COM state does NOT persist "
+    "across calls, and every property access is a slow cross-process round-trip. So: "
+    "(1) BATCH — do all inspection in ONE script (return what you need, e.g. as JSON), "
+    "then apply ALL edits in ONE script; never one tool call per shape/cell/slide. "
+    "(2) Within a script cache COM references in variables (grab the slide/shape/table "
+    "once) instead of re-walking the object model, and don't re-read everything to verify "
+    "after each write. (3) For Excel bulk writes, set Application.ScreenUpdating=$false, "
+    "Calculation=xlManual and EnableEvents=$false around them, then restore. (4) For large "
+    "purely-textual edits where the live open document isn't needed, python-pptx/openpyxl "
+    "on the file is far faster than COM — but only when the file is NOT open in Office."
 )
 
 THEMES = {
@@ -198,6 +309,14 @@ _user32.GetAncestor.restype = wt.HWND
 _user32.GetAncestor.argtypes = [wt.HWND, ctypes.c_uint]
 _gdi32.CreateEllipticRgn.restype = wt.HRGN
 _gdi32.CreateEllipticRgn.argtypes = [ctypes.c_int] * 4
+# Region from arbitrary silhouette (used to float the collapsed orb as a pixel sprite,
+# with no circular frame): OR together one rect per opaque run of the artwork's alpha.
+_gdi32.CreateRectRgn.restype = wt.HRGN
+_gdi32.CreateRectRgn.argtypes = [ctypes.c_int] * 4
+_gdi32.SetRectRgn.restype = ctypes.c_int
+_gdi32.SetRectRgn.argtypes = [wt.HRGN] + [ctypes.c_int] * 4
+_gdi32.CombineRgn.restype = ctypes.c_int
+_gdi32.CombineRgn.argtypes = [wt.HRGN, wt.HRGN, wt.HRGN, ctypes.c_int]
 _user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 _user32.GetMonitorInfoW.restype = ctypes.c_int
 _MONENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
@@ -253,7 +372,9 @@ def enumerate_monitors():
 class ClaudeWorker(threading.Thread):
     def __init__(self, ui_queue: "queue.Queue"):
         super().__init__(daemon=True)
-        self.ui = ui_queue
+        # Tap the UI channel so the debug log captures every worker→UI event (no-op when
+        # DEBUG_LOG is ""). The UI side keeps reading the raw queue.
+        self.ui = _UIQueueTap(ui_queue) if DEBUG_LOG else ui_queue
         self.req: "queue.Queue" = queue.Queue()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._client: ClaudeSDKClient | None = None
@@ -338,10 +459,19 @@ class ClaudeWorker(threading.Thread):
                            "append": SYSTEM_APPEND, "exclude_dynamic_sections": True},
         )
         opts["max_buffer_size"] = MAX_BUFFER_SIZE
-        # Some kwargs (max_buffer_size, can_use_tool) only exist on newer SDKs. Strip any
-        # the installed SDK rejects, one at a time, so an older install still loads (with
-        # reduced features) instead of failing to construct options at all.
-        droppable = ["max_buffer_size", "can_use_tool", "include_partial_messages"]
+        if STRICT_MCP_CONFIG:
+            # Use ONLY the (empty) MCP servers defined here, ignoring the user's filesystem
+            # config. Without this the spawned CLI loads every MCP server from ~/.claude.json
+            # and injects all their tool schemas — measured at 72K tokens (36% of Haiku's
+            # 200K window) on one machine with many MCP servers, gone before the first
+            # message. setting_sources
+            # alone does NOT stop this; the CLI loads MCP servers via a separate path.
+            opts["strict_mcp_config"] = True
+        # Some kwargs (max_buffer_size, can_use_tool, strict_mcp_config) only exist on newer
+        # SDKs. Strip any the installed SDK rejects, one at a time, so an older install still
+        # loads (with reduced features) instead of failing to construct options at all.
+        droppable = ["strict_mcp_config", "max_buffer_size", "can_use_tool",
+                     "include_partial_messages"]
         while True:
             try:
                 return ClaudeAgentOptions(**opts)
@@ -357,6 +487,7 @@ class ClaudeWorker(threading.Thread):
         # Bounded auto-restart: even if _amain falls over entirely (e.g. the event loop
         # dies), bring it back so the overlay self-heals instead of becoming a zombie
         # window that never answers again.
+        dbg("worker_start")
         attempts = 0
         last_start = 0.0
         while self._running and attempts < 5:
@@ -465,8 +596,18 @@ class ClaudeWorker(threading.Thread):
 
     async def _emit_usage(self):
         """Push current model + context-window usage % to the UI statusline."""
+        # Capture the client we're measuring. A turn's finally schedules this against the
+        # *current* client; if a Clear/reconnect swaps the client out while the (slow,
+        # round-trips to the CLI) get_context_usage() is in flight, the result describes a
+        # session that no longer exists. Emitting it would overwrite the fresh post-reset
+        # baseline with the OLD conversation's high % — the "Clear didn't drop context" bug.
+        client = self._client
+        if client is None:
+            return
         try:
-            u = await asyncio.wait_for(self._client.get_context_usage(), timeout=6)
+            u = await asyncio.wait_for(client.get_context_usage(), timeout=6)
+            if client is not self._client:   # reset/reconnect happened mid-flight → stale
+                return
             if isinstance(u, dict):
                 if u.get("model"):
                     self.ui.put(("model", u["model"]))
@@ -490,6 +631,9 @@ class ClaudeWorker(threading.Thread):
 
     async def _run_turn(self, payload):
         text, image_paths = payload if isinstance(payload, tuple) else (payload, [])
+        dbg("turn_start", f"imgs={len(image_paths or [])} | {str(text)[:120]}")
+        _dbg_stream_last[0] = 0.0   # force this turn's FIRST delta to log → measures time-to-first-token
+        _dbg_think_last[0] = 0.0    # and its first thinking token → time-to-first-thinking
         if self._client is None:        # initial connect failed earlier — try once more
             await self._open()
         if self._client is None:
@@ -652,6 +796,8 @@ class ClaudeWorker(threading.Thread):
                 dt = d.get("type")
                 if dt == "text_delta":
                     self.ui.put(("delta", d.get("text", "")))
+                elif dt == "thinking_delta":   # extended-thinking tokens (stream them so the
+                    self.ui.put(("think", d.get("thinking", "")))   # pre-answer wait looks alive
                 elif dt == "input_json_delta":
                     b = blocks.get(idx)
                     if not isinstance(b, dict):   # corrupted/missing → reset to a fresh buf
@@ -731,6 +877,8 @@ class Overlay:
         self._paste_busy = False        # a background clipboard paste is in flight
         self._quitting = False          # make quit() idempotent (double-close → one teardown)
         self._orb_imgs: dict = {}       # (size, hover) → PhotoImage cache for the orb
+        self._send_imgs: dict = {}      # (diameter, state) → PhotoImage cache for the send button
+        self._send_hover = False
         self.busy = False
         self.visible = True
         self.expanded = True
@@ -738,9 +886,20 @@ class Overlay:
         self._model = None
         self._ctx_pct = None
         self._claude_header = False
+        self._thinking_active = False   # a thinking block is open in the current turn
+        # streaming-Markdown renderer state (per turn): the current unfinished answer line
+        # (re-rendered live so inline emphasis lands the moment its closing marker streams in),
+        # a table being assembled across lines, and whether we're inside a ``` code fence.
+        self._md_tail = ""
+        self._md_tbl = None
+        self._md_fence = False
+        self._md_last_scroll = 0.0   # throttle yview()/see() — both are O(line) on a giant line
+        self._last_pump = time.monotonic()   # hang-watchdog heartbeat
+        self._pump_logged = 0.0              # throttle the periodic "pump alive" debug line
         self._drag = (0, 0)
         self._resize = None
         self._round_after = None
+        self._last_cfg_size = None   # last (w,h) we re-applied the window region for
         self._capture_excluded = False   # set once WDA_EXCLUDEFROMCAPTURE is applied
         self._update_available = None     # set to the newer version string if one exists
 
@@ -784,6 +943,14 @@ class Overlay:
         self.f_chip  = mk(self.sans, 11, weight="bold")
         self.f_mono  = mk(self.mono, 12)
         self.f_send  = mk(self.sans, 17, weight="bold")
+        self.f_think = mk(self.sans, 13, slant="italic")   # streamed extended-thinking text
+        # Markdown answer styling — registered with self._fonts so they live-zoom with the body.
+        self.f_bold  = mk(self.sans, 15, weight="bold")
+        self.f_ital  = mk(self.sans, 15, slant="italic")
+        self.f_code  = mk(self.mono, 13)
+        self.f_h1    = mk(self.sans, 19, weight="bold")
+        self.f_h2    = mk(self.sans, 17, weight="bold")
+        self.f_h3    = mk(self.sans, 15, weight="bold")
 
         self._build_titlebar()
         self.hairline = tk.Frame(self.root, bg=T["border"], height=1)
@@ -802,6 +969,41 @@ class Overlay:
         self.root.after(170, self._apply_region)
         self.root.after(180, self._exclude_from_capture)
         self.root.after(1200, self._check_for_update)
+        self._start_hang_watchdog()    # diagnostic: dumps all-thread stacks if the UI pump stalls
+
+    def _start_hang_watchdog(self):
+        """Diagnostic (active only when CLAUDE_OVERLAY_DEBUG_LOG is set): a daemon thread that,
+        if the Tk event pump (_poll) stops heart-beating for >4 s — i.e. the UI is actually
+        wedged, which from OUTSIDE looks identical to a healthy idle window (CPU 0, not
+        "hung") — dumps every thread's Python stack to the log. That names the exact line /
+        lock / queue.get the UI thread is stuck on. Pure in-process (faulthandler), no memory
+        reads, no external profiler."""
+        if not DEBUG_LOG:
+            return
+        import faulthandler
+        import threading as _th
+
+        def _watch():
+            dumped_for = None
+            while True:
+                time.sleep(1.0)
+                try:
+                    lp = getattr(self, "_last_pump", 0.0)
+                    stalled = time.monotonic() - lp
+                    if stalled > 4.0 and dumped_for != lp:   # one dump per distinct stall episode
+                        dumped_for = lp
+                        with open(DEBUG_LOG, "a", encoding="utf-8") as f:
+                            f.write("\n===== HANG WATCHDOG: pid=%d UI pump _poll stalled %.1fs @ %s "
+                                    "(>1800s usually = laptop sleep/long idle, not a real hang) — all-thread stacks =====\n"
+                                    % (os.getpid(), stalled, time.strftime("%H:%M:%S")))
+                            f.flush()
+                            faulthandler.dump_traceback(file=f, all_threads=True)
+                            f.write("===== END HANG DUMP =====\n")
+                            f.flush()
+                except Exception:
+                    pass
+
+        _th.Thread(target=_watch, name="hang-watchdog", daemon=True).start()
 
     @staticmethod
     def _parse_ver(s):
@@ -869,14 +1071,35 @@ class Overlay:
         wrap = tk.Frame(self.root, bg=T["bg"])
         wrap.pack(fill="both", expand=True, side="top")
         self.chat_wrap = wrap
+        # Custom thin scrollbar on the right edge: a draggable grey thumb that also shows where
+        # you are in the transcript. Drawn on a Canvas to match the app's look, and (crucially)
+        # it's a wheel-independent way to scroll — useful because hovering an embedded widget can
+        # still swallow the mouse wheel.
+        self._sb_w = self.px(11)
+        self._sb_first, self._sb_last = 0.0, 1.0
+        self._sb_drag = None
+        self._sb_hover = False
+        self.scrollbar = tk.Canvas(wrap, width=self._sb_w, bg=T["bg"], highlightthickness=0,
+                                   cursor="arrow", takefocus=0)
+        # inset by the resize-edge thickness (px 6) so the right-edge resize strip (which is
+        # lifted on top) doesn't sit over the bar and steal its drag.
+        self.scrollbar.pack(side="right", fill="y", padx=(0, self.px(6)))
+        self.scrollbar.bind("<ButtonPress-1>", self._sb_press)
+        self.scrollbar.bind("<B1-Motion>", self._sb_motion)
+        self.scrollbar.bind("<ButtonRelease-1>", lambda e: (setattr(self, "_sb_drag", None), self._sb_redraw()))
+        self.scrollbar.bind("<Configure>", lambda e: self._sb_redraw())
+        self.scrollbar.bind("<MouseWheel>", self._fwd_wheel)
+        self.scrollbar.bind("<Enter>", lambda e: (setattr(self, "_sb_hover", True), self._sb_redraw()))
+        self.scrollbar.bind("<Leave>", lambda e: (setattr(self, "_sb_hover", False), self._sb_redraw()))
         self.chat = tk.Text(
             wrap, bg=T["bg"], fg=T["text"], bd=0, padx=self.px(18), pady=self.px(12),
             wrap="word", font=self.f_body, highlightthickness=0, cursor="arrow",
             width=1, height=1, selectbackground=T["sel"], selectforeground=T["text"],
             spacing1=self.px(2), spacing3=self.px(3),
         )
-        self.chat.pack(fill="both", expand=True)
-        self.chat.bind("<MouseWheel>", lambda e: self.chat.yview_scroll(int(-e.delta / 120), "units"))
+        self.chat.pack(side="left", fill="both", expand=True)
+        self.chat.configure(yscrollcommand=self._sb_set)
+        self.chat.bind("<MouseWheel>", self._on_wheel)
         self.chat.bind("<Key>", self._readonly_keys)
 
         m = self.f_body.measure("0") * 5
@@ -895,6 +1118,89 @@ class Overlay:
                                 spacing1=self.px(6), spacing3=self.px(4))
         self.chat.tag_configure("err", foreground=T["err"], font=self.f_small,
                                 spacing1=self.px(6), spacing3=self.px(4))
+        # extended-thinking: a muted "✻ thinking" label + faint italic body, indented so it
+        # reads as a side-channel before the answer (mirrors how the CLI streams thinking, so
+        # the long pre-answer wait isn't a dead, frozen-looking screen).
+        self.chat.tag_configure("think_label", foreground=T["faint"], font=self.f_chip,
+                                lmargin1=self.px(18), spacing1=self.px(8), spacing3=self.px(2))
+        self.chat.tag_configure("think", foreground=T["faint"], font=self.f_think,
+                                lmargin1=self.px(18), lmargin2=self.px(18), rmargin=self.px(14),
+                                spacing2=self.px(1))
+        # Markdown styling for the answer. These tags layer ON TOP of "a" (which owns the
+        # answer's foreground colour + paragraph spacing) and are created AFTER it, so on the
+        # font/background options they conflict on, the md_* tag wins while "a" still supplies
+        # the colour — i.e. a range tagged ("a", "md_b") keeps the answer colour but renders bold.
+        code_bg = T["tool_bg"]
+        self.chat.tag_configure("md_b", font=self.f_bold)
+        self.chat.tag_configure("md_i", font=self.f_ital)
+        self.chat.tag_configure("md_code", font=self.f_code, background=code_bg)
+        self.chat.tag_configure("md_h1", font=self.f_h1, spacing1=self.px(14), spacing3=self.px(5))
+        self.chat.tag_configure("md_h2", font=self.f_h2, spacing1=self.px(11), spacing3=self.px(4))
+        self.chat.tag_configure("md_h3", font=self.f_h3, spacing1=self.px(9), spacing3=self.px(3))
+        self.chat.tag_configure("md_bullet", lmargin1=self.px(20), lmargin2=self.px(36))
+        self.chat.tag_configure("md_quote", font=self.f_ital, foreground=T["muted"],
+                                lmargin1=self.px(20), lmargin2=self.px(20))
+        self.chat.tag_configure("md_codeblock", font=self.f_code, background=code_bg,
+                                lmargin1=self.px(20), lmargin2=self.px(20), rmargin=self.px(14),
+                                spacing1=self.px(1), spacing3=self.px(1))
+
+    # ── custom scrollbar (right edge of the chat) ──
+    def _sb_set(self, first, last):
+        """Tk's Text calls this (yscrollcommand) whenever the view changes — scrolling, a new
+        reply streaming in, see('end'), resize. Store the visible fraction and redraw the thumb,
+        so it always tracks the real position."""
+        try:
+            self._sb_first, self._sb_last = float(first), float(last)
+        except Exception:
+            self._sb_first, self._sb_last = 0.0, 1.0
+        self._sb_redraw()
+
+    def _sb_geom(self):
+        """Return (height, thumb_top_px, thumb_bottom_px) honouring a minimum thumb size, or
+        None if the bar isn't laid out yet / the content fits (nothing to scroll)."""
+        h = self.scrollbar.winfo_height()
+        if h <= 1:
+            return None
+        if self._sb_first <= 0.0 and self._sb_last >= 1.0:
+            return None                                   # everything fits → no thumb
+        y0, y1 = self._sb_first * h, self._sb_last * h
+        minh = self.px(28)
+        if y1 - y0 < minh:                                # keep the thumb grabbable
+            mid = max(minh / 2, min((y0 + y1) / 2, h - minh / 2))
+            y0, y1 = mid - minh / 2, mid + minh / 2
+        return h, y0, y1
+
+    def _sb_redraw(self):
+        cv = self.scrollbar
+        cv.delete("all")
+        g = self._sb_geom()
+        if not g:
+            return
+        h, y0, y1 = g
+        w = self._sb_w
+        pad = self.px(3)
+        col = T["muted"] if self._sb_hover or self._sb_drag is not None else T["faint"]
+        round_rect(cv, pad, y0 + pad, w - pad, y1 - pad, (w - 2 * pad) / 2, fill=col, outline="")
+
+    def _sb_press(self, e):
+        g = self._sb_geom()
+        if not g:
+            return
+        h, y0, y1 = g
+        if y0 <= e.y <= y1:
+            self._sb_drag = e.y - y0                       # grab offset within the thumb
+        else:                                              # clicked the track → jump there
+            self._sb_drag = (y1 - y0) / 2
+            self.chat.yview_moveto(max(0.0, min(1.0, (e.y - self._sb_drag) / h)))
+        self._sb_redraw()
+
+    def _sb_motion(self, e):
+        if self._sb_drag is None:
+            return
+        h = self.scrollbar.winfo_height()
+        if h <= 1:
+            return
+        self.chat.yview_moveto(max(0.0, min(1.0, (e.y - self._sb_drag) / h)))
 
     def _build_input(self):
         wrap = tk.Frame(self.root, bg=T["bg"])
@@ -990,6 +1296,59 @@ class Overlay:
         t = 0.0 if t < 0 else 1.0 if t > 1 else t
         return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
 
+    def _orb_image_from_file(self, s, hover):
+        """Render the collapsed orb from ORB_IMAGE instead of the procedural sphere.
+        The artwork is auto-scaled so its whole opaque silhouette fits inside the
+        circular orb (the collapsed window is clipped to a circle), then centred.
+        Supersampled ×4 + LANCZOS for crisp edges at any DPI. Returns a PhotoImage,
+        or None if the file is missing/unreadable (caller falls back to the sphere)."""
+        import math
+        try:
+            from PIL import ImageEnhance
+            p = Path(ORB_IMAGE)
+            if not p.is_absolute():
+                p = Path(__file__).resolve().parent / p
+            if not p.exists():
+                return None
+            art = Image.open(p).convert("RGBA")
+        except Exception:
+            return None
+
+        SS = 4
+        n = s * SS
+        try:
+            alpha = art.split()[3]
+            bbox = alpha.getbbox() or (0, 0, art.width, art.height)
+        except Exception:
+            bbox = (0, 0, art.width, art.height)
+
+        if ORB_FLOAT:
+            # Floating sprite: the window is clipped to the artwork's own silhouette, so no
+            # circle to fit inside — scale the opaque content to fill the orb box (minus a hair).
+            bw, bh = max(1, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
+            scale = (n * (1.0 - max(0.0, min(0.4, ORB_IMAGE_MARGIN)))) / max(bw, bh)
+        else:
+            # Circular orb: fit the farthest opaque pixel just inside the circle so nothing clips.
+            cx, cy = art.width / 2.0, art.height / 2.0
+            corners = [(bbox[0], bbox[1]), (bbox[2], bbox[1]),
+                       (bbox[0], bbox[3]), (bbox[2], bbox[3])]
+            opaque_r = max(math.hypot(x - cx, y - cy) for x, y in corners) or max(cx, cy)
+            scale = ((n / 2.0) * (1.0 - max(0.0, min(0.4, ORB_IMAGE_MARGIN)))) / opaque_r
+
+        nw, nh = max(1, int(round(art.width * scale))), max(1, int(round(art.height * scale)))
+        art = art.resize((nw, nh), Image.LANCZOS)
+
+        if hover:                                   # gentle lift on hover
+            art = ImageEnhance.Brightness(art).enhance(1.08)
+
+        canvas = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+        canvas.alpha_composite(art, ((n - nw) // 2, (n - nh) // 2))
+        out = canvas.resize((s, s), Image.LANCZOS)
+        # Stash the alpha at window size so _apply_region can clip the window to the sprite.
+        self._orb_mask = out.split()[3]
+        self._orb_mask_size = (s, s)
+        return ImageTk.PhotoImage(out)
+
     def _orb_image(self, s, hover):
         """Render a glossy terracotta sphere: off-centre radial gradient (volume),
         a soft top-left specular highlight, a darker bottom rim + lighter top rim
@@ -999,6 +1358,14 @@ class Overlay:
         key = (s, hover)
         if key in self._orb_imgs:
             return self._orb_imgs[key]
+
+        # Custom artwork path: load ORB_IMAGE, auto-fit it inside the circular orb.
+        if ORB_IMAGE:
+            photo = self._orb_image_from_file(s, hover)
+            if photo is not None:
+                self._orb_imgs[key] = photo
+                return photo
+            # fall through to the procedural orb if the file is missing/unreadable
 
         SS = 4
         n = s * SS
@@ -1146,18 +1513,73 @@ class Overlay:
         c.itemconfigure(self.entry_win, width=max(self.px(40), bx - rad - self.px(8) - ex1),
                         height=max(self.px(20), h - 2 * pad - self.px(14)))
         c.delete("send")
-        col = T["err"] if self.busy else T["accent"]
-        c.create_oval(bx - rad, by - rad, bx + rad, by + rad, fill=col, outline="", tags=("send", "sc"))
-        c.create_text(bx, by - self.px(1), text=("■" if self.busy else "↑"),
-                      fill=T["on_accent"], font=self.f_send, tags=("send", "sa"))
+        # Pillow-rendered (supersampled, anti-aliased) button — Tk's create_oval is aliased
+        # and looked low-res. Centred PhotoImage; state (idle/hover/busy) swaps the cached image.
+        self._send_d = 2 * rad
+        self._send_item = c.create_image(bx, by, image=self._send_img(self._send_d, self._send_state()),
+                                         tags=("send",))
         c.tag_bind("send", "<Button-1>", lambda ev: self._send_or_stop())
-        c.tag_bind("send", "<Enter>", lambda ev: c.itemconfigure("sc", fill=T["accent_hi"]))
-        c.tag_bind("send", "<Leave>", lambda ev: c.itemconfigure(
-            "sc", fill=(T["err"] if self.busy else T["accent"])))
+        c.tag_bind("send", "<Enter>", lambda ev: self._on_send_hover(True))
+        c.tag_bind("send", "<Leave>", lambda ev: self._on_send_hover(False))
+
+    def _send_state(self):
+        return ("busy" if self.busy else "idle") + ("_hover" if self._send_hover else "")
+
+    def _on_send_hover(self, hovering):
+        self._send_hover = hovering
+        self._paint_send()
+
+    def _paint_send(self):
+        item = getattr(self, "_send_item", None)
+        d = getattr(self, "_send_d", None)
+        if item is None or not d:
+            return
+        try:
+            self.canvas.itemconfigure(item, image=self._send_img(d, self._send_state()))
+        except Exception:
+            pass
+
+    def _send_img(self, d, state):
+        """Render the round send/stop button with Pillow (×4 supersample + LANCZOS) so the
+        circle is smoothly anti-aliased and the glyph is a crisp vector, not a font character.
+        Cached per (diameter, state). state ∈ {idle, idle_hover, busy, busy_hover}."""
+        key = (d, state)
+        if key in self._send_imgs:
+            return self._send_imgs[key]
+        busy = state.startswith("busy")
+        hover = state.endswith("hover")
+        base = self._rgb(T["err"] if busy else T["accent"])
+        if hover:
+            base = self._mix(base, (255, 255, 255), 0.12) if busy else self._rgb(T["accent_hi"])
+        fg = self._rgb(T["on_accent"])
+
+        SS = 4
+        n = max(4, d * SS)
+        img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(img)
+        dr.ellipse([0, 0, n - 1, n - 1], fill=base + (255,))
+        if busy:                                   # rounded "stop" square
+            sq = n * 0.30
+            o = (n - sq) / 2
+            dr.rounded_rectangle([o, o, o + sq, o + sq], radius=n * 0.055, fill=fg + (255,))
+        else:                                      # upward "send" arrow (stem + chevron)
+            cx = n / 2
+            topy, boty = n * 0.31, n * 0.71
+            wln = max(2, int(round(n * 0.11)))
+            hw = n * 0.18
+            r = wln / 2
+            dr.line([cx, boty, cx, topy], fill=fg + (255,), width=wln)
+            dr.line([cx - hw, topy + hw, cx, topy], fill=fg + (255,), width=wln)
+            dr.line([cx + hw, topy + hw, cx, topy], fill=fg + (255,), width=wln)
+            for (ex, ey) in ((cx, topy), (cx, boty), (cx - hw, topy + hw), (cx + hw, topy + hw)):
+                dr.ellipse([ex - r, ey - r, ex + r, ey + r], fill=fg + (255,))   # round the caps
+        out = img.resize((d, d), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(out)
+        self._send_imgs[key] = photo
+        return photo
 
     def _refresh_send(self):
-        self.canvas.itemconfigure("sc", fill=(T["err"] if self.busy else T["accent"]))
-        self.canvas.itemconfigure("sa", text=("■" if self.busy else "↑"))
+        self._paint_send()
 
     # ── placeholder ──
     def _ph_in(self, e=None):
@@ -1378,10 +1800,23 @@ class Overlay:
             pass
 
     def _on_configure(self, e):
-        if e.widget is self.root:
-            if self._round_after:
-                self.root.after_cancel(self._round_after)
-            self._round_after = self.root.after(50, self._apply_region)
+        if e.widget is not self.root:
+            return
+        # The rounded/elliptic region depends ONLY on the window SIZE (and expanded state),
+        # not its position. Re-applying on every <Configure> — move-only events, and the
+        # redraw that SetWindowRgn(…, bRedraw=True) itself triggers — spun _apply_region in a
+        # ~50 ms self-feeding loop (SetWindowRgn → repaint → <Configure> → reschedule), and
+        # each pass ran update_idletasks() (a full layout flush, expensive on a big chat).
+        # That intermittently starved the UI thread: scrolling froze, the reply only rendered
+        # in the gaps. Only re-apply when the size actually changed; collapse/expand still
+        # re-apply explicitly via their own after(_apply_region) calls.
+        size = (e.width, e.height)
+        if size == self._last_cfg_size:
+            return
+        self._last_cfg_size = size
+        if self._round_after:
+            self.root.after_cancel(self._round_after)
+        self._round_after = self.root.after(50, self._apply_region)
 
     def _apply_region(self):
         try:
@@ -1392,7 +1827,12 @@ class Overlay:
                 r = self.px(CORNER_RADIUS)
                 rgn = _gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, r, r)
             else:
-                rgn = _gdi32.CreateEllipticRgn(0, 0, w + 1, h + 1)   # circular orb
+                rgn = None
+                if ORB_FLOAT and getattr(self, "_orb_mask", None) is not None \
+                        and self._orb_mask_size == (w, h):
+                    rgn = self._build_alpha_region(self._orb_mask)   # float as the raw sprite
+                if not rgn:
+                    rgn = _gdi32.CreateEllipticRgn(0, 0, w + 1, h + 1)   # circular orb fallback
             # On success Windows owns the region handle; on failure WE still own it and must
             # free it, or repeated <Configure>/resize churn with a stale hwnd leaks GDI
             # handles until drawing eventually fails. SetWindowRgn returns 0 on failure.
@@ -1401,6 +1841,38 @@ class Overlay:
                 _gdi32.DeleteObject(rgn)
         except Exception:
             pass
+
+    def _build_alpha_region(self, mask, thr=None):
+        """Build a Win32 region matching an alpha mask's opaque silhouette: one rect per
+        horizontal run of pixels at/above the threshold, OR-ed together. Lets the collapsed
+        window float as the raw pixel sprite (hard binary edge — ideal for pixel art).
+        Returns an HRGN owned by the caller, or None on failure."""
+        try:
+            thr = ORB_ALPHA_THRESHOLD if thr is None else thr
+            w, h = mask.size
+            px = mask.load()
+            full = _gdi32.CreateRectRgn(0, 0, 0, 0)
+            tmp = _gdi32.CreateRectRgn(0, 0, 0, 0)
+            if not full or not tmp:
+                for r in (full, tmp):
+                    if r:
+                        _gdi32.DeleteObject(r)
+                return None
+            for y in range(h):
+                x = 0
+                while x < w:
+                    if px[x, y] >= thr:
+                        x0 = x
+                        while x < w and px[x, y] >= thr:
+                            x += 1
+                        _gdi32.SetRectRgn(tmp, x0, y, x, y + 1)
+                        _gdi32.CombineRgn(full, full, tmp, 2)   # RGN_OR
+                    else:
+                        x += 1
+            _gdi32.DeleteObject(tmp)
+            return full
+        except Exception:
+            return None
 
     # ── chat rendering (main thread only) ──
     def _readonly_keys(self, e):
@@ -1436,6 +1908,8 @@ class Overlay:
             # next delta re-inserts the header.
             if self._claude_header and not self.chat.tag_ranges("current_ah"):
                 self._claude_header = False
+                self._thinking_active = False   # header was pruned mid-thinking → re-arm the
+                                                # "✻ thinking" label with the re-inserted header
         except Exception:
             pass
 
@@ -1448,6 +1922,7 @@ class Overlay:
         self._prune_chat()
 
     def add_user(self, text):
+        self._md_finalize()              # commit the previous turn's last line before a new bubble
         at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", "\n")
         self.chat.window_create("end", window=self._user_bubble(text), pady=self.px(3))
@@ -1457,6 +1932,7 @@ class Overlay:
         except Exception:                                       # is no longer the "active" one
             pass
         self._claude_header = False
+        self._thinking_active = False    # new turn → next thinking re-inserts its label
         if at_bottom:
             self.chat.see("end")
         self._prune_chat()
@@ -1504,6 +1980,7 @@ class Overlay:
         c.create_text(bx + padx, pady, text=text, font=body_font, fill=T["text"],
                       width=maxw, anchor="nw")
         c.configure(width=full, height=bh)
+        c.bind("<MouseWheel>", self._fwd_wheel)   # embedded widget must not swallow the scroll
         return c
 
     def _ensure_header(self):
@@ -1520,15 +1997,390 @@ class Overlay:
                 pass
             self._claude_header = True
 
+    def add_think(self, text):
+        # Stream extended-thinking tokens as a muted block under the Claude header, before
+        # the answer. The "✻ thinking" label is inserted once per turn; subsequent thinking
+        # text just appends. This keeps the (often 10-20s) pre-answer wait visibly alive.
+        self._md_finalize()              # seal any answer text before a (re-opened) thinking block
+        self._ensure_header()
+        if not self._thinking_active:
+            self._ins("\n✻ thinking\n", "think_label")
+            self._thinking_active = True
+        self._ins(text, "think")
+
     def add_delta(self, text):
         self._ensure_header()
-        self._ins(text, "a")
+        if self._thinking_active:        # the visible answer is starting → close the thinking block
+            self._raw_ins("\n", "a")
+            self._thinking_active = False
+        self._md_feed(text)
+
+    # ── streaming Markdown renderer ───────────────────────────────────────────────────
+    # Claude streams Markdown token-by-token, so markup spans deltas. We commit BLOCK
+    # elements (headings, lists, blockquotes, code fences, tables) when a line completes,
+    # and render INLINE emphasis (**bold**, *italic*, `code`) live by re-rendering only the
+    # current unfinished line on every delta — so a marker turns into formatting the instant
+    # its closing token arrives. A table can't align row-by-row, so its raw rows show as they
+    # stream, then snap into a real Tk grid the moment the table block ends.
+    MD_INLINE = {"b": "md_b", "i": "md_i", "code": "md_code"}
+
+    def _raw_ins(self, text, *tags):
+        """Append text + tags without the per-insert see()/_prune_chat() that _ins does;
+        the md feed batches scroll + prune once at the end (many tiny inline inserts otherwise)."""
+        if text:
+            self.chat.insert("end", text, tags)
+
+    def _md_feed(self, chunk):
+        if chunk is None:
+            return
+        chunk = str(chunk)
+        if not chunk:
+            return
+        # Auto-scroll-follow: measure "am I at the bottom" BEFORE mutating content (an append
+        # below the fold would otherwise read as "not at bottom" and break following). yview()/
+        # see() are cheap for normal multi-line content (Tk caches per-line heights) but
+        # O(line length) on a pathological newline-free GIANT line — so only for such a giant
+        # current line do we throttle the scroll to ~25/s (a long stream of one huge line would
+        # otherwise monopolise the UI thread → the v1.1.9-class freeze). Normal replies keep the
+        # exact, correct per-delta follow.
+        giant = len(self._md_tail) > self.MD_LIVE_REPARSE_MAX
+        scroll = (time.monotonic() - self._md_last_scroll) >= 0.04 if giant else True
+        at_bottom = False
+        if scroll:
+            try:
+                at_bottom = self.chat.yview()[1] > 0.999
+            except Exception:
+                at_bottom = False
+            if giant:
+                self._md_last_scroll = time.monotonic()
+        parts = chunk.split("\n")
+        for i, part in enumerate(parts):
+            if i < len(parts) - 1:                  # this part is terminated by a newline → commit
+                self._md_clear_tail()               # lift whatever of the line is rendered
+                self._md_unset_tail_mark()          # the next line re-anchors its own tail mark
+                line = self._md_tail + part
+                self._md_tail = ""
+                self._md_commit_line(line)
+            elif part:                              # the trailing, still-unfinished line
+                self._md_grow_tail(part)
+        if scroll and at_bottom:
+            try:
+                self.chat.see("end")
+            except Exception:
+                pass
+        self._prune_chat()
+
+    # cap live inline re-parsing on absurdly long single lines; formatting still finalizes
+    # correctly when the line completes / on _md_finalize.
+    MD_LIVE_REPARSE_MAX = 2000
+
+    def _md_grow_tail(self, part):
+        """Extend the current unfinished line. To stay O(n) over a long, newline-free line we
+        APPEND new text cheaply and only re-parse the whole tail when a marker char (`*` or
+        `` ` ``) arrives: plain text can't change existing spans (an unclosed span already
+        renders raw until its closing marker, which is itself a marker char and so triggers the
+        re-parse). Re-rendering the whole growing line on *every* delta was O(n²) and froze
+        scrolling on long replies — this is the fix."""
+        if "md_tail" not in self.chat.mark_names():
+            self.chat.mark_set("md_tail", "end-1c")
+            self.chat.mark_gravity("md_tail", "left")   # stays at the tail start as we append after it
+        self._md_tail += part
+        if self._md_fence:
+            self._raw_ins(part, "a", "md_codeblock")    # fenced: raw monospace, never inline
+        elif ("*" in part or "`" in part) and len(self._md_tail) <= self.MD_LIVE_REPARSE_MAX:
+            self._md_clear_tail()                       # a marker arrived → re-parse the whole tail
+            self._md_render_inline(self._md_tail, ("a",))
+        else:
+            self._raw_ins(part, "a")                    # no marker (or line too long) → cheap append
+
+    def _md_autoscroll_final(self):
+        """One-shot scroll-to-end at turn end (a giant line's last deltas may have been throttled
+        out, leaving the view a hair off the bottom). Loose threshold so 'slightly behind due to
+        throttling' still snaps to the end, while a user who clearly scrolled up to read earlier
+        content is left alone."""
+        try:
+            if self.chat.yview()[1] > 0.90:
+                self.chat.see("end")
+        except Exception:
+            pass
+        self._md_last_scroll = time.monotonic()
+
+    def _md_clear_tail(self):
+        """Delete the live-rendered tail (md_tail mark → end) so it can be re-rendered."""
+        try:
+            if "md_tail" in self.chat.mark_names():
+                self.chat.delete("md_tail", "end-1c")
+        except Exception:
+            pass
+
+    def _md_unset_tail_mark(self):
+        try:
+            if "md_tail" in self.chat.mark_names():
+                self.chat.mark_unset("md_tail")
+        except Exception:
+            pass
+
+    def _md_commit_line(self, line, trailing_nl=True):
+        """A complete line: classify it (fence / table row / heading / list / quote / text)
+        and render it permanently."""
+        if line.lstrip().startswith("```"):
+            self._md_fence = not self._md_fence     # the fence line itself is not rendered
+            return
+        if self._md_fence:
+            self._raw_ins(line + ("\n" if trailing_nl else ""), "a", "md_codeblock")
+            return
+        if self._md_is_table_row(line):
+            if self._md_tbl is None:
+                self._md_tbl = []
+                self.chat.mark_set("md_tbl", "end-1c")
+                self.chat.mark_gravity("md_tbl", "left")
+            self._md_tbl.append(line)
+            self._raw_ins(line + "\n", "a")         # raw preview; replaced by the grid on flush
+            return
+        if self._md_tbl is not None:                # a non-table line ends the table block
+            self._md_flush_table()
+        self._md_render_block_line(line, trailing_nl)
+
+    def _md_render_block_line(self, line, trailing_nl=True):
+        nl = "\n" if trailing_nl else ""
+        m = re.match(r'^(#{1,6})\s+(.*)$', line)
+        if m:
+            lvl = min(3, len(m.group(1)))
+            tag = "md_h%d" % lvl
+            self._md_render_inline(m.group(2), ("a", tag))
+            self._raw_ins(nl, "a", tag)              # carry the tag onto the newline so spacing3 applies
+            return
+        m = re.match(r'^\s*[-*+]\s+(.*)$', line)
+        if m:
+            self._raw_ins("•  ", "a", "md_bullet")
+            self._md_render_inline(m.group(1), ("a", "md_bullet"))
+            self._raw_ins(nl, "a", "md_bullet")
+            return
+        m = re.match(r'^\s*(\d+)[.)]\s+(.*)$', line)
+        if m:
+            self._raw_ins("%s. " % m.group(1), "a", "md_bullet")
+            self._md_render_inline(m.group(2), ("a", "md_bullet"))
+            self._raw_ins(nl, "a", "md_bullet")
+            return
+        if line.lstrip().startswith(">"):
+            self._md_render_inline(line.lstrip()[1:].lstrip(), ("a", "md_quote"))
+            self._raw_ins(nl, "a", "md_quote")
+            return
+        if re.match(r'^\s*([-*_])\1{2,}\s*$', line):      # horizontal rule
+            self._raw_ins("─" * 16 + nl, "a", "md_quote")
+            return
+        self._md_render_inline(line, ("a",))             # plain paragraph line
+        self._raw_ins(nl, "a")
+
+    def _md_render_inline(self, text, base):
+        for seg, kind in self._md_inline_segments(text):
+            if not seg:
+                continue
+            self._raw_ins(seg, *(base + ((self.MD_INLINE[kind],) if kind else ())))
+
+    @staticmethod
+    def _md_inline_segments(text):
+        """Split a line into (text, kind) segments where kind ∈ {None,'b','i','code'}. Only
+        COMPLETE spans get a kind; an unclosed `**`/`*`/`` ` `` is emitted as plain text so the
+        live tail shows raw markers until the closing token streams in (then a re-render snaps
+        it to formatting)."""
+        segs, buf, i, n = [], [], 0, len(text)
+
+        def flush():
+            if buf:
+                segs.append(("".join(buf), None))
+                buf.clear()
+
+        while i < n:
+            c = text[i]
+            if c == '`':
+                j = text.find('`', i + 1)
+                if j != -1:
+                    flush(); segs.append((text[i + 1:j], "code")); i = j + 1; continue
+                buf.append(text[i:]); break                      # unclosed → raw
+            if c == '*':
+                if text[i:i + 2] == '**':
+                    j = text.find('**', i + 2)
+                    if j != -1 and j > i + 2:
+                        flush(); segs.append((text[i + 2:j], "b")); i = j + 2; continue
+                    buf.append(text[i:]); break                  # unclosed → raw
+                j = text.find('*', i + 1)
+                if j != -1 and j > i + 1 and text[i + 1] != ' ':
+                    flush(); segs.append((text[i + 1:j], "i")); i = j + 1; continue
+                buf.append(c); i += 1; continue                  # lone '*' (e.g. a*b) → literal
+            buf.append(c); i += 1
+        flush()
+        return segs
+
+    @staticmethod
+    def _md_is_table_row(line):
+        t = line.strip()
+        return t.startswith("|") and t.count("|") >= 2
+
+    @staticmethod
+    def _md_is_separator(line):
+        t = line.strip().strip("|").strip()
+        return bool(t) and set(t) <= set("-: |") and "-" in t
+
+    @staticmethod
+    def _md_strip_inline(text):
+        """Table cells are plain Labels (no partial styling), so drop emphasis/code markers
+        instead of showing them raw."""
+        return text.replace("**", "").replace("`", "")
+
+    def _md_split_table_cells(self, row):
+        """Split a table row into cells on pipe boundaries — but NOT on a pipe inside an
+        inline-code span (`` `a|b` ``) or one that's backslash-escaped (`\\|`). Splitting on
+        every pipe byte would wrongly break a cell like `a|b` into two. Outer pipes are
+        stripped; emphasis/code markers dropped (cells are plain Labels)."""
+        s = row.strip()
+        if s.startswith("|"):
+            s = s[1:]
+        if s.endswith("|"):
+            s = s[:-1]
+        out, buf, in_code, esc = [], [], False, False
+        for ch in s:
+            if esc:
+                buf.append(ch); esc = False; continue
+            if ch == "\\":
+                buf.append(ch); esc = True; continue
+            if ch == "`":
+                in_code = not in_code; buf.append(ch); continue
+            if ch == "|" and not in_code:
+                out.append(self._md_strip_inline("".join(buf).strip())); buf = []
+            else:
+                buf.append(ch)
+        out.append(self._md_strip_inline("".join(buf).strip()))
+        return out
+
+    def _md_flush_table(self):
+        """Replace the raw rows buffered since md_tbl with a real Tk grid (or, if it wasn't a
+        valid table after all, re-render them as plain lines)."""
+        rows = self._md_tbl or []
+        self._md_tbl = None
+        try:
+            if "md_tbl" in self.chat.mark_names():
+                self.chat.delete("md_tbl", "end-1c")
+                self.chat.mark_unset("md_tbl")
+        except Exception:
+            pass
+        if len(rows) >= 2 and self._md_is_separator(rows[1]):
+            try:
+                header = self._md_split_table_cells(rows[0])
+                body = [self._md_split_table_cells(r) for r in rows[2:]]
+                tbl = self._build_table(header, body)
+                self._raw_ins("\n", "a")
+                self.chat.window_create("end", window=tbl, pady=self.px(4))
+                self._raw_ins("\n", "a")
+                return
+            except Exception:
+                pass                                  # fall through to a plain re-render
+        for r in rows:
+            self._md_render_block_line(r)
+
+    def _build_table(self, header, body):
+        """Render the table as a SINGLE lightweight Canvas that draws its own grid lines + cell
+        text — NOT a Frame of N Labels. A Frame-of-Labels cost ~400 ms of synchronous Tk
+        geometry management to embed/lay out each table (the "freezes when a table appears"
+        stall), and worse, an embedded child widget SWALLOWS the mouse wheel so scrolling died
+        whenever the cursor sat over a table. One Canvas lays out instantly and we forward its
+        wheel to the chat. Columns are sized by the real measured pixel width of each cell, so
+        CJK and ASCII still line up. Fonts are snapshotted at the current zoom and pinned on
+        _overlay_fonts so Tk won't GC them; _prune_chat frees the canvas with its text range."""
+        rows = [list(header)] + [list(r) for r in body]
+        ncol = max((len(r) for r in rows), default=1) or 1
+        cell_f = tkfont.Font(root=self.root, font=self.f_body)
+        head_f = tkfont.Font(root=self.root, font=self.f_chip)
+        padx, pady = self.px(9), self.px(5)
+        avail = max(self.px(200), self.chat.winfo_width() - self.px(56))
+        cap = max(self.px(90), int(avail / ncol))
+        colw = [self.px(36)] * ncol
+        for ri, r in enumerate(rows):
+            f = head_f if ri == 0 else cell_f
+            for c in range(ncol):
+                t = r[c] if c < len(r) else ""
+                colw[c] = max(colw[c], min(f.measure(t) + 2 * padx, cap))
+        xs = [0]
+        for c in range(ncol):
+            xs.append(xs[-1] + colw[c])
+        total_w = xs[-1]
+        cv = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0, width=total_w, takefocus=0)
+        cv._overlay_fonts = [cell_f, head_f]
+        ys = [0]
+        for ri, r in enumerate(rows):
+            f = head_f if ri == 0 else cell_f
+            rowmax = 0
+            for c in range(ncol):
+                t = r[c] if c < len(r) else ""
+                tid = cv.create_text(xs[c] + padx, ys[ri] + pady, text=t, font=f, fill=T["text"],
+                                     width=max(1, colw[c] - 2 * padx), anchor="nw")
+                bb = cv.bbox(tid)
+                rowmax = max(rowmax, (bb[3] - bb[1]) if bb else f.metrics("linespace"))
+            ys.append(ys[ri] + rowmax + 2 * pady)
+        total_h = ys[-1]
+        cv.configure(height=total_h)
+        # header tint behind the text, then thin grid lines + outer border (border colour)
+        rect = cv.create_rectangle(0, 0, total_w, ys[1], fill=T["tool_bg"], outline="")
+        cv.tag_lower(rect)
+        b = T["border"]
+        cv.create_rectangle(0, 0, total_w - 1, total_h - 1, outline=b)
+        for c in range(1, ncol):
+            cv.create_line(xs[c], 0, xs[c], total_h, fill=b)
+        for ri in range(1, len(rows)):
+            cv.create_line(0, ys[ri], total_w, ys[ri], fill=b)
+        cv.bind("<MouseWheel>", self._fwd_wheel)   # don't let the table swallow the scroll
+        return cv
+
+    def _fwd_wheel(self, e):
+        """Forward a wheel event that landed on an embedded widget to the chat's scroll, so
+        hovering a table (or any embedded widget) never freezes scrolling."""
+        try:
+            self._on_wheel(e)
+        except Exception:
+            pass
+        return "break"
+
+    def _md_seal_mark(self):
+        """Forget the live-tail / table marks (nothing left to re-render or delete)."""
+        for m in ("md_tail", "md_tbl"):
+            try:
+                if m in self.chat.mark_names():
+                    self.chat.mark_unset(m)
+            except Exception:
+                pass
+
+    def _md_finalize(self):
+        """Commit any in-flight table/tail into permanent content. Called before non-answer
+        content (tool chip, thinking, system line, new turn) is appended at the end — otherwise
+        the next _md_clear_tail would delete that content along with the tail — and at turn end
+        so the last line gets full block styling. Idempotent."""
+        try:
+            self._md_clear_tail()
+            tail = self._md_tail
+            self._md_tail = ""
+            if tail:
+                self._md_commit_line(tail, trailing_nl=False)
+            if self._md_tbl is not None:
+                self._md_flush_table()
+            self._md_autoscroll_final()       # giant-line throttling may have left us off-bottom
+        except Exception:
+            pass
+        self._md_fence = False
+        self._md_seal_mark()
+
+    def _md_reset(self):
+        """Drop md state without committing (the caller has wiped the chat)."""
+        self._md_tail = ""
+        self._md_tbl = None
+        self._md_fence = False
+        self._md_seal_mark()
 
     def add_tool(self, name, inp):
         # Skip the auto-screenshot Read so the chat isn't cluttered every turn.
         if HIDE_SCREENSHOT_TOOL and name == "Read" and isinstance(inp, dict) \
                 and "claude_overlay_shots" in str(inp.get("file_path", "")):
             return
+        self._md_finalize()              # seal the answer text streamed so far, then the tool chip
         self._ensure_header()
         at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", "\n")
@@ -1560,12 +2412,15 @@ class Overlay:
         c.create_text(x, cy, text=name, fill=T["muted"], font=fn, anchor="w"); x += nw + gap
         if arg:
             c.create_text(x, cy, text=arg, fill=T["faint"], font=fa, anchor="w")
+        c.bind("<MouseWheel>", self._fwd_wheel)   # embedded widget must not swallow the scroll
         return c
 
     def add_sys(self, text):
+        self._md_finalize()
         self._ins("\n" + ("" if text is None else str(text)) + "\n", "sys")
 
     def add_err(self, text):
+        self._md_finalize()
         self._ins("\n⚠  " + ("" if text is None else str(text)) + "\n", "err")
 
     @staticmethod
@@ -1790,7 +2645,14 @@ class Overlay:
         # of the old reply keeps streaming deltas into the chat we just cleared.
         self.worker.interrupt()
         self.chat.delete("1.0", "end")
+        self._md_reset()                 # chat wiped → drop md tail/table/fence state + marks
         self._claude_header = False
+        self._thinking_active = False    # don't carry a half-open thinking block into the new turn
+        # Clear the shown % immediately so the OLD conversation's usage can't linger while the
+        # async reset (close + reconnect) runs; the new session's true baseline arrives via the
+        # worker's post-_open _emit_usage.
+        self._ctx_pct = None
+        self._refresh_statusline()
         self.worker.reset()
         self._set_status("resetting…")
 
@@ -1896,6 +2758,25 @@ class Overlay:
         self._set_status("switching model…")
         self.worker.set_model(val)
 
+    def _on_wheel(self, e):
+        # Same scroll as before (no "break", so behavior is unchanged) — but timed. Tk
+        # relayouts a Text holding many embedded canvases (our message bubbles + tool
+        # chips) synchronously inside yview_scroll, so a janky scroll frame shows up as a
+        # slow call here. Log only the slow frames (>50 ms) plus whether a reply is
+        # streaming and how big the transcript is, so the intermittent scroll lag can be
+        # caught in the act and attributed (large transcript vs. streaming contention).
+        t0 = time.monotonic()
+        self.chat.yview_scroll(int(-e.delta / 120), "units")
+        if DEBUG_LOG:
+            dt = (time.monotonic() - t0) * 1000
+            if dt > 50:   # only genuinely janky frames
+                try:
+                    lines = int(self.chat.index("end-1c").split(".")[0])
+                    wins = len(self.chat.window_names())   # embedded widgets (bubbles+chips+tables) in play
+                except Exception:
+                    lines = -1; wins = -1
+                dbg("scroll_slow", f"{dt:.0f}ms streaming={getattr(self, 'busy', False)} lines={lines} embeds={wins}")
+
     # ── event pump ──
     def _poll(self):
         # Whatever happens in here, the pump MUST reschedule itself — an unhandled
@@ -1903,9 +2784,17 @@ class Overlay:
         # (window still drawn, but no replies, no events ever again). The finally
         # guarantees the next tick; per-message guarding keeps one bad render from
         # dropping the rest of the queue.
+        self._last_pump = time.monotonic()    # hang-watchdog heartbeat (see _start_hang_watchdog)
+        if DEBUG_LOG and (self._last_pump - getattr(self, "_pump_logged", 0.0)) > 10.0:
+            self._pump_logged = self._last_pump
+            try:
+                dbg("pump", "alive q=%d busy=%s" % (self.ui_q.qsize(), getattr(self, "busy", False)))
+            except Exception:
+                pass
         deadline = time.monotonic() + 0.012   # ~12ms budget per tick, so the drain can never
         handled = 0                            # monopolize Tk: a fast stream yields back for
         pending_delta = []                     # repaint / clicks / hotkey between slices.
+        pending_think = []                     # thinking tokens, coalesced the same way
 
         def flush_delta():
             if pending_delta:
@@ -1913,6 +2802,15 @@ class Overlay:
                 pending_delta.clear()
                 try:
                     self._handle("delta", joined)
+                except Exception:
+                    pass
+
+        def flush_think():
+            if pending_think:
+                joined = "".join(pending_think)
+                pending_think.clear()
+                try:
+                    self._handle("think", joined)
                 except Exception:
                     pass
 
@@ -1929,10 +2827,15 @@ class Overlay:
                 except queue.Empty:
                     break
                 handled += 1
-                if kind == "delta":            # coalesce adjacent deltas into one insert
+                if kind == "delta":            # coalesce adjacent text deltas into one insert
+                    flush_think()              # ordering: any pending thinking renders first
                     pending_delta.append("" if payload is None else str(payload))
                     continue
-                flush_delta()                  # preserve ordering around non-delta messages
+                if kind == "think":            # coalesce adjacent thinking deltas too
+                    flush_delta()
+                    pending_think.append("" if payload is None else str(payload))
+                    continue
+                flush_think(); flush_delta()   # preserve ordering around non-stream messages
                 try:
                     self._handle(kind, payload)
                 except Exception as e:
@@ -1940,7 +2843,7 @@ class Overlay:
                         self.add_err(f"UI hiccup handling '{kind}': {type(e).__name__}: {e}")
                     except Exception:
                         pass
-            flush_delta()
+            flush_think(); flush_delta()
         except Exception:
             pass
         finally:
@@ -1953,11 +2856,15 @@ class Overlay:
             self._refresh_statusline()
         elif kind == "reset_done":
             self.add_sys("🔄 new conversation.")
-            self._ctx_pct = None
+            # Don't null _ctx_pct here: reset() already cleared it on click, and the worker's
+            # post-_open _emit_usage has (just before this) pushed the NEW session's real
+            # baseline. Nulling now would discard that correct value and leave a bare "—".
             self._refresh_statusline()
             self._set_busy(False)
         elif kind == "delta":
             self.add_delta(payload)
+        elif kind == "think":
+            self.add_think(payload)
         elif kind == "tool":
             self.add_tool(payload[0], payload[1])
         elif kind == "model":
@@ -1967,11 +2874,13 @@ class Overlay:
             self._ctx_pct = payload
             self._refresh_statusline()
         elif kind == "turn_done":
+            self._md_finalize()          # the turn ended → give the last line full block styling
             self._set_busy(False)
         elif kind == "error":
             self.add_err(str(payload))
             self._set_busy(False)
         elif kind == "result":
+            self._md_finalize()          # finalize before any error line is appended
             # the SDK reports a turn that ended in error here even when no exception
             # was raised on our side; surface it instead of dropping it silently.
             if isinstance(payload, dict) and payload.get("is_error"):
@@ -2036,6 +2945,19 @@ class Overlay:
             self.root.destroy()
         except Exception:
             pass
+        # Guarantee the process actually exits. Normally destroy() ends mainloop() and the
+        # interpreter exits on its own — every thread we start (worker, paste, pre-capture,
+        # update check) and even the `keyboard` listener are daemons, so nothing *should*
+        # keep it alive. But "should" isn't "will": one wedged daemon thread stuck in a
+        # C call (a hung SDK transport, an OS hook), or any non-daemon thread a future change
+        # introduces, would leave a headless pythonw process running in the background after
+        # the user clicked ✕ — exactly the "I closed it but it's still running" symptom.
+        # os._exit is the unconditional terminator. We've already asked the worker to
+        # interrupt + disconnect cleanly (bounded by the join above), so this can't cut short
+        # a mid-turn write; and when this process dies its stdio pipes to the `claude` CLI
+        # child close, so the child exits too (no orphaned agent left behind).
+        dbg("quit", "terminating")
+        os._exit(0)
 
     def run(self):
         self.root.mainloop()
