@@ -73,7 +73,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -894,6 +894,8 @@ class Overlay:
         self._md_tbl = None
         self._md_fence = False
         self._md_last_scroll = 0.0   # throttle yview()/see() — both are O(line) on a giant line
+        self._last_pump = time.monotonic()   # hang-watchdog heartbeat
+        self._pump_logged = 0.0              # throttle the periodic "pump alive" debug line
         self._drag = (0, 0)
         self._resize = None
         self._round_after = None
@@ -967,6 +969,41 @@ class Overlay:
         self.root.after(170, self._apply_region)
         self.root.after(180, self._exclude_from_capture)
         self.root.after(1200, self._check_for_update)
+        self._start_hang_watchdog()    # diagnostic: dumps all-thread stacks if the UI pump stalls
+
+    def _start_hang_watchdog(self):
+        """Diagnostic (active only when CLAUDE_OVERLAY_DEBUG_LOG is set): a daemon thread that,
+        if the Tk event pump (_poll) stops heart-beating for >4 s — i.e. the UI is actually
+        wedged, which from OUTSIDE looks identical to a healthy idle window (CPU 0, not
+        "hung") — dumps every thread's Python stack to the log. That names the exact line /
+        lock / queue.get the UI thread is stuck on. Pure in-process (faulthandler), no memory
+        reads, no external profiler."""
+        if not DEBUG_LOG:
+            return
+        import faulthandler
+        import threading as _th
+
+        def _watch():
+            dumped_for = None
+            while True:
+                time.sleep(1.0)
+                try:
+                    lp = getattr(self, "_last_pump", 0.0)
+                    stalled = time.monotonic() - lp
+                    if stalled > 4.0 and dumped_for != lp:   # one dump per distinct stall episode
+                        dumped_for = lp
+                        with open(DEBUG_LOG, "a", encoding="utf-8") as f:
+                            f.write("\n===== HANG WATCHDOG: pid=%d UI pump _poll stalled %.1fs @ %s "
+                                    "(>1800s usually = laptop sleep/long idle, not a real hang) — all-thread stacks =====\n"
+                                    % (os.getpid(), stalled, time.strftime("%H:%M:%S")))
+                            f.flush()
+                            faulthandler.dump_traceback(file=f, all_threads=True)
+                            f.write("===== END HANG DUMP =====\n")
+                            f.flush()
+                except Exception:
+                    pass
+
+        _th.Thread(target=_watch, name="hang-watchdog", daemon=True).start()
 
     @staticmethod
     def _parse_ver(s):
@@ -1034,13 +1071,34 @@ class Overlay:
         wrap = tk.Frame(self.root, bg=T["bg"])
         wrap.pack(fill="both", expand=True, side="top")
         self.chat_wrap = wrap
+        # Custom thin scrollbar on the right edge: a draggable grey thumb that also shows where
+        # you are in the transcript. Drawn on a Canvas to match the app's look, and (crucially)
+        # it's a wheel-independent way to scroll — useful because hovering an embedded widget can
+        # still swallow the mouse wheel.
+        self._sb_w = self.px(11)
+        self._sb_first, self._sb_last = 0.0, 1.0
+        self._sb_drag = None
+        self._sb_hover = False
+        self.scrollbar = tk.Canvas(wrap, width=self._sb_w, bg=T["bg"], highlightthickness=0,
+                                   cursor="arrow", takefocus=0)
+        # inset by the resize-edge thickness (px 6) so the right-edge resize strip (which is
+        # lifted on top) doesn't sit over the bar and steal its drag.
+        self.scrollbar.pack(side="right", fill="y", padx=(0, self.px(6)))
+        self.scrollbar.bind("<ButtonPress-1>", self._sb_press)
+        self.scrollbar.bind("<B1-Motion>", self._sb_motion)
+        self.scrollbar.bind("<ButtonRelease-1>", lambda e: (setattr(self, "_sb_drag", None), self._sb_redraw()))
+        self.scrollbar.bind("<Configure>", lambda e: self._sb_redraw())
+        self.scrollbar.bind("<MouseWheel>", self._fwd_wheel)
+        self.scrollbar.bind("<Enter>", lambda e: (setattr(self, "_sb_hover", True), self._sb_redraw()))
+        self.scrollbar.bind("<Leave>", lambda e: (setattr(self, "_sb_hover", False), self._sb_redraw()))
         self.chat = tk.Text(
             wrap, bg=T["bg"], fg=T["text"], bd=0, padx=self.px(18), pady=self.px(12),
             wrap="word", font=self.f_body, highlightthickness=0, cursor="arrow",
             width=1, height=1, selectbackground=T["sel"], selectforeground=T["text"],
             spacing1=self.px(2), spacing3=self.px(3),
         )
-        self.chat.pack(fill="both", expand=True)
+        self.chat.pack(side="left", fill="both", expand=True)
+        self.chat.configure(yscrollcommand=self._sb_set)
         self.chat.bind("<MouseWheel>", self._on_wheel)
         self.chat.bind("<Key>", self._readonly_keys)
 
@@ -1085,6 +1143,64 @@ class Overlay:
         self.chat.tag_configure("md_codeblock", font=self.f_code, background=code_bg,
                                 lmargin1=self.px(20), lmargin2=self.px(20), rmargin=self.px(14),
                                 spacing1=self.px(1), spacing3=self.px(1))
+
+    # ── custom scrollbar (right edge of the chat) ──
+    def _sb_set(self, first, last):
+        """Tk's Text calls this (yscrollcommand) whenever the view changes — scrolling, a new
+        reply streaming in, see('end'), resize. Store the visible fraction and redraw the thumb,
+        so it always tracks the real position."""
+        try:
+            self._sb_first, self._sb_last = float(first), float(last)
+        except Exception:
+            self._sb_first, self._sb_last = 0.0, 1.0
+        self._sb_redraw()
+
+    def _sb_geom(self):
+        """Return (height, thumb_top_px, thumb_bottom_px) honouring a minimum thumb size, or
+        None if the bar isn't laid out yet / the content fits (nothing to scroll)."""
+        h = self.scrollbar.winfo_height()
+        if h <= 1:
+            return None
+        if self._sb_first <= 0.0 and self._sb_last >= 1.0:
+            return None                                   # everything fits → no thumb
+        y0, y1 = self._sb_first * h, self._sb_last * h
+        minh = self.px(28)
+        if y1 - y0 < minh:                                # keep the thumb grabbable
+            mid = max(minh / 2, min((y0 + y1) / 2, h - minh / 2))
+            y0, y1 = mid - minh / 2, mid + minh / 2
+        return h, y0, y1
+
+    def _sb_redraw(self):
+        cv = self.scrollbar
+        cv.delete("all")
+        g = self._sb_geom()
+        if not g:
+            return
+        h, y0, y1 = g
+        w = self._sb_w
+        pad = self.px(3)
+        col = T["muted"] if self._sb_hover or self._sb_drag is not None else T["faint"]
+        round_rect(cv, pad, y0 + pad, w - pad, y1 - pad, (w - 2 * pad) / 2, fill=col, outline="")
+
+    def _sb_press(self, e):
+        g = self._sb_geom()
+        if not g:
+            return
+        h, y0, y1 = g
+        if y0 <= e.y <= y1:
+            self._sb_drag = e.y - y0                       # grab offset within the thumb
+        else:                                              # clicked the track → jump there
+            self._sb_drag = (y1 - y0) / 2
+            self.chat.yview_moveto(max(0.0, min(1.0, (e.y - self._sb_drag) / h)))
+        self._sb_redraw()
+
+    def _sb_motion(self, e):
+        if self._sb_drag is None:
+            return
+        h = self.scrollbar.winfo_height()
+        if h <= 1:
+            return
+        self.chat.yview_moveto(max(0.0, min(1.0, (e.y - self._sb_drag) / h)))
 
     def _build_input(self):
         wrap = tk.Frame(self.root, bg=T["bg"])
@@ -1864,6 +1980,7 @@ class Overlay:
         c.create_text(bx + padx, pady, text=text, font=body_font, fill=T["text"],
                       width=maxw, anchor="nw")
         c.configure(width=full, height=bh)
+        c.bind("<MouseWheel>", self._fwd_wheel)   # embedded widget must not swallow the scroll
         return c
 
     def _ensure_header(self):
@@ -2162,34 +2279,66 @@ class Overlay:
             self._md_render_block_line(r)
 
     def _build_table(self, header, body):
-        """A real grid of Labels embedded in the chat: each cell auto-sizes via grid geometry,
-        so CJK and ASCII columns line up perfectly (a monospace text grid can't). Thin grid
-        lines come from a border-coloured backing Frame showing through 1px cell gaps. Fonts
-        are snapshotted at the current zoom (fixed-size embedded widget, like the bubbles/chips)
-        and kept on _overlay_fonts so Tk won't GC them; _prune_chat frees the frame with its
-        text range."""
-        ncol = max([len(header)] + [len(r) for r in body]) if (header or body) else 1
-        ncol = max(1, ncol)
+        """Render the table as a SINGLE lightweight Canvas that draws its own grid lines + cell
+        text — NOT a Frame of N Labels. A Frame-of-Labels cost ~400 ms of synchronous Tk
+        geometry management to embed/lay out each table (the "freezes when a table appears"
+        stall), and worse, an embedded child widget SWALLOWS the mouse wheel so scrolling died
+        whenever the cursor sat over a table. One Canvas lays out instantly and we forward its
+        wheel to the chat. Columns are sized by the real measured pixel width of each cell, so
+        CJK and ASCII still line up. Fonts are snapshotted at the current zoom and pinned on
+        _overlay_fonts so Tk won't GC them; _prune_chat frees the canvas with its text range."""
+        rows = [list(header)] + [list(r) for r in body]
+        ncol = max((len(r) for r in rows), default=1) or 1
         cell_f = tkfont.Font(root=self.root, font=self.f_body)
         head_f = tkfont.Font(root=self.root, font=self.f_chip)
-        outer = tk.Frame(self.chat, bg=T["border"], highlightthickness=0)
-        outer._overlay_fonts = [cell_f, head_f]
-        avail = max(self.px(220), self.chat.winfo_width() - self.px(56))
-        wrap = max(self.px(70), int(avail / ncol) - self.px(20))
-
-        def cell(text, r, c, head):
-            lbl = tk.Label(outer, text=text, font=(head_f if head else cell_f),
-                           bg=(T["tool_bg"] if head else T["bg"]), fg=T["text"],
-                           padx=self.px(9), pady=self.px(5), anchor="w", justify="left",
-                           wraplength=wrap)
-            lbl.grid(row=r, column=c, sticky="nsew", padx=1, pady=1)
-
-        for c in range(ncol):
-            cell(header[c] if c < len(header) else "", 0, c, True)
-        for ri, row in enumerate(body, start=1):
+        padx, pady = self.px(9), self.px(5)
+        avail = max(self.px(200), self.chat.winfo_width() - self.px(56))
+        cap = max(self.px(90), int(avail / ncol))
+        colw = [self.px(36)] * ncol
+        for ri, r in enumerate(rows):
+            f = head_f if ri == 0 else cell_f
             for c in range(ncol):
-                cell(row[c] if c < len(row) else "", ri, c, False)
-        return outer
+                t = r[c] if c < len(r) else ""
+                colw[c] = max(colw[c], min(f.measure(t) + 2 * padx, cap))
+        xs = [0]
+        for c in range(ncol):
+            xs.append(xs[-1] + colw[c])
+        total_w = xs[-1]
+        cv = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0, width=total_w, takefocus=0)
+        cv._overlay_fonts = [cell_f, head_f]
+        ys = [0]
+        for ri, r in enumerate(rows):
+            f = head_f if ri == 0 else cell_f
+            rowmax = 0
+            for c in range(ncol):
+                t = r[c] if c < len(r) else ""
+                tid = cv.create_text(xs[c] + padx, ys[ri] + pady, text=t, font=f, fill=T["text"],
+                                     width=max(1, colw[c] - 2 * padx), anchor="nw")
+                bb = cv.bbox(tid)
+                rowmax = max(rowmax, (bb[3] - bb[1]) if bb else f.metrics("linespace"))
+            ys.append(ys[ri] + rowmax + 2 * pady)
+        total_h = ys[-1]
+        cv.configure(height=total_h)
+        # header tint behind the text, then thin grid lines + outer border (border colour)
+        rect = cv.create_rectangle(0, 0, total_w, ys[1], fill=T["tool_bg"], outline="")
+        cv.tag_lower(rect)
+        b = T["border"]
+        cv.create_rectangle(0, 0, total_w - 1, total_h - 1, outline=b)
+        for c in range(1, ncol):
+            cv.create_line(xs[c], 0, xs[c], total_h, fill=b)
+        for ri in range(1, len(rows)):
+            cv.create_line(0, ys[ri], total_w, ys[ri], fill=b)
+        cv.bind("<MouseWheel>", self._fwd_wheel)   # don't let the table swallow the scroll
+        return cv
+
+    def _fwd_wheel(self, e):
+        """Forward a wheel event that landed on an embedded widget to the chat's scroll, so
+        hovering a table (or any embedded widget) never freezes scrolling."""
+        try:
+            self._on_wheel(e)
+        except Exception:
+            pass
+        return "break"
 
     def _md_seal_mark(self):
         """Forget the live-tail / table marks (nothing left to re-render or delete)."""
@@ -2263,6 +2412,7 @@ class Overlay:
         c.create_text(x, cy, text=name, fill=T["muted"], font=fn, anchor="w"); x += nw + gap
         if arg:
             c.create_text(x, cy, text=arg, fill=T["faint"], font=fa, anchor="w")
+        c.bind("<MouseWheel>", self._fwd_wheel)   # embedded widget must not swallow the scroll
         return c
 
     def add_sys(self, text):
@@ -2634,6 +2784,13 @@ class Overlay:
         # (window still drawn, but no replies, no events ever again). The finally
         # guarantees the next tick; per-message guarding keeps one bad render from
         # dropping the rest of the queue.
+        self._last_pump = time.monotonic()    # hang-watchdog heartbeat (see _start_hang_watchdog)
+        if DEBUG_LOG and (self._last_pump - getattr(self, "_pump_logged", 0.0)) > 10.0:
+            self._pump_logged = self._last_pump
+            try:
+                dbg("pump", "alive q=%d busy=%s" % (self.ui_q.qsize(), getattr(self, "busy", False)))
+            except Exception:
+                pass
         deadline = time.monotonic() + 0.012   # ~12ms budget per tick, so the drain can never
         handled = 0                            # monopolize Tk: a fast stream yields back for
         pending_delta = []                     # repaint / clicks / hotkey between slices.

@@ -3,6 +3,25 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.4.1] — 2026-06-09
+
+### Added
+- **A scrollbar.** A thin draggable scrollbar now sits on the right edge of the chat: it shows
+  where you are in the transcript, you can drag the thumb (or click the track) to move through a
+  long reply, and it auto-hides when everything fits. It's also a wheel-independent way to
+  scroll.
+
+### Fixed
+- **The mouse wheel / trackpad now scrolls when the cursor is over a table** (or any embedded
+  element). Embedded widgets were swallowing the wheel event, so scrolling did nothing while
+  hovering a table — which, when a table filled the view, felt like the whole window had frozen
+  (the arrow keys still scrolled). Embedded elements now forward the wheel to the chat.
+
+### Changed
+- Tables are now drawn on a single lightweight canvas instead of a grid of label widgets — same
+  look and column alignment, far less per-table layout work, and a single place to forward the
+  wheel from.
+
 ## [1.4.0] — 2026-06-08
 
 ### Added
