@@ -38,6 +38,23 @@ if errorlevel 1 (
   echo [OK] claude CLI found.
 )
 
+rem --- 2a. npm-shim heads-up (PowerShell + Windows' default Restricted ExecutionPolicy) ---
+rem An npm install exposes %APPDATA%\npm\claude.ps1; PowerShell resolves `claude` to that
+rem .ps1, and the default Restricted policy blocks it, so typing `claude` in PowerShell fails
+rem with "running scripts is disabled on this system". CMD, this script, and the overlay's
+rem SDK all use claude.cmd and are unaffected -- so we only warn (and point at the native build).
+if exist "%APPDATA%\npm\claude.ps1" if not exist "%USERPROFILE%\.local\bin\claude.exe" (
+  echo.
+  echo [!] Heads-up: you have the npm 'claude' ^(claude.ps1^). In PowerShell, typing
+  echo     'claude' may fail with "running scripts is disabled on this system" -- that's
+  echo     Windows blocking .ps1 by default, NOT a broken install. Any one of these fixes it:
+  echo       1^) just use CMD instead of PowerShell to run claude, or
+  echo       2^) in PowerShell once:  Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+  echo       3^) ^(recommended^) install the native build -- a real .exe, no policy gate:
+  echo            irm https://claude.ai/install.ps1 ^| iex
+  echo     The overlay app itself is unaffected; it launches claude via claude.cmd.
+)
+
 rem --- 2b. make sure you're logged in (uses YOUR subscription, no API key) ---
 claude --version >nul 2>nul
 echo.
@@ -48,6 +65,18 @@ if /i not "%DOLOGIN%"=="n" ( claude auth login )
 
 rem --- 3. Python packages ---
 echo.
+rem Make sure pip exists FIRST. Some Python installs ship without it, or `pip` isn't on
+rem PATH even though `python` is; `python -m pip` + ensurepip is the robust path.
+%PY% -m pip --version >nul 2>nul
+if errorlevel 1 (
+  echo pip not found - bootstrapping it with ensurepip ...
+  %PY% -m ensurepip --upgrade
+  if errorlevel 1 (
+    echo [X] Could not bootstrap pip. Reinstall Python from https://www.python.org/downloads/
+    echo     ^(make sure the "pip" optional feature stays ticked^), then re-run setup.cmd.
+    pause & exit /b 1
+  )
+)
 echo Installing Python packages: claude-agent-sdk, pillow, keyboard ...
 echo (Any "installed in ... which is not on PATH" warnings below are harmless.)
 %PY% -m pip install --upgrade claude-agent-sdk pillow keyboard

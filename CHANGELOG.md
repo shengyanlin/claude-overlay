@@ -3,6 +3,24 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.4.2] — 2026-06-13
+
+### Fixed
+- **Setup no longer dead-ends when `pip` is missing or off PATH.** `setup.cmd` now bootstraps pip
+  with `python -m ensurepip --upgrade` (only if `python -m pip` isn't already available) *before*
+  installing the packages — so a Python that shipped without pip, or one whose `Scripts\` folder
+  isn't on PATH, no longer stops at "pip install failed". The README's by-hand and "let Claude
+  install it" steps now use `python -m pip` instead of a bare `pip` for the same reason.
+
+### Added
+- **Heads-up when you have the npm `claude` instead of the native build.** An npm install exposes
+  `claude.ps1`, which PowerShell resolves `claude` to — and Windows' default **Restricted**
+  ExecutionPolicy blocks `.ps1`, so typing `claude` in PowerShell fails with *"running scripts is
+  disabled on this system."* `setup.cmd` now detects this and prints the three fixes (run `claude`
+  from CMD, `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, or — recommended — install the
+  native `.exe` build via `irm https://claude.ai/install.ps1 | iex`). The overlay itself was never
+  affected: it launches the CLI via `claude.cmd`, which the policy doesn't gate.
+
 ## [1.4.1] — 2026-06-09
 
 ### Added
@@ -354,6 +372,9 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.4.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.4.2
+[1.4.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.4.1
+[1.4.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.4.0
 [1.3.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.3.0
 [1.2.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.3
 [1.2.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.2
