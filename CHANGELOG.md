@@ -3,6 +3,17 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.5.2] — 2026-06-14
+
+### Changed
+- **"Last turn ended with an error" now tells you *why*.** When the Claude Code CLI reports a turn's
+  result as an error, the overlay used to show a bare *"The last turn ended with an error."* It now
+  surfaces the CLI's actual reason — e.g. *overloaded error* (the model was briefly overloaded),
+  *max turns*, or *rate limit error* — pulled from the result's `subtype`/`result`, and adds *"Your
+  next message is unaffected"* (the error is per-turn; the session stays healthy, which is why the
+  next message works). The full detail is also written to the activity log when
+  `CLAUDE_OVERLAY_DEBUG_LOG` is set, so a past occurrence can be diagnosed after the fact.
+
 ## [1.5.1] — 2026-06-14
 
 ### Fixed
@@ -411,6 +422,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.5.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.2
 [1.5.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.1
 [1.5.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.0
 [1.4.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.4.2

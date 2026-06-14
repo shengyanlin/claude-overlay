@@ -73,7 +73,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -634,6 +634,26 @@ class ClaudeWorker(threading.Thread):
         dbg("turn_start", f"imgs={len(image_paths or [])} | {str(text)[:120]}")
         _dbg_stream_last[0] = 0.0   # force this turn's FIRST delta to log → measures time-to-first-token
         _dbg_think_last[0] = 0.0    # and its first thinking token → time-to-first-thinking
+        # ── Debug-only test hook, gated by CLAUDE_OVERLAY_DEBUG_LOG so it's inert in normal use
+        #    (without the env var, `/simerror` is just sent to Claude as ordinary text). It emits a
+        #    synthetic errored ResultMessage so the "last turn ended with an error (<reason>)" UI
+        #    can be exercised without a real API failure. Presets: (none)=overloaded, max, exec,
+        #    rate; any other word is used verbatim as the subtype.
+        ts = text.strip() if isinstance(text, str) else ""
+        if DEBUG_LOG and (ts == "/simerror" or ts.startswith("/simerror ")):
+            arg = ts[len("/simerror"):].strip()
+            presets = {
+                "":     ("overloaded_error", "The model was overloaded (HTTP 529). Transient — the next turn retries."),
+                "max":  ("error_max_turns", None),
+                "exec": ("error_during_execution", "A tool call failed during execution."),
+                "rate": ("rate_limit_error", "Rate limited (HTTP 429)."),
+            }
+            sub, detail = presets.get(arg, (arg, None))
+            self.ui.put(("system", f"(test: simulating an errored result — subtype={sub})"))
+            self.ui.put(("result", {"is_error": True, "subtype": sub, "result": detail,
+                                    "stop_reason": None, "cost": None}))
+            self.ui.put(("turn_done", None))
+            return
         if self._client is None:        # initial connect failed earlier — try once more
             await self._open()
         if self._client is None:
@@ -823,8 +843,17 @@ class ClaudeWorker(threading.Thread):
                     elif isinstance(blk, ToolUseBlock):
                         self.ui.put(("tool", (blk.name, blk.input)))
         elif isinstance(msg, ResultMessage):
+            is_err = getattr(msg, "is_error", False)
+            subtype = getattr(msg, "subtype", None)
+            detail = getattr(msg, "result", None)
+            stop_reason = getattr(msg, "stop_reason", None)
+            if is_err:   # log the REAL reason (error detail, not reply text) so a past
+                         # occurrence is diagnosable from the activity log
+                dbg("result_error", "subtype=%s stop=%s detail=%s"
+                    % (subtype, stop_reason, str(detail)[:300]))
             self.ui.put(("result", {"cost": getattr(msg, "total_cost_usd", None),
-                                    "is_error": getattr(msg, "is_error", False)}))
+                                    "is_error": is_err, "subtype": subtype,
+                                    "result": detail, "stop_reason": stop_reason}))
 
 
 # ───────────────────────────── the overlay UI ─────────────────────────────
@@ -2625,6 +2654,26 @@ class Overlay:
         self._md_finalize()
         self._ins("\n⚠  " + ("" if text is None else str(text)) + "\n", "err")
 
+    def _format_turn_error(self, payload):
+        """Turn the CLI's errored ResultMessage (subtype / result / stop_reason) into a one-line
+        reason, so the chat says WHY the turn errored instead of a generic message. The leading ⚠
+        is added by add_err. Examples: 'error_max_turns' → 'max turns'; an overloaded_error carries
+        its detail text."""
+        subtype = payload.get("subtype")
+        detail = payload.get("result")
+        reason = None
+        if subtype and subtype != "success":
+            reason = str(subtype).replace("error_", "").replace("_", " ").strip()
+        if detail:
+            d = str(detail).replace("\n", " ").strip()
+            if len(d) > 200:
+                d = d[:200] + "…"
+            reason = f"{reason} — {d}" if reason else d
+        if not reason:
+            sr = payload.get("stop_reason")
+            reason = f"stop reason: {sr}" if sr else "no detail reported by the CLI"
+        return f"Last turn ended with an error ({reason}). Your next message is unaffected."
+
     @staticmethod
     def _summ(inp, maxlen=84):
         if not isinstance(inp, dict) or not inp:
@@ -3088,10 +3137,10 @@ class Overlay:
         elif kind == "result":
             self._md_finalize()          # finalize before any error line is appended
             self._finish_turn_copy()     # Copy button under whatever reply text we did get
-            # the SDK reports a turn that ended in error here even when no exception
-            # was raised on our side; surface it instead of dropping it silently.
+            # the SDK reports a turn that ended in error here even when no exception was raised on
+            # our side; surface it WITH the CLI's reason (subtype/result) instead of a generic line.
             if isinstance(payload, dict) and payload.get("is_error"):
-                self.add_err("The last turn ended with an error.")
+                self.add_err(self._format_turn_error(payload))
             self._set_busy(False)
         elif kind == "attach":          # background paste finished (paths, failed_count)
             self._paste_busy = False
