@@ -73,7 +73,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -1111,6 +1111,7 @@ class Overlay:
         self.chat.configure(yscrollcommand=self._sb_set)
         self.chat.bind("<MouseWheel>", self._on_wheel)
         self.chat.bind("<Key>", self._readonly_keys)
+        self.chat.bind("<Configure>", self._on_chat_configure, add="+")
 
         m = self.f_body.measure("0") * 5
         self.chat.tag_configure("uh", foreground=T["muted"], font=self.f_chip,
@@ -1855,6 +1856,19 @@ class Overlay:
             live.append((c, render))
         self._zoomables = live
 
+    def _on_chat_configure(self, e):
+        """The chat's embedded canvases (user bubbles, tables) are sized to the chat width when
+        they're drawn; resizing the window narrower would otherwise leave them at their old, wider
+        size — a right-aligned user bubble then slides off the right edge and its text gets clipped
+        (worst for short messages, which hug the far right — hence 'sometimes'). Re-fit them to the
+        new width, reusing the debounced re-render so a drag coalesces into one pass when it settles
+        (no per-pixel re-render → stays off the v1.1.9 freeze path)."""
+        w = e.width
+        if w == getattr(self, "_last_chat_w", None):
+            return                       # height-only Configure (or no change) → nothing to re-fit
+        self._last_chat_w = w
+        self._rezoom_embeds()
+
     def _on_configure(self, e):
         if e.widget is not self.root:
             return
@@ -2460,10 +2474,29 @@ class Overlay:
             self.chat.see("end")
         self._prune_chat()
 
+    @staticmethod
+    def _truncate_to_px(font, text, budget):
+        """Longest prefix of `text` that fits within `budget` pixels, with a trailing … if it had
+        to be cut. Binary-searched on the font's pixel measure (so it's correct for CJK + ASCII)."""
+        if not text or budget <= 0:
+            return ""
+        if font.measure(text) <= budget:
+            return text
+        ew = font.measure("…")
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font.measure(text[:mid]) + ew <= budget:
+                lo = mid
+            else:
+                hi = mid - 1
+        return (text[:lo] + "…") if lo > 0 else "…"
+
     def _tool_chip(self, name, arg):
         """A compact rounded Claude-style tool pill embedded in the chat. render() rebuilds it from
         fonts at the *current* zoom so it grows/shrinks with Ctrl +/− (registered via
-        _register_zoomable); recomputing its size each time keeps the bigger font from overflowing."""
+        _register_zoomable), and caps its width to the available chat width — ellipsizing the arg —
+        so a long command/path can't overflow and get clipped when the window is narrow."""
         icon = TOOL_ICONS.get(name, "●")
         c = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0)
         def render():
@@ -2474,16 +2507,25 @@ class Overlay:
             c._overlay_fonts = [fi, fn, fa]                 # keep refs so Tk won't GC them
             padx, gap, h = self.px(11), self.px(7), self.px(26)
             iw, nw = fi.measure(icon), fn.measure(name)
-            aw = fa.measure(arg) if arg else 0
-            w = padx + iw + gap + nw + ((gap + aw) if arg else 0) + padx
+            # Cap to what fits in the chat (minus the chat's own padx + the window_create padx),
+            # then ellipsize the arg into whatever width is left so the chip never overflows.
+            fixed = 2 * padx + iw + gap + nw
+            avail = max(self.px(120), self.chat.winfo_width() - self.px(68))
+            shown = ""
+            if arg:
+                budget = avail - fixed - gap
+                if budget > fa.measure("…"):
+                    shown = self._truncate_to_px(fa, arg, budget)
+            aw = fa.measure(shown) if shown else 0
+            w = fixed + ((gap + aw) if shown else 0)
             c.configure(width=w, height=h)
             round_rect(c, 1, 1, w - 1, h - 1, self.px(8), fill=T["tool_bg"],
                        outline=T["border"], width=1)
             x, cy = padx, h / 2 - self.px(1)
             c.create_text(x, cy, text=icon, fill=T["accent"], font=fi, anchor="w"); x += iw + gap
             c.create_text(x, cy, text=name, fill=T["muted"], font=fn, anchor="w"); x += nw + gap
-            if arg:
-                c.create_text(x, cy, text=arg, fill=T["faint"], font=fa, anchor="w")
+            if shown:
+                c.create_text(x, cy, text=shown, fill=T["faint"], font=fa, anchor="w")
         render()
         c.bind("<MouseWheel>", self._fwd_wheel)   # embedded widget must not swallow the scroll
         self._register_zoomable(c, render)

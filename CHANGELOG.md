@@ -3,6 +3,23 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.5.1] — 2026-06-14
+
+### Fixed
+- **Nothing in the chat gets clipped when you drag the window narrower any more.** Embedded items
+  were sized when first drawn and weren't re-laid-out on resize, so making the window narrower cut
+  them off on the right:
+  - **Your message bubbles** are sized to the chat width and right-aligned, so a narrower window
+    slid them partly off the right edge — worst for short messages, which hug the far right (hence
+    it only happened *sometimes*). Bubbles now re-fit to the new width on resize.
+  - **Tool-call chips** (the `❯ Bash …` pills) are sized to their text, so a long command/path
+    overflowed a narrow window. They now cap their width to the chat and ellipsize the argument
+    (`…`) so they always fit, and grow the text back when you widen the window.
+  - Tables re-fit to the new width too.
+
+  The re-layout is debounced (a drag settles into a single pass) and fires only on an actual width
+  change, so it never touches the streaming/scroll path (no v1.1.9-class freeze).
+
 ## [1.5.0] — 2026-06-14
 
 ### Added
@@ -394,6 +411,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.5.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.1
 [1.5.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.0
 [1.4.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.4.2
 [1.4.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.4.1
