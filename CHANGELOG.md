@@ -3,6 +3,28 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] — 2026-06-14
+
+### Added
+- **Copy Claude's replies.** Each of Claude's replies now has a small, always-visible **⧉ Copy**
+  button beneath it — the way ChatGPT and Claude show one. Click it and the reply goes to the
+  clipboard as **raw Markdown** (the `**bold**`, `#` headings and `| tables |` exactly as written,
+  so it pastes with its formatting intact); the button flashes **✓ Copied** for a moment and
+  brightens on hover so it reads as clickable. It appears under the finished reply and copies the
+  whole turn's answer text (Markdown only — extended thinking and tool chips are excluded). The text
+  is snapshotted when the button is drawn, so an older reply still copies the right thing after
+  newer turns. Like the v1.4.1 tables, the button forwards the mouse wheel, so hovering it never
+  blocks scrolling.
+
+### Fixed
+- **Zoom now resizes the *whole* chat.** Ctrl +/− (and Ctrl+mouse-wheel) used to grow only the
+  flowing text — your message bubbles, the tool-call chips, and tables stayed frozen at the size
+  they were drawn (they're fixed-size canvases that drew with a snapshotted font, so the shared
+  zoom didn't reach them; a bigger font would have overflowed their box). They now re-render at the
+  new zoom too — recomputing their box each time, so nothing overflows — and the new Copy button
+  scales with them, so the entire transcript zooms together. The re-render is debounced and runs
+  only on a zoom event (never while streaming), so it doesn't touch the streaming/scroll paths.
+
 ## [1.4.2] — 2026-06-13
 
 ### Fixed
@@ -372,6 +394,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.5.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.0
 [1.4.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.4.2
 [1.4.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.4.1
 [1.4.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.4.0

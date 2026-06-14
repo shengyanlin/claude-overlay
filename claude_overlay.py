@@ -73,7 +73,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.4.2"
+__version__ = "1.5.0"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -894,6 +894,11 @@ class Overlay:
         self._md_tbl = None
         self._md_fence = False
         self._md_last_scroll = 0.0   # throttle yview()/see() — both are O(line) on a giant line
+        # "Copy message" support: accumulate the raw streamed answer text for the current turn
+        # so each message's Copy button can snapshot it. _turn_copy_added guards against the
+        # several turn_done/result events emitting more than one button per assistant turn.
+        self._turn_raw = ""
+        self._turn_copy_added = False
         self._last_pump = time.monotonic()   # hang-watchdog heartbeat
         self._pump_logged = 0.0              # throttle the periodic "pump alive" debug line
         self._drag = (0, 0)
@@ -933,6 +938,11 @@ class Overlay:
         self.sans, self.serif, self.mono = pick(FONT_SANS), pick(FONT_SERIF), pick(FONT_MONO)
         self.zoom = 1.0
         self._fonts = []   # (Font, base_logical_size) → reconfigured live on Ctrl +/-
+        # Embedded canvases (user bubbles, tool chips, tables, Copy buttons) are fixed-size and
+        # draw with their own font, so they don't track the shared fonts. Register each with its
+        # render() here so a zoom can redraw it at the new size (see _rezoom_embeds).
+        self._zoomables = []
+        self._rezoom_after = None
         def mk(fam, base, **k):
             f = tkfont.Font(family=fam, size=-self.px(base), **k)
             self._fonts.append((f, base))
@@ -1798,6 +1808,52 @@ class Overlay:
             self._layout_input()
         except Exception:
             pass
+        self._rezoom_embeds()      # redraw embedded canvases (bubbles/chips/tables/Copy) at new zoom
+
+    @staticmethod
+    def _widget_alive(w):
+        try:
+            return bool(w.winfo_exists())
+        except Exception:
+            return False
+
+    def _register_zoomable(self, canvas, render):
+        """Track an embedded canvas + its render() so Ctrl +/− can redraw it at the new zoom —
+        a fixed-size canvas would otherwise stay frozen while the flowing text grows. Compact
+        dead entries (pruning/reset destroys the widget) once the list grows, so it stays bounded
+        even across a long session."""
+        self._zoomables.append((canvas, render))
+        if len(self._zoomables) > 300:
+            self._zoomables = [(c, r) for (c, r) in self._zoomables if self._widget_alive(c)]
+
+    def _rezoom_embeds(self):
+        """Schedule a redraw of every live embedded canvas at the current zoom. Debounced (~20 ms)
+        so a fast Ctrl+wheel spin coalesces into one pass instead of re-rendering every notch."""
+        try:
+            if self._rezoom_after is not None:
+                self.root.after_cancel(self._rezoom_after)
+        except Exception:
+            pass
+        try:
+            self._rezoom_after = self.root.after(20, self._do_rezoom_embeds)
+        except Exception:
+            self._rezoom_after = None
+            self._do_rezoom_embeds()
+
+    def _do_rezoom_embeds(self):
+        # Re-render only on a zoom event (never per-delta), so this can't reintroduce the v1.1.9
+        # per-<Configure> freeze; cost is bounded by the capped transcript. Drop dead widgets.
+        self._rezoom_after = None
+        live = []
+        for c, render in self._zoomables:
+            if not self._widget_alive(c):
+                continue
+            try:
+                render()
+            except Exception:
+                pass
+            live.append((c, render))
+        self._zoomables = live
 
     def _on_configure(self, e):
         if e.widget is not self.root:
@@ -1923,6 +1979,8 @@ class Overlay:
 
     def add_user(self, text):
         self._md_finalize()              # commit the previous turn's last line before a new bubble
+        self._turn_raw = ""              # a new turn starts → fresh assistant-answer buffer
+        self._turn_copy_added = False
         at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", "\n")
         self.chat.window_create("end", window=self._user_bubble(text), pady=self.px(3))
@@ -1959,28 +2017,32 @@ class Overlay:
         return "".join(out)
 
     def _user_bubble(self, text):
-        """A right-aligned rounded chat bubble (drawn on a full-width canvas)."""
+        """A right-aligned rounded chat bubble (drawn on a full-width canvas). render() recomputes
+        the whole box from a body font at the *current* zoom, so it grows/shrinks with Ctrl +/−
+        like the flowing text — recomputing the box each time means the bigger font never overflows
+        a stale fixed size (the reason this used to be frozen). Registered with _register_zoomable."""
         text = self._clip_bubble(text)
-        full = max(self.px(200), self.chat.winfo_width() - 2 * self.px(18))
-        maxw = max(self.px(140), int(full * 0.74))
-        padx, pady, rad = self.px(13), self.px(9), self.px(14)
         c = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0)
-        # Snapshot the body font at *current* zoom into a private Font. The shared self.f_body
-        # is reconfigured live on Ctrl +/−; if this canvas (fixed pixel width/height) kept using
-        # it, a later zoom would regrow the text inside an unchanged box and clip/overflow it.
-        body_font = tkfont.Font(root=self.root, font=self.f_body)
-        c._overlay_fonts = [body_font]                  # keep a ref so Tk won't GC it
-        tmp = c.create_text(0, 0, text=text, font=body_font, width=maxw, anchor="nw")
-        bb = c.bbox(tmp)
-        x1, y1, x2, y2 = bb if bb else (0, 0, maxw, self.px(18))
-        c.delete(tmp)
-        bw, bh = (x2 - x1) + 2 * padx, (y2 - y1) + 2 * pady
-        bx = full - bw                                  # hug the right edge
-        round_rect(c, bx, 1, bx + bw, bh - 1, rad, fill=T["user_card"], outline="")
-        c.create_text(bx + padx, pady, text=text, font=body_font, fill=T["text"],
-                      width=maxw, anchor="nw")
-        c.configure(width=full, height=bh)
+        def render():
+            c.delete("all")
+            full = max(self.px(200), self.chat.winfo_width() - 2 * self.px(18))
+            maxw = max(self.px(140), int(full * 0.74))
+            padx, pady, rad = self.px(13), self.px(9), self.px(14)
+            body_font = tkfont.Font(root=self.root, font=self.f_body)   # current zoom
+            c._overlay_fonts = [body_font]                  # keep a ref so Tk won't GC it
+            tmp = c.create_text(0, 0, text=text, font=body_font, width=maxw, anchor="nw")
+            bb = c.bbox(tmp)
+            x1, y1, x2, y2 = bb if bb else (0, 0, maxw, self.px(18))
+            c.delete(tmp)
+            bw, bh = (x2 - x1) + 2 * padx, (y2 - y1) + 2 * pady
+            bx = full - bw                                  # hug the right edge
+            round_rect(c, bx, 1, bx + bw, bh - 1, rad, fill=T["user_card"], outline="")
+            c.create_text(bx + padx, pady, text=text, font=body_font, fill=T["text"],
+                          width=maxw, anchor="nw")
+            c.configure(width=full, height=bh)
+        render()
         c.bind("<MouseWheel>", self._fwd_wheel)   # embedded widget must not swallow the scroll
+        self._register_zoomable(c, render)
         return c
 
     def _ensure_header(self):
@@ -2009,6 +2071,9 @@ class Overlay:
         self._ins(text, "think")
 
     def add_delta(self, text):
+        if text is not None:
+            self._turn_raw += str(text)  # accumulate the raw answer text so the Copy button can
+                                         # snapshot exactly what Claude wrote (Markdown and all)
         self._ensure_header()
         if self._thinking_active:        # the visible answer is starting → close the thinking block
             self._raw_ins("\n", "a")
@@ -2289,46 +2354,50 @@ class Overlay:
         _overlay_fonts so Tk won't GC them; _prune_chat frees the canvas with its text range."""
         rows = [list(header)] + [list(r) for r in body]
         ncol = max((len(r) for r in rows), default=1) or 1
-        cell_f = tkfont.Font(root=self.root, font=self.f_body)
-        head_f = tkfont.Font(root=self.root, font=self.f_chip)
-        padx, pady = self.px(9), self.px(5)
-        avail = max(self.px(200), self.chat.winfo_width() - self.px(56))
-        cap = max(self.px(90), int(avail / ncol))
-        colw = [self.px(36)] * ncol
-        for ri, r in enumerate(rows):
-            f = head_f if ri == 0 else cell_f
+        cv = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0, takefocus=0)
+        def render():
+            cv.delete("all")
+            cell_f = tkfont.Font(root=self.root, font=self.f_body)   # current zoom
+            head_f = tkfont.Font(root=self.root, font=self.f_chip)
+            cv._overlay_fonts = [cell_f, head_f]
+            padx, pady = self.px(9), self.px(5)
+            avail = max(self.px(200), self.chat.winfo_width() - self.px(56))
+            cap = max(self.px(90), int(avail / ncol))
+            colw = [self.px(36)] * ncol
+            for ri, r in enumerate(rows):
+                f = head_f if ri == 0 else cell_f
+                for c in range(ncol):
+                    t = r[c] if c < len(r) else ""
+                    colw[c] = max(colw[c], min(f.measure(t) + 2 * padx, cap))
+            xs = [0]
             for c in range(ncol):
-                t = r[c] if c < len(r) else ""
-                colw[c] = max(colw[c], min(f.measure(t) + 2 * padx, cap))
-        xs = [0]
-        for c in range(ncol):
-            xs.append(xs[-1] + colw[c])
-        total_w = xs[-1]
-        cv = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0, width=total_w, takefocus=0)
-        cv._overlay_fonts = [cell_f, head_f]
-        ys = [0]
-        for ri, r in enumerate(rows):
-            f = head_f if ri == 0 else cell_f
-            rowmax = 0
-            for c in range(ncol):
-                t = r[c] if c < len(r) else ""
-                tid = cv.create_text(xs[c] + padx, ys[ri] + pady, text=t, font=f, fill=T["text"],
-                                     width=max(1, colw[c] - 2 * padx), anchor="nw")
-                bb = cv.bbox(tid)
-                rowmax = max(rowmax, (bb[3] - bb[1]) if bb else f.metrics("linespace"))
-            ys.append(ys[ri] + rowmax + 2 * pady)
-        total_h = ys[-1]
-        cv.configure(height=total_h)
-        # header tint behind the text, then thin grid lines + outer border (border colour)
-        rect = cv.create_rectangle(0, 0, total_w, ys[1], fill=T["tool_bg"], outline="")
-        cv.tag_lower(rect)
-        b = T["border"]
-        cv.create_rectangle(0, 0, total_w - 1, total_h - 1, outline=b)
-        for c in range(1, ncol):
-            cv.create_line(xs[c], 0, xs[c], total_h, fill=b)
-        for ri in range(1, len(rows)):
-            cv.create_line(0, ys[ri], total_w, ys[ri], fill=b)
+                xs.append(xs[-1] + colw[c])
+            total_w = xs[-1]
+            ys = [0]
+            for ri, r in enumerate(rows):
+                f = head_f if ri == 0 else cell_f
+                rowmax = 0
+                for c in range(ncol):
+                    t = r[c] if c < len(r) else ""
+                    tid = cv.create_text(xs[c] + padx, ys[ri] + pady, text=t, font=f, fill=T["text"],
+                                         width=max(1, colw[c] - 2 * padx), anchor="nw")
+                    bb = cv.bbox(tid)
+                    rowmax = max(rowmax, (bb[3] - bb[1]) if bb else f.metrics("linespace"))
+                ys.append(ys[ri] + rowmax + 2 * pady)
+            total_h = ys[-1]
+            cv.configure(width=total_w, height=total_h)
+            # header tint behind the text, then thin grid lines + outer border (border colour)
+            rect = cv.create_rectangle(0, 0, total_w, ys[1], fill=T["tool_bg"], outline="")
+            cv.tag_lower(rect)
+            b = T["border"]
+            cv.create_rectangle(0, 0, total_w - 1, total_h - 1, outline=b)
+            for c in range(1, ncol):
+                cv.create_line(xs[c], 0, xs[c], total_h, fill=b)
+            for ri in range(1, len(rows)):
+                cv.create_line(0, ys[ri], total_w, ys[ri], fill=b)
+        render()
         cv.bind("<MouseWheel>", self._fwd_wheel)   # don't let the table swallow the scroll
+        self._register_zoomable(cv, render)
         return cv
 
     def _fwd_wheel(self, e):
@@ -2392,28 +2461,119 @@ class Overlay:
         self._prune_chat()
 
     def _tool_chip(self, name, arg):
-        """A compact rounded Claude-style tool pill embedded in the chat."""
+        """A compact rounded Claude-style tool pill embedded in the chat. render() rebuilds it from
+        fonts at the *current* zoom so it grows/shrinks with Ctrl +/− (registered via
+        _register_zoomable); recomputing its size each time keeps the bigger font from overflowing."""
         icon = TOOL_ICONS.get(name, "●")
-        # Private font snapshots at current zoom (see _user_bubble): this chip is a fixed-size
-        # canvas, so it must not track the shared fonts when the user later zooms.
-        fi = tkfont.Font(root=self.root, font=self.f_small)
-        fn = tkfont.Font(root=self.root, font=self.f_chip)
-        fa = tkfont.Font(root=self.root, font=self.f_small)
-        padx, gap, h = self.px(11), self.px(7), self.px(26)
-        iw, nw = fi.measure(icon), fn.measure(name)
-        aw = fa.measure(arg) if arg else 0
-        w = padx + iw + gap + nw + ((gap + aw) if arg else 0) + padx
-        c = tk.Canvas(self.chat, width=w, height=h, bg=T["bg"], highlightthickness=0)
-        c._overlay_fonts = [fi, fn, fa]                 # keep refs so Tk won't GC them
-        round_rect(c, 1, 1, w - 1, h - 1, self.px(8), fill=T["tool_bg"],
-                   outline=T["border"], width=1)
-        x, cy = padx, h / 2 - self.px(1)
-        c.create_text(x, cy, text=icon, fill=T["accent"], font=fi, anchor="w"); x += iw + gap
-        c.create_text(x, cy, text=name, fill=T["muted"], font=fn, anchor="w"); x += nw + gap
-        if arg:
-            c.create_text(x, cy, text=arg, fill=T["faint"], font=fa, anchor="w")
+        c = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0)
+        def render():
+            c.delete("all")
+            fi = tkfont.Font(root=self.root, font=self.f_small)   # current zoom
+            fn = tkfont.Font(root=self.root, font=self.f_chip)
+            fa = tkfont.Font(root=self.root, font=self.f_small)
+            c._overlay_fonts = [fi, fn, fa]                 # keep refs so Tk won't GC them
+            padx, gap, h = self.px(11), self.px(7), self.px(26)
+            iw, nw = fi.measure(icon), fn.measure(name)
+            aw = fa.measure(arg) if arg else 0
+            w = padx + iw + gap + nw + ((gap + aw) if arg else 0) + padx
+            c.configure(width=w, height=h)
+            round_rect(c, 1, 1, w - 1, h - 1, self.px(8), fill=T["tool_bg"],
+                       outline=T["border"], width=1)
+            x, cy = padx, h / 2 - self.px(1)
+            c.create_text(x, cy, text=icon, fill=T["accent"], font=fi, anchor="w"); x += iw + gap
+            c.create_text(x, cy, text=name, fill=T["muted"], font=fn, anchor="w"); x += nw + gap
+            if arg:
+                c.create_text(x, cy, text=arg, fill=T["faint"], font=fa, anchor="w")
+        render()
         c.bind("<MouseWheel>", self._fwd_wheel)   # embedded widget must not swallow the scroll
+        self._register_zoomable(c, render)
         return c
+
+    # ── per-message "Copy" button (ChatGPT/Claude-style) ──────────────────────────────
+    def _copy_btn(self, text):
+        """A small, always-visible ghost 'Copy' button rendered as an embedded canvas (same
+        pattern as the tool chip / user bubble). Click copies `text` — a snapshot captured here,
+        so an OLD message still copies the right thing after newer turns reset the live buffers —
+        to the clipboard and flashes '✓ Copied' for ~1.2 s. Forwards the wheel so it can't swallow
+        scrolling (the v1.4.1 embedded-widget trap)."""
+        text = "" if text is None else str(text)
+        idle, done = "⧉ Copy", "✓ Copied"
+        c = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0, cursor="hand2", takefocus=0)
+        c._copied = False
+        st = {"f": None, "w": 0, "h": 0, "rad": 0}   # current-zoom font + box, refreshed by render()
+
+        def draw(label, fg, bg=None):
+            c.delete("all")
+            if bg:
+                round_rect(c, 1, 1, st["w"] - 1, st["h"] - 1, st["rad"], fill=bg, outline="")
+            c.create_text(st["w"] / 2, st["h"] / 2, text=label, fill=fg, font=st["f"], anchor="center")
+
+        def show(hover=False):
+            if c._copied:
+                draw(done, T["accent"], T["tool_bg"])
+            else:
+                draw(idle, T["muted"] if hover else T["faint"], T["tool_bg"] if hover else None)
+
+        def render():
+            f = tkfont.Font(root=self.root, font=self.f_small)   # current zoom
+            c._overlay_fonts = [f]                               # keep a ref so Tk won't GC it
+            pad = self.px(9)
+            st.update(f=f, h=self.px(20), rad=self.px(6),
+                      w=pad + max(f.measure(idle), f.measure(done)) + pad)  # widest label → no reflow
+            c.configure(width=st["w"], height=st["h"])
+            show(False)
+
+        def restore():
+            try:
+                c._copied = False
+                show(False)
+            except Exception:
+                pass
+
+        def on_click(_e):
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(text)
+            except Exception:
+                pass
+            c._copied = True
+            show(False)                # show() honours _copied → draws the '✓ Copied' state
+            try:
+                c.after(1200, restore)
+            except Exception:
+                pass
+            return "break"
+
+        render()
+        c.bind("<Enter>", lambda e: show(True))
+        c.bind("<Leave>", lambda e: show(False))
+        c.bind("<Button-1>", on_click)
+        c.bind("<MouseWheel>", self._fwd_wheel)   # embedded widget must not swallow the scroll
+        self._register_zoomable(c, render)
+        return c
+
+    def _add_copy(self, text):
+        """Drop a Copy button on its own line, left-aligned under the message it belongs to.
+        No-ops on empty/whitespace text (e.g. a turn that produced only tool calls)."""
+        if not (text and str(text).strip()):
+            return
+        at_bottom = self.chat.yview()[1] > 0.999
+        self.chat.insert("end", "\n")
+        self.chat.window_create("end", window=self._copy_btn(text), padx=self.px(16), pady=self.px(1))
+        self.chat.insert("end", "\n")
+        if at_bottom:
+            self.chat.see("end")
+        self._prune_chat()
+
+    def _finish_turn_copy(self):
+        """At turn end, add ONE Copy button under the assistant's reply, only if the turn
+        produced answer text. Snapshots _turn_raw (passed by value into the button) so it keeps
+        working after a later turn resets the buffer. Idempotent across the multiple
+        turn_done/result events a single turn can emit."""
+        if self._turn_copy_added or not (self._turn_raw or "").strip():
+            return
+        self._turn_copy_added = True
+        self._add_copy(self._turn_raw)
 
     def add_sys(self, text):
         self._md_finalize()
@@ -2646,6 +2806,9 @@ class Overlay:
         self.worker.interrupt()
         self.chat.delete("1.0", "end")
         self._md_reset()                 # chat wiped → drop md tail/table/fence state + marks
+        self._zoomables = []             # all embedded canvases were just destroyed with the text
+        self._turn_raw = ""              # drop the assistant-answer buffer + its Copy-button guard
+        self._turn_copy_added = False
         self._claude_header = False
         self._thinking_active = False    # don't carry a half-open thinking block into the new turn
         # Clear the shown % immediately so the OLD conversation's usage can't linger while the
@@ -2875,12 +3038,14 @@ class Overlay:
             self._refresh_statusline()
         elif kind == "turn_done":
             self._md_finalize()          # the turn ended → give the last line full block styling
+            self._finish_turn_copy()     # then a Copy button under the reply
             self._set_busy(False)
         elif kind == "error":
             self.add_err(str(payload))
             self._set_busy(False)
         elif kind == "result":
             self._md_finalize()          # finalize before any error line is appended
+            self._finish_turn_copy()     # Copy button under whatever reply text we did get
             # the SDK reports a turn that ended in error here even when no exception
             # was raised on our side; surface it instead of dropping it silently.
             if isinstance(payload, dict) and payload.get("is_error"):
