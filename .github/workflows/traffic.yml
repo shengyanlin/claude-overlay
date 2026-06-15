@@ -1,0 +1,60 @@
+name: traffic-stats
+
+# Snapshot GitHub's clone/view traffic daily. The Traffic API only retains the
+# last 14 days, so without this the older data is lost. History is appended to a
+# dedicated `traffic-stats` branch, keeping `main` clean.
+#
+# Requires a repo secret named TRAFFIC_PAT: a Personal Access Token with push
+# access (the default GITHUB_TOKEN returns 403 on the traffic endpoints).
+
+on:
+  schedule:
+    - cron: "23 2 * * *"   # daily, ~02:23 UTC
+  workflow_dispatch: {}     # adds a manual "Run workflow" button
+
+permissions:
+  contents: read            # we push history with TRAFFIC_PAT, not GITHUB_TOKEN
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main (for the collector script)
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Get the data branch (create it on the first run)
+        env:
+          GH_PAT: ${{ secrets.TRAFFIC_PAT }}
+        run: |
+          set -e
+          if git clone --branch traffic-stats --single-branch \
+               "https://x-access-token:${GH_PAT}@github.com/${GITHUB_REPOSITORY}.git" data 2>/dev/null; then
+            echo "Existing traffic-stats branch checked out."
+          else
+            echo "First run: starting an orphan traffic-stats branch."
+            mkdir data && cd data
+            git init -q
+            git checkout -q --orphan traffic-stats
+          fi
+
+      - name: Collect today's traffic
+        env:
+          GH_PAT: ${{ secrets.TRAFFIC_PAT }}
+          REPO: ${{ github.repository }}
+        run: python .github/scripts/track_traffic.py data
+
+      - name: Commit & push history
+        env:
+          GH_PAT: ${{ secrets.TRAFFIC_PAT }}
+        run: |
+          cd data
+          git add -A
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "chore(traffic): snapshot $(date -u +%F)" || { echo "No changes to commit."; exit 0; }
+          git push "https://x-access-token:${GH_PAT}@github.com/${GITHUB_REPOSITORY}.git" HEAD:traffic-stats
