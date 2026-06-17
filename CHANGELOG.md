@@ -3,6 +3,20 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.5.3] — 2026-06-17
+
+### Fixed
+- **Setup no longer claims to find Python on a machine that doesn't have it.** Windows 11 ships a
+  0-byte "App execution alias" stub (`%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe`) that is
+  present even when Python isn't installed — running it just prints *"Python was not found…"* and
+  exits. The old check used `where python`, which that stub satisfies, so `setup.cmd` printed
+  *"[OK] Python found"* and only fell over later at the package step. Detection now **verifies the
+  interpreter actually runs** (`py -3 --version` / `python --version`, preferring the `py` launcher,
+  which the Store alias never shadows) instead of trusting `where`; it reports the real version it
+  found, and when none is present it spells out that the Microsoft Store `python` shortcut doesn't
+  count and how to turn the alias off. `update.cmd` had the same `where`-based check and got the
+  same fix.
+
 ## [1.5.2] — 2026-06-14
 
 ### Changed
@@ -422,6 +436,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.5.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.3
 [1.5.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.2
 [1.5.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.1
 [1.5.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.0

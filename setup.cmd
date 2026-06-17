@@ -6,16 +6,25 @@ echo   Claude Overlay - setup
 echo ============================================================
 echo.
 
-rem --- 1. Python ---
+rem --- 1. Python (must be a REAL interpreter, not the Microsoft Store alias) ---
+rem `where python` is NOT enough: Windows 11 ships a 0-byte "App execution alias"
+rem stub at %LOCALAPPDATA%\Microsoft\WindowsApps\python.exe that `where` finds even
+rem when Python is NOT installed -- running it just prints "Python was not found..."
+rem and exits 9009. So VERIFY by actually running --version, and prefer the `py`
+rem launcher (which the Store alias never shadows).
 set "PY="
-where python >nul 2>nul && set "PY=python"
-if not defined PY ( where py >nul 2>nul && set "PY=py -3" )
+py -3 --version >nul 2>nul && set "PY=py -3"
+if not defined PY ( python --version >nul 2>nul && set "PY=python" )
 if not defined PY (
   echo [X] Python 3 not found. Install it from https://www.python.org/downloads/
   echo     ^(tick "Add python.exe to PATH" in the installer^), then re-run setup.cmd.
+  echo     Note: the Microsoft Store "python" shortcut does NOT count -- install the
+  echo     real thing, or turn the stub off under Settings ^> Apps ^> Advanced app
+  echo     settings ^> App execution aliases.
   pause & exit /b 1
 )
-echo [OK] Python found: %PY%
+for /f "tokens=*" %%v in ('%PY% --version 2^>^&1') do set "PYVER=%%v"
+echo [OK] Python found: %PY% ^(%PYVER%^)
 
 rem --- 2. claude CLI (auto-install via the native installer if missing; no Node needed) ---
 set "PATH=%USERPROFILE%\.local\bin;%APPDATA%\npm;%PATH%"
