@@ -32,9 +32,12 @@ if errorlevel 1 (
 )
 
 rem --- refresh Python packages (best-effort: catches occasional SDK fixes) ---
+rem Verify by running --version (not `where`): a Win11 machine without Python still
+rem has the Microsoft Store alias stub %LOCALAPPDATA%\...\WindowsApps\python.exe that
+rem `where` finds but that only prints "Python was not found" -- so trust --version.
 set "PY="
-where python >nul 2>nul && set "PY=python"
-if not defined PY ( where py >nul 2>nul && set "PY=py -3" )
+py -3 --version >nul 2>nul && set "PY=py -3"
+if not defined PY ( python --version >nul 2>nul && set "PY=python" )
 if defined PY (
   echo.
   echo Refreshing Python packages ^(claude-agent-sdk, pillow, keyboard^)...

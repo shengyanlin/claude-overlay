@@ -3,6 +3,88 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.5.3] — 2026-06-17
+
+### Fixed
+- **Setup no longer claims to find Python on a machine that doesn't have it.** Windows 11 ships a
+  0-byte "App execution alias" stub (`%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe`) that is
+  present even when Python isn't installed — running it just prints *"Python was not found…"* and
+  exits. The old check used `where python`, which that stub satisfies, so `setup.cmd` printed
+  *"[OK] Python found"* and only fell over later at the package step. Detection now **verifies the
+  interpreter actually runs** (`py -3 --version` / `python --version`, preferring the `py` launcher,
+  which the Store alias never shadows) instead of trusting `where`; it reports the real version it
+  found, and when none is present it spells out that the Microsoft Store `python` shortcut doesn't
+  count and how to turn the alias off. `update.cmd` had the same `where`-based check and got the
+  same fix.
+
+## [1.5.2] — 2026-06-14
+
+### Changed
+- **"Last turn ended with an error" now tells you *why*.** When the Claude Code CLI reports a turn's
+  result as an error, the overlay used to show a bare *"The last turn ended with an error."* It now
+  surfaces the CLI's actual reason — e.g. *overloaded error* (the model was briefly overloaded),
+  *max turns*, or *rate limit error* — pulled from the result's `subtype`/`result`, and adds *"Your
+  next message is unaffected"* (the error is per-turn; the session stays healthy, which is why the
+  next message works). The full detail is also written to the activity log when
+  `CLAUDE_OVERLAY_DEBUG_LOG` is set, so a past occurrence can be diagnosed after the fact.
+
+## [1.5.1] — 2026-06-14
+
+### Fixed
+- **Nothing in the chat gets clipped when you drag the window narrower any more.** Embedded items
+  were sized when first drawn and weren't re-laid-out on resize, so making the window narrower cut
+  them off on the right:
+  - **Your message bubbles** are sized to the chat width and right-aligned, so a narrower window
+    slid them partly off the right edge — worst for short messages, which hug the far right (hence
+    it only happened *sometimes*). Bubbles now re-fit to the new width on resize.
+  - **Tool-call chips** (the `❯ Bash …` pills) are sized to their text, so a long command/path
+    overflowed a narrow window. They now cap their width to the chat and ellipsize the argument
+    (`…`) so they always fit, and grow the text back when you widen the window.
+  - Tables re-fit to the new width too.
+
+  The re-layout is debounced (a drag settles into a single pass) and fires only on an actual width
+  change, so it never touches the streaming/scroll path (no v1.1.9-class freeze).
+
+## [1.5.0] — 2026-06-14
+
+### Added
+- **Copy Claude's replies.** Each of Claude's replies now has a small, always-visible **⧉ Copy**
+  button beneath it — the way ChatGPT and Claude show one. Click it and the reply goes to the
+  clipboard as **raw Markdown** (the `**bold**`, `#` headings and `| tables |` exactly as written,
+  so it pastes with its formatting intact); the button flashes **✓ Copied** for a moment and
+  brightens on hover so it reads as clickable. It appears under the finished reply and copies the
+  whole turn's answer text (Markdown only — extended thinking and tool chips are excluded). The text
+  is snapshotted when the button is drawn, so an older reply still copies the right thing after
+  newer turns. Like the v1.4.1 tables, the button forwards the mouse wheel, so hovering it never
+  blocks scrolling.
+
+### Fixed
+- **Zoom now resizes the *whole* chat.** Ctrl +/− (and Ctrl+mouse-wheel) used to grow only the
+  flowing text — your message bubbles, the tool-call chips, and tables stayed frozen at the size
+  they were drawn (they're fixed-size canvases that drew with a snapshotted font, so the shared
+  zoom didn't reach them; a bigger font would have overflowed their box). They now re-render at the
+  new zoom too — recomputing their box each time, so nothing overflows — and the new Copy button
+  scales with them, so the entire transcript zooms together. The re-render is debounced and runs
+  only on a zoom event (never while streaming), so it doesn't touch the streaming/scroll paths.
+
+## [1.4.2] — 2026-06-13
+
+### Fixed
+- **Setup no longer dead-ends when `pip` is missing or off PATH.** `setup.cmd` now bootstraps pip
+  with `python -m ensurepip --upgrade` (only if `python -m pip` isn't already available) *before*
+  installing the packages — so a Python that shipped without pip, or one whose `Scripts\` folder
+  isn't on PATH, no longer stops at "pip install failed". The README's by-hand and "let Claude
+  install it" steps now use `python -m pip` instead of a bare `pip` for the same reason.
+
+### Added
+- **Heads-up when you have the npm `claude` instead of the native build.** An npm install exposes
+  `claude.ps1`, which PowerShell resolves `claude` to — and Windows' default **Restricted**
+  ExecutionPolicy blocks `.ps1`, so typing `claude` in PowerShell fails with *"running scripts is
+  disabled on this system."* `setup.cmd` now detects this and prints the three fixes (run `claude`
+  from CMD, `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, or — recommended — install the
+  native `.exe` build via `irm https://claude.ai/install.ps1 | iex`). The overlay itself was never
+  affected: it launches the CLI via `claude.cmd`, which the policy doesn't gate.
+
 ## [1.4.1] — 2026-06-09
 
 ### Added
@@ -354,6 +436,13 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.5.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.3
+[1.5.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.2
+[1.5.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.1
+[1.5.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.0
+[1.4.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.4.2
+[1.4.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.4.1
+[1.4.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.4.0
 [1.3.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.3.0
 [1.2.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.3
 [1.2.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.2.2

@@ -181,7 +181,7 @@ It's an agent — so it can set itself up. With the `claude` CLI already install
 wherever you want it to live:
 
 ```
-claude "Set up Claude Overlay for me: clone https://github.com/shengyanlin/claude-overlay, make sure Python 3.10+ is installed (install it if missing), pip install its requirements.txt, then launch it with pythonw. Tell me when it's running."
+claude "Set up Claude Overlay for me: clone https://github.com/shengyanlin/claude-overlay, make sure Python 3.10+ is installed (install it if missing), ensure pip is present (python -m ensurepip --upgrade), then run python -m pip install -r requirements.txt, then launch it with pythonw. Tell me when it's running."
 ```
 
 Claude will ask before each step.
@@ -191,11 +191,14 @@ Claude will ask before each step.
 ```
 git clone https://github.com/shengyanlin/claude-overlay.git
 cd claude-overlay
-pip install -r requirements.txt
+python -m ensurepip --upgrade          # only needed if pip is missing; harmless otherwise
+python -m pip install -r requirements.txt
 ```
 
 This installs only the Python packages (`claude-agent-sdk`, `pillow`, `keyboard`) —
-you still need the `claude` CLI installed and logged in (see Prerequisites).
+you still need the `claude` CLI installed and logged in (see Prerequisites). Use
+`python -m pip` (not a bare `pip`): it works even when Python's `Scripts\` folder
+isn't on PATH, and `ensurepip` bootstraps `pip` if your Python install shipped without it.
 
 ---
 
