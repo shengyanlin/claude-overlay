@@ -73,7 +73,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.5.3"
+__version__ = "1.6.0"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -92,12 +92,32 @@ STRICT_MCP_CONFIG = True          # do NOT inherit the user's ~/.claude MCP serv
                                   # (Atlassian, Figma, M365, …) injects their tool schemas into the
                                   # context — easily 50-70K+ tokens, a third of a 200K window, gone
                                   # before you type. Flip to False to expose your MCP tools here.
+SKILLS = "all"                    # which Agent SDK skills to enable in the overlay. Default None
+                                  # means the overlay discovers NO skills (the SDK only wires up
+                                  # skill discovery when this is set). A list enables ONLY those
+                                  # skills by name — lean, just their description lands in context.
+                                  # "all" enables every discovered skill (heavier: every skill's
+                                  # description is injected). Setting this also makes the CLI load
+                                  # ~/.claude settings (setting_sources defaults to user+project),
+                                  # but NOT MCP servers (STRICT_MCP_CONFIG still blocks those).
+                                  # None → skills off entirely.
 AUTO_SCREENSHOT_DEFAULT = True
 HIDE_SCREENSHOT_TOOL = True       # hide the noisy "⚙ Read …shot_*.png" lines every turn
 HOTKEY = "ctrl+alt+space"
 THEME = "light"                  # "light" (Claude paper) or "dark" (warm dark)
 WINDOW_ALPHA = 1.0
 CORNER_RADIUS = 18
+TASKBAR_BUTTON = True            # show a real, clickable Windows taskbar button (with the
+                                 # Clawd icon), like a normal app — alt-tab target, click to
+                                 # focus/raise, see at a glance that it's running. The frameless
+                                 # (overrideredirect) window gets NO taskbar button by default;
+                                 # this forces one via WS_EX_APPWINDOW. False → the pure
+                                 # no-taskbar floating overlay (original behaviour).
+APP_ICON = "claude_overlay_2.ico"  # window + taskbar icon (Clawd). Path is relative to this
+                                 # script (or absolute). "" → no custom icon (Tk default).
+APP_ID = "shengyanlin.claude-overlay"  # explicit Windows AppUserModelID. Without it a pythonw
+                                 # app shows pythonw's icon in the taskbar and groups with other
+                                 # Python apps; setting it makes the taskbar use APP_ICON instead.
 ORB_SIZE = 56                    # diameter (logical px) of the collapsed Claude orb
 ORB_IMAGE = "claude_overlay_2.png"  # collapsed-orb artwork. "" → procedural glossy
                                  # terracotta sphere (original look). A path (relative
@@ -297,6 +317,18 @@ def set_dpi_awareness():
             pass
 
 
+def set_app_user_model_id():
+    """Give the process an explicit AppUserModelID so the Windows taskbar shows OUR
+    window icon (APP_ICON) rather than pythonw's, and doesn't lump the overlay together
+    with other Python apps. Must run before the first window is created."""
+    if not (TASKBAR_BUTTON and APP_ID):
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+    except Exception:
+        pass
+
+
 # Win32 region calls — set argtypes so 64-bit handles aren't truncated.
 _gdi32, _user32 = ctypes.windll.gdi32, ctypes.windll.user32
 _gdi32.CreateRoundRectRgn.restype = wt.HRGN
@@ -326,6 +358,15 @@ _user32.EnumDisplayMonitors.restype = ctypes.c_int
 _user32.SetWindowDisplayAffinity.argtypes = [wt.HWND, ctypes.c_uint]
 _user32.SetWindowDisplayAffinity.restype = ctypes.c_int
 _user32.GetForegroundWindow.restype = wt.HWND
+# Extended window-style get/set — used to force a taskbar button onto the frameless
+# (overrideredirect) window. argtypes set so the 64-bit HWND isn't truncated.
+_user32.GetWindowLongW.restype = ctypes.c_long
+_user32.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
+_user32.SetWindowLongW.restype = ctypes.c_long
+_user32.SetWindowLongW.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_long]
+GWL_EXSTYLE      = -20
+WS_EX_TOOLWINDOW = 0x00000080   # no taskbar button (what an overrideredirect popup effectively is)
+WS_EX_APPWINDOW  = 0x00040000   # force a taskbar button even on a tool/popup window
 _user32.IsClipboardFormatAvailable.argtypes = [ctypes.c_uint]
 _user32.IsClipboardFormatAvailable.restype = ctypes.c_int
 # Standard clipboard format ids — used for a cheap, non-blocking "is there an image?" probe
@@ -459,6 +500,11 @@ class ClaudeWorker(threading.Thread):
                            "append": SYSTEM_APPEND, "exclude_dynamic_sections": True},
         )
         opts["max_buffer_size"] = MAX_BUFFER_SIZE
+        if SKILLS is not None:
+            # Enable Agent SDK skills (e.g. the slide-check skill). The SDK only injects the
+            # Skill tool + sets setting_sources=["user","project"] when this is provided; left
+            # unset the overlay discovers no skills at all. A list enables only those skills.
+            opts["skills"] = SKILLS
         if STRICT_MCP_CONFIG:
             # Use ONLY the (empty) MCP servers defined here, ignoring the user's filesystem
             # config. Without this the spawned CLI loads every MCP server from ~/.claude.json
@@ -471,7 +517,7 @@ class ClaudeWorker(threading.Thread):
         # SDKs. Strip any the installed SDK rejects, one at a time, so an older install still
         # loads (with reduced features) instead of failing to construct options at all.
         droppable = ["strict_mcp_config", "max_buffer_size", "can_use_tool",
-                     "include_partial_messages"]
+                     "include_partial_messages", "skills"]
         while True:
             try:
                 return ClaudeAgentOptions(**opts)
@@ -936,6 +982,7 @@ class Overlay:
         self._last_cfg_size = None   # last (w,h) we re-applied the window region for
         self._capture_excluded = False   # set once WDA_EXCLUDEFROMCAPTURE is applied
         self._update_available = None     # set to the newer version string if one exists
+        self._mapping = False             # re-entrancy guard for the <Map> taskbar re-assert
 
         self._build()
         self._register_hotkey()
@@ -950,6 +997,7 @@ class Overlay:
         self.root.title("Claude")
         self.s = max(1.0, self.root.winfo_fpixels("1i") / 96.0)   # DPI scale factor
         self.root.overrideredirect(True)
+        self._apply_app_icon()                 # Clawd icon for the taskbar button / alt-tab
         self.root.configure(bg=T["bg"])
         self.root.attributes("-topmost", True)
         if WINDOW_ALPHA < 1.0:   # avoid WS_EX_LAYERED, which ignores SetWindowRgn rounding
@@ -1005,8 +1053,10 @@ class Overlay:
 
         self.root.after(130, lambda: (self.root.focus_force(), self.entry.focus_set()))
         self.root.bind("<Configure>", self._on_configure)
+        self.root.bind("<Map>", self._on_map, add="+")   # restore (incl. from taskbar) re-asserts the frameless look
         self.root.after(170, self._apply_region)
         self.root.after(180, self._exclude_from_capture)
+        self.root.after(220, self._install_taskbar_button)
         self.root.after(1200, self._check_for_update)
         self._start_hang_watchdog()    # diagnostic: dumps all-thread stacks if the UI pump stalls
 
@@ -1088,6 +1138,87 @@ class Overlay:
                 self._capture_excluded = True
         except Exception:
             self._capture_excluded = False
+
+    # ── taskbar button (frameless windows get none by default) ──
+    def _hwnd(self):
+        """The top-level window handle (GA_ROOT), not the Tk child."""
+        return _user32.GetAncestor(self.root.winfo_id(), 2) or self.root.winfo_id()
+
+    def _apply_app_icon(self):
+        """Give the window (hence the taskbar button + alt-tab) the Clawd icon."""
+        if not APP_ICON:
+            return
+        try:
+            p = Path(APP_ICON)
+            if not p.is_absolute():
+                p = Path(__file__).with_name(APP_ICON)
+            if p.exists():
+                self.root.iconbitmap(default=str(p))
+        except Exception:
+            pass
+
+    def _set_taskbar_button(self):
+        """Force a taskbar button onto the frameless (overrideredirect) window by setting
+        WS_EX_APPWINDOW / clearing WS_EX_TOOLWINDOW on its top-level handle. Idempotent —
+        only writes when the bits actually need changing, so it's cheap to re-assert on
+        every show/restore. No window-region / <Configure> work, so it's clear of the
+        v1.1.9 freeze class."""
+        if not TASKBAR_BUTTON:
+            return
+        try:
+            hwnd = self._hwnd()
+            style = _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            new = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+            if new != style:
+                _user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new)
+        except Exception:
+            pass
+
+    def _install_taskbar_button(self):
+        """One-time at startup: set the app-window style, then nudge the shell with a
+        single withdraw→deiconify so it actually materializes the button (Windows only
+        (re)evaluates taskbar membership when a window is shown). The brief hide/show is a
+        one-shot at launch, not on the streaming path."""
+        if not TASKBAR_BUTTON:
+            return
+        self._set_taskbar_button()
+        try:
+            geo = self.root.geometry()
+            self.root.withdraw()
+            self.root.after(10, lambda: self._after_taskbar_show(geo))
+        except Exception:
+            pass
+
+    def _after_taskbar_show(self, geo=None):
+        try:
+            self.root.deiconify()
+            self.root.overrideredirect(True)        # deiconify can re-add decorations → strip them
+            if geo:
+                self.root.geometry(geo)
+            self.root.attributes("-topmost", True)
+            self._set_taskbar_button()
+            self.root.after(20, self._apply_region)  # restore rounded corners
+        except Exception:
+            pass
+
+    def _on_map(self, e):
+        """Fires on the initial show and on every restore — including a restore from a
+        taskbar-button click that had minimized us. Re-assert the frameless look + topmost
+        + rounded region + app-window style so a taskbar restore can't bring back the title
+        bar / square corners. Guarded against the recursion our own deiconify triggers, and
+        ignores child-widget <Map> events."""
+        if e.widget is not self.root or not TASKBAR_BUTTON or self._mapping:
+            return
+        self._mapping = True
+        try:
+            self.root.overrideredirect(True)
+            self.root.attributes("-topmost", True)
+            self._set_taskbar_button()
+            self.root.after(20, self._apply_region)
+        except Exception:
+            pass
+        finally:
+            self.root.after(150, lambda: setattr(self, "_mapping", False))
 
     def _build_titlebar(self):
         bar = tk.Frame(self.root, bg=T["bg"], height=self.px(44))
@@ -2852,6 +2983,7 @@ class Overlay:
                 self.root.overrideredirect(True)
                 self.root.geometry(geo)
                 self.root.attributes("-topmost", True)
+                self._set_taskbar_button()   # withdraw→deiconify dropped the button; bring it back
                 self.root.lift()
                 self.root.after(20, self._apply_region)
         if not shots and not quiet:   # total failure — don't silently send no image
@@ -2955,6 +3087,7 @@ class Overlay:
         self.root.deiconify()
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
+        self._set_taskbar_button()   # re-assert the taskbar button after a hotkey-hide → show
         self.root.lift()
         self.root.after(40, lambda: (self.root.focus_force(), self.entry.focus_set()))
         self.root.after(60, self._apply_region)
@@ -3221,6 +3354,7 @@ class Overlay:
 
 if __name__ == "__main__":
     set_dpi_awareness()
+    set_app_user_model_id()   # before any window, so the taskbar uses our icon
     try:
         Overlay().run()
     except KeyboardInterrupt:

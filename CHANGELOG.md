@@ -3,6 +3,25 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] — 2026-06-23
+
+### Added
+- **A real taskbar button — like any other app.** The overlay is a frameless, always-on-top
+  window, which on Windows means it had *no* taskbar button at all: no way to click it back to the
+  front, no Alt-Tab entry, no at-a-glance "it's running". It now shows a proper taskbar button with
+  the Clawd icon — click it to focus/raise the overlay, find it in Alt-Tab, and see that it's
+  running. The window stays frameless and rounded; only the taskbar presence changes. Set the new
+  `TASKBAR_BUTTON` config constant to `False` for the original no-taskbar floating-only behaviour.
+  (Under the hood: `WS_EX_APPWINDOW` forces the button onto the borderless window, an explicit
+  AppUserModelID makes the taskbar show the overlay's own icon instead of Python's, and every
+  show/restore re-asserts the frameless look so a taskbar restore never flashes a title bar.)
+- **Skills are now available to the overlay.** A new `SKILLS` config constant exposes your enabled
+  Claude Code skills to the overlay (default `"all"` — every skill installed on the machine; or pass
+  a list to enable only specific ones, or `None` to disable). Previously the overlay wired up no
+  skill discovery at all. Enabling skills also lets the underlying CLI load your `~/.claude` user
+  settings; MCP servers stay blocked by `STRICT_MCP_CONFIG`, and the added context cost is minimal
+  (~1% of a 200K window for ~16 skills).
+
 ## [1.5.3] — 2026-06-17
 
 ### Fixed
@@ -436,6 +455,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.6.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.6.0
 [1.5.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.3
 [1.5.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.2
 [1.5.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.1
