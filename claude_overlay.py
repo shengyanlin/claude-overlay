@@ -367,6 +367,26 @@ _user32.SetWindowLongW.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_long]
 GWL_EXSTYLE      = -20
 WS_EX_TOOLWINDOW = 0x00000080   # no taskbar button (what an overrideredirect popup effectively is)
 WS_EX_APPWINDOW  = 0x00040000   # force a taskbar button even on a tool/popup window
+# Z-order raise + forced activation — used when the taskbar button / alt-tab / hotkey asks for
+# the overlay: the OS activates it but does NOT re-order it above other always-on-top windows,
+# so a click could leave it buried under another topmost window (or just unfocused). These do
+# the raise the activation skips. Plain z-order, no SetWindowRgn → clear of the v1.1.9 freeze class.
+HWND_TOPMOST     = wt.HWND(-1)
+SWP_NOSIZE       = 0x0001
+SWP_NOMOVE       = 0x0002
+SWP_NOACTIVATE   = 0x0010
+SWP_SHOWWINDOW   = 0x0040
+_user32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+_user32.SetWindowPos.restype = wt.BOOL
+_user32.BringWindowToTop.argtypes = [wt.HWND]
+_user32.BringWindowToTop.restype = wt.BOOL
+_user32.SetForegroundWindow.argtypes = [wt.HWND]
+_user32.SetForegroundWindow.restype = wt.BOOL
+_user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+_user32.GetWindowThreadProcessId.restype = wt.DWORD
+_user32.AttachThreadInput.argtypes = [wt.DWORD, wt.DWORD, wt.BOOL]
+_user32.AttachThreadInput.restype = wt.BOOL
 _user32.IsClipboardFormatAvailable.argtypes = [ctypes.c_uint]
 _user32.IsClipboardFormatAvailable.restype = ctypes.c_int
 # Standard clipboard format ids — used for a cheap, non-blocking "is there an image?" probe
@@ -983,6 +1003,7 @@ class Overlay:
         self._capture_excluded = False   # set once WDA_EXCLUDEFROMCAPTURE is applied
         self._update_available = None     # set to the newer version string if one exists
         self._mapping = False             # re-entrancy guard for the <Map> taskbar re-assert
+        self._fronting = False            # re-entrancy guard for _raise_to_front (focus churn)
 
         self._build()
         self._register_hotkey()
@@ -1054,6 +1075,7 @@ class Overlay:
         self.root.after(130, lambda: (self.root.focus_force(), self.entry.focus_set()))
         self.root.bind("<Configure>", self._on_configure)
         self.root.bind("<Map>", self._on_map, add="+")   # restore (incl. from taskbar) re-asserts the frameless look
+        self.root.bind("<FocusIn>", self._on_focus_in, add="+")  # taskbar-click / alt-tab activation → raise above topmost peers
         self.root.after(170, self._apply_region)
         self.root.after(180, self._exclude_from_capture)
         self.root.after(220, self._install_taskbar_button)
@@ -1215,10 +1237,71 @@ class Overlay:
             self.root.attributes("-topmost", True)
             self._set_taskbar_button()
             self.root.after(20, self._apply_region)
+            self.root.after(40, lambda: self._raise_to_front(focus=True))  # restore-from-minimize → come forward + focus
         except Exception:
             pass
         finally:
             self.root.after(150, lambda: setattr(self, "_mapping", False))
+
+    def _safe_focus_entry(self):
+        try:
+            if getattr(self, "entry", None) and self.entry.winfo_exists():
+                self.entry.focus_set()
+        except Exception:
+            pass
+
+    def _raise_to_front(self, focus=False):
+        """Bring the overlay above ALL windows — including other always-on-top windows — and
+        optionally focus the input. The OS activates us on a taskbar-button click / alt-tab /
+        restore but does NOT re-order us above topmost peers, so the click could leave us
+        buried under another always-on-top window (or just unfocused). This does the z-order
+        raise the activation skips. Pure z-order (no SetWindowRgn / <Configure>), so it's
+        idempotent, flicker-free when already on top, and clear of the v1.1.9 freeze class.
+        Guarded against the focus churn it can itself trigger."""
+        if self._fronting:
+            return
+        self._fronting = True
+        try:
+            hwnd = self._hwnd()
+            self.root.lift()
+            _user32.BringWindowToTop(hwnd)
+            # re-insert at the top of the topmost band → above other always-on-top windows;
+            # NOACTIVATE because the OS has already handed us activation (or _force_foreground did).
+            _user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+            if focus:
+                self.root.after(30, self._safe_focus_entry)
+        except Exception:
+            pass
+        finally:
+            self.root.after(150, lambda: setattr(self, "_fronting", False))
+
+    def _force_foreground(self):
+        """Steal the foreground to us even when another process owns the current foreground
+        window (the hotkey path — there WE initiate activation, so the OS hasn't handed us
+        foreground yet). The AttachThreadInput trick gets past Windows' foreground lock."""
+        try:
+            hwnd = self._hwnd()
+            fg = _user32.GetForegroundWindow()
+            cur = _user32.GetWindowThreadProcessId(fg, None) if fg else 0
+            me = _user32.GetWindowThreadProcessId(hwnd, None)
+            attached = bool(cur and cur != me and _user32.AttachThreadInput(cur, me, True))
+            _user32.SetForegroundWindow(hwnd)
+            if attached:
+                _user32.AttachThreadInput(cur, me, False)
+        except Exception:
+            pass
+
+    def _on_focus_in(self, e):
+        """The OS activated our top-level window — a taskbar-button click while we're visible-
+        but-behind, an alt-tab to us, or a restore all fire <FocusIn> on the root window. Raise
+        above any topmost peers so the activation actually brings us forward. Child-widget focus
+        (entry, chat) fires <FocusIn> on the CHILD, not the root, so this only runs on real
+        window activation. focus=False so we don't yank input focus from e.g. a chat-text
+        selection — the OS already gave the window focus; we only need to raise it."""
+        if e.widget is not self.root or not TASKBAR_BUTTON:
+            return
+        self._raise_to_front(focus=False)
 
     def _build_titlebar(self):
         bar = tk.Frame(self.root, bg=T["bg"], height=self.px(44))
@@ -3088,8 +3171,8 @@ class Overlay:
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self._set_taskbar_button()   # re-assert the taskbar button after a hotkey-hide → show
-        self.root.lift()
-        self.root.after(40, lambda: (self.root.focus_force(), self.entry.focus_set()))
+        self._force_foreground()     # hotkey path: WE initiate activation, push past the fg lock
+        self._raise_to_front(focus=True)   # lift above topmost peers + focus the input
         self.root.after(60, self._apply_region)
         self.visible = True
 
