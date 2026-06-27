@@ -3,6 +3,25 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] — 2026-06-27
+
+### Added
+- **Name each overlay — tell several apart at a glance.** Click the **"Claude"** title to give this
+  overlay a name (type inline, Enter or click away to save, Esc to cancel); an unnamed overlay shows
+  a faint **"Click to name this session"** hint next to the title to point the way. The name also
+  becomes the window's taskbar/Alt-Tab title. Most useful **collapsed**: when you minimize a named
+  overlay to its orb, the name now floats **beneath the orb** as crisp black text with a soft white
+  halo around the letters (no box, no frame) — so if you keep several overlays open, one per task,
+  you can tell which orb is which without expanding them. The name is per session (it isn't saved
+  across restarts). Unnamed overlays collapse to just the orb, exactly as before.
+
+### Fixed
+- **Clicking the taskbar button now brings the overlay to the front.** Because the window is
+  always-on-top *and* frameless, a taskbar-button click activated it but didn't re-order it above
+  other always-on-top windows, so it could stay buried (or just unfocused). It now raises itself to
+  the very front on a taskbar click, Alt-Tab, or restore. (Pure z-order — no `<Configure>`/region
+  churn, so it stays clear of the v1.1.9 freeze class.)
+
 ## [1.6.0] — 2026-06-23
 
 ### Added
@@ -455,6 +474,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.7.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.7.0
 [1.6.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.6.0
 [1.5.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.3
 [1.5.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.2

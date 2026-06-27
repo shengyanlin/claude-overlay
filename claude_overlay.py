@@ -73,7 +73,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -1004,6 +1004,14 @@ class Overlay:
         self._update_available = None     # set to the newer version string if one exists
         self._mapping = False             # re-entrancy guard for the <Map> taskbar re-assert
         self._fronting = False            # re-entrancy guard for _raise_to_front (focus churn)
+        # Per-overlay custom name (session-only, set by clicking the titlebar "Claude"). Shown
+        # in the titlebar + window title when expanded, and as a small pill UNDER the orb when
+        # collapsed — so several overlays open at once (one per task) are tellable apart at a
+        # glance while collapsed. Empty → the default "Claude" everywhere (original behaviour).
+        self.overlay_name = ""
+        self._rename_entry = None         # the in-place rename Entry while editing, else None
+        self._collapsed_mask = None       # PIL 'L' silhouette (orb ∪ name-pill) for the clipped
+                                          # collapsed window when a name is set; None → orb only
 
         self._build()
         self._register_hotkey()
@@ -1059,6 +1067,9 @@ class Overlay:
         self.f_h1    = mk(self.sans, 19, weight="bold")
         self.f_h2    = mk(self.sans, 17, weight="bold")
         self.f_h3    = mk(self.sans, 15, weight="bold")
+        # Collapsed-orb name pill: a fixed-size label (NOT registered for zoom — it only shows
+        # while collapsed, where the chat-text zoom is irrelevant). Kept as a ref so Tk won't GC it.
+        self.f_pill  = tkfont.Font(family=self.sans, size=-self.px(13), weight="bold")
 
         self._build_titlebar()
         self.hairline = tk.Frame(self.root, bg=T["border"], height=1)
@@ -1314,11 +1325,114 @@ class Overlay:
         mark.pack(side="left", padx=(self.px(14), self.px(7)))
         self._draw_spark(mark, sz / 2, sz / 2, self.px(9))
         self._bind_drag(mark)
-        name = tk.Label(bar, text="Claude", bg=T["bg"], fg=T["text"], font=self.f_title)
-        name.pack(side="left")
-        self._bind_drag(name)
+        # The title doubles as the rename target: click it (without dragging) to edit this
+        # overlay's name; dragging it still moves the window (moved-detection, like the orb).
+        self.title_lbl = tk.Label(bar, text=self.overlay_name or "Claude", bg=T["bg"],
+                                  fg=T["text"], font=self.f_title, cursor="hand2")
+        self.title_lbl.pack(side="left")
+        self.title_lbl.bind("<ButtonPress-1>", self._title_press)
+        self.title_lbl.bind("<B1-Motion>", self._title_drag)
+        self.title_lbl.bind("<ButtonRelease-1>", self._title_release)
+        # Faint hint to the right of the title, shown ONLY before this overlay is named (and not
+        # while editing) — invites the user to click and name the session. Clicking it starts the
+        # rename too. Hidden the moment a name exists.
+        self.title_hint = tk.Label(bar, text="Click to name this session",
+                                   bg=T["bg"], fg=T["faint"], font=self.f_small, cursor="hand2")
+        self.title_hint.bind("<Button-1>", lambda e: self._begin_rename())
         self._title_btn(bar, "✕", self.quit)
         self._title_btn(bar, "—", self.toggle_collapse)
+        self._update_title_hint()
+
+    def _update_title_hint(self):
+        """Show the 'type to name this session' hint only before the overlay is named and while
+        not editing; hide it once it has a name (or during an edit)."""
+        hint = getattr(self, "title_hint", None)
+        if hint is None:
+            return
+        show = not (self.overlay_name or "").strip() and getattr(self, "_rename_entry", None) is None
+        try:
+            if show and not hint.winfo_ismapped():
+                hint.pack(side="left", padx=(self.px(8), 0))
+            elif not show:
+                hint.pack_forget()
+        except Exception:
+            pass
+
+    # ── rename this overlay (click the titlebar "Claude") ──
+    def _title_press(self, e):
+        self._title_moved = False
+        self._drag_start(e)
+
+    def _title_drag(self, e):
+        self._title_moved = True
+        self._drag_move(e)
+
+    def _title_release(self, e):
+        # A click (no drag) on the title opens the inline rename editor; a drag just moved
+        # the window (handled in _title_drag) and must NOT also trigger a rename.
+        if not self._title_moved:
+            self._begin_rename()
+
+    def _begin_rename(self):
+        if getattr(self, "_rename_entry", None) is not None:
+            return                                  # already editing
+        lbl = self.title_lbl
+        ent = tk.Entry(self.titlebar, font=self.f_title, bg=T["field"], fg=T["text"],
+                       insertbackground=T["text"], relief="flat", highlightthickness=1,
+                       highlightbackground=T["border"], highlightcolor=T["accent"])
+        ent.insert(0, self.overlay_name)
+        ent.select_range(0, "end")
+        ent.icursor("end")
+        # Overlay it on the titlebar (place, so the pack layout is untouched), spanning from the
+        # title text to just before the —/✕ buttons.
+        x = max(self.px(40), lbl.winfo_x())
+        w = max(self.px(140), self.titlebar.winfo_width() - x - self.px(78))
+        ent.place(x=x, y=self.px(8), width=w, height=self.px(28))
+        ent.focus_set()
+        ent.bind("<Return>", lambda ev: self._commit_rename())
+        ent.bind("<KP_Enter>", lambda ev: self._commit_rename())
+        ent.bind("<Escape>", lambda ev: self._cancel_rename())
+        ent.bind("<FocusOut>", lambda ev: self._commit_rename())
+        self._rename_entry = ent
+        self._update_title_hint()          # hide the hint while editing
+
+    def _commit_rename(self):
+        ent = getattr(self, "_rename_entry", None)
+        if ent is None:
+            return
+        try:
+            name = ent.get().strip()
+        except Exception:
+            name = ""
+        self._rename_entry = None          # null FIRST so the destroy-triggered <FocusOut> no-ops
+        try:
+            ent.destroy()
+        except Exception:
+            pass
+        self._apply_name(name)
+
+    def _cancel_rename(self):
+        ent = getattr(self, "_rename_entry", None)
+        self._rename_entry = None
+        if ent is not None:
+            try:
+                ent.destroy()
+            except Exception:
+                pass
+        self._update_title_hint()          # re-show the hint if still unnamed
+
+    def _apply_name(self, name):
+        self.overlay_name = name or ""
+        shown = self.overlay_name or "Claude"
+        try:
+            self.title_lbl.configure(text=shown)
+        except Exception:
+            pass
+        try:
+            self.root.title(shown)         # also updates the taskbar tooltip / alt-tab label
+        except Exception:
+            pass
+        self._update_title_hint()          # named → hide hint; cleared → show it again
 
     def _build_chat(self):
         wrap = tk.Frame(self.root, bg=T["bg"])
@@ -1524,6 +1638,109 @@ class Overlay:
         self.orb.bind("<ButtonRelease-1>", self._orb_release)
         self.orb.bind("<Enter>", lambda e: self._draw_orb(hover=True))
         self.orb.bind("<Leave>", lambda e: self._draw_orb(hover=False))
+        # Name pill shown UNDER the orb while collapsed (only when this overlay has a custom
+        # name). The whole collapsed cluster (orb + pill) shares the orb's click=expand /
+        # drag=move handlers, so clicking the name expands too. Hidden until collapse.
+        self.orb_name = tk.Canvas(self.root, highlightthickness=0, bg=T["accent"], cursor="hand2")
+        self.orb_name.bind("<ButtonPress-1>", self._orb_press)
+        self.orb_name.bind("<B1-Motion>", self._orb_drag)
+        self.orb_name.bind("<ButtonRelease-1>", self._orb_release)
+
+    def _pill_ttf(self, px_size):
+        """A PIL TrueType font for the collapsed name (PIL needs an actual font FILE to render
+        CJK). Prefer Traditional-Chinese-capable faces, fall back to Latin. Cached per size."""
+        cache = self.__dict__.setdefault("_pill_ttf_cache", {})
+        if px_size in cache:
+            return cache[px_size]
+        from PIL import ImageFont
+        font = None
+        for path in (r"C:\Windows\Fonts\msjhbd.ttc",   # Microsoft JhengHei Bold (TC)
+                     r"C:\Windows\Fonts\msjh.ttc",     # Microsoft JhengHei
+                     r"C:\Windows\Fonts\msyhbd.ttc",   # MS YaHei Bold (SC fallback)
+                     r"C:\Windows\Fonts\segoeuib.ttf", # Segoe UI Bold (Latin)
+                     r"C:\Windows\Fonts\arialbd.ttf"):
+            try:
+                font = ImageFont.truetype(path, px_size)
+                break
+            except Exception:
+                continue
+        if font is None:
+            try:
+                font = ImageFont.load_default()
+            except Exception:
+                font = None
+        cache[px_size] = font
+        return font
+
+    @staticmethod
+    def _truncate_pil(font, text, budget_px, stroke):
+        """Longest prefix of `text` whose rendered width (incl. the halo stroke) fits `budget_px`,
+        with a trailing … if cut. Measured with the PIL font so it matches the actual render."""
+        if not text or font is None:
+            return text or ""
+        def width(s):
+            try:
+                box = font.getbbox(s, stroke_width=stroke)
+            except TypeError:
+                box = font.getbbox(s)
+            return box[2] - box[0]
+        if width(text) <= budget_px:
+            return text
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if width(text[:mid] + "…") <= budget_px:
+                lo = mid
+            else:
+                hi = mid - 1
+        return (text[:lo] + "…") if lo > 0 else "…"
+
+    def _draw_name_pill(self):
+        """Render the collapsed name as BLACK text with a WHITE halo that hugs the glyph shapes —
+        no box, no border. Done by drawing the text with a thick white PIL stroke; the white sits
+        only around the letters, and the window region (built from this image's alpha in
+        _build_collapsed_mask) clips the window to that halo silhouette, so it floats like a
+        captioned label rather than a rectangle. Returns (w, h) in logical px."""
+        name = (self.overlay_name or "").strip()
+        SS = 4                                   # supersample for crisp edges at any DPI
+        fpx = self.px(14) * SS                   # caption font size
+        grow = max(2 * SS, self.px(3) * SS)      # white halo thickness (supersampled)
+        font = self._pill_ttf(fpx)
+        shown = self._truncate_pil(font, name, self.px(230) * SS, grow) or " "
+
+        probe = ImageDraw.Draw(Image.new("RGBA", (8, 8), (0, 0, 0, 0)))
+        try:
+            l, t, r, b = probe.textbbox((0, 0), shown, font=font, stroke_width=grow)
+            has_stroke = True
+        except TypeError:                        # very old Pillow: no stroke param
+            l, t, r, b = probe.textbbox((0, 0), shown, font=font)
+            has_stroke = False
+        pad = grow + SS                          # margin so anti-aliased halo isn't clipped
+        Wn, Hn = (r - l) + 2 * pad, (b - t) + 2 * pad
+        img = Image.new("RGBA", (max(1, Wn), max(1, Hn)), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        ox, oy = pad - l, pad - t
+        white, black = (255, 255, 255, 255), (0, 0, 0, 255)
+        if has_stroke:
+            d.text((ox, oy), shown, font=font, fill=black, stroke_width=grow, stroke_fill=white)
+        else:                                    # emulate the halo: white at offsets, black centre
+            g = max(1, grow)
+            for dx in range(-g, g + 1):
+                for dy in range(-g, g + 1):
+                    if dx * dx + dy * dy <= g * g:
+                        d.text((ox + dx, oy + dy), shown, font=font, fill=white)
+            d.text((ox, oy), shown, font=font, fill=black)
+
+        lw, lh = max(1, round(Wn / SS)), max(1, round(Hn / SS))
+        out = img.resize((lw, lh), Image.LANCZOS)
+        self._orb_name_photo = ImageTk.PhotoImage(out)   # keep a ref so Tk won't GC it
+        c = self.orb_name
+        c.delete("all")
+        c.configure(width=lw, height=lh, bg="#FFFFFF")   # bg = white → any AA edge blends into halo
+        c.create_image(lw // 2, lh // 2, image=self._orb_name_photo)
+        self._name_label_mask = out.split()[3]           # alpha silhouette → the window region
+        self._name_pill_size = (lw, lh)
+        return lw, lh
 
     def _draw_orb(self, hover=False):
         s = self.orb_size
@@ -2141,7 +2358,12 @@ class Overlay:
                 rgn = _gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, r, r)
             else:
                 rgn = None
-                if ORB_FLOAT and getattr(self, "_orb_mask", None) is not None \
+                # Named-collapse: clip to the composite silhouette (orb sprite ∪ name pill) so the
+                # pill floats as its own rounded tag under the free-floating orb.
+                cm = getattr(self, "_collapsed_mask", None)
+                if cm is not None and cm.size == (w, h):
+                    rgn = self._build_alpha_region(cm)
+                if rgn is None and ORB_FLOAT and getattr(self, "_orb_mask", None) is not None \
                         and self._orb_mask_size == (w, h):
                     rgn = self._build_alpha_region(self._orb_mask)   # float as the raw sprite
                 if not rgn:
@@ -2186,6 +2408,32 @@ class Overlay:
             return full
         except Exception:
             return None
+
+    def _build_collapsed_mask(self, W, H, s, pw, ph, gap):
+        """Compose ONE alpha silhouette for the named-collapse window: the orb's own sprite
+        silhouette at the top (centred), the name label's halo silhouette below it. Fed to
+        _build_alpha_region in _apply_region so the window floats as orb-sprite + a haloed text
+        label — no surrounding box. Built once per collapse (never in a <Configure> loop → off the
+        v1.1.9 freeze path). Stored on self._collapsed_mask; None on failure (falls back to the
+        plain orb region)."""
+        try:
+            mask = Image.new("L", (W, H), 0)
+            x_orb = (W - s) // 2
+            om = getattr(self, "_orb_mask", None)
+            if ORB_FLOAT and om is not None and om.size == (s, s):
+                mask.paste(om, (x_orb, 0))                       # the raw sprite silhouette
+            else:
+                ImageDraw.Draw(mask).ellipse([x_orb, 0, x_orb + s - 1, s - 1], fill=255)  # circular orb
+            x_pill, y_pill = (W - pw) // 2, s + gap
+            lm = getattr(self, "_name_label_mask", None)
+            if lm is not None and lm.size == (pw, ph):
+                mask.paste(lm, (x_pill, y_pill))                 # the text-halo silhouette
+            else:                                                # fallback: a plain filled box
+                ImageDraw.Draw(mask).rectangle(
+                    [x_pill, y_pill, x_pill + pw - 1, y_pill + ph - 1], fill=255)
+            self._collapsed_mask = mask
+        except Exception:
+            self._collapsed_mask = None
 
     # ── chat rendering (main thread only) ──
     def _readonly_keys(self, e):
@@ -3127,6 +3375,9 @@ class Overlay:
 
     def toggle_collapse(self):
         if self.expanded:
+            # editing the name when the — / double-click collapses → commit it first
+            if getattr(self, "_rename_entry", None) is not None:
+                self._commit_rename()
             self._geo_before = self.root.geometry()
             gx, gy, gw = self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width()
             for w in (self.titlebar, self.hairline, self.chat_wrap, self.input_wrap,
@@ -3134,12 +3385,30 @@ class Overlay:
                 w.pack_forget()
             self._hide_edges()
             s = self.orb_size
-            self.orb.pack(fill="both", expand=True)
-            self.root.minsize(s, s)
-            self.root.geometry(f"{s}x{s}+{gx + gw - s}+{gy}")   # stay at top-right corner
+            name = (self.overlay_name or "").strip()
+            if name:
+                # Named: orb on top, name pill below — both placed at exact coords so the window
+                # region (orb silhouette ∪ pill rounded-rect) lines up pixel-for-pixel.
+                pw, ph = self._draw_name_pill()
+                gap = self.px(5)
+                W, H = max(s, pw), s + gap + ph
+                x_orb, x_pill, y_pill = (W - s) // 2, (W - pw) // 2, s + gap
+                self.orb.place(x=x_orb, y=0, width=s, height=s)
+                self.orb_name.place(x=x_pill, y=y_pill, width=pw, height=ph)
+                self._build_collapsed_mask(W, H, s, pw, ph, gap)
+                self.root.minsize(W, H)
+                self.root.geometry(f"{W}x{H}+{gx + gw - W}+{gy}")   # right edge stays put
+            else:
+                self._collapsed_mask = None
+                self.orb_name.place_forget()
+                self.orb.place(x=0, y=0, width=s, height=s)
+                self.root.minsize(s, s)
+                self.root.geometry(f"{s}x{s}+{gx + gw - s}+{gy}")   # stay at top-right corner
             self.expanded = False
         else:
-            self.orb.pack_forget()
+            self._collapsed_mask = None
+            self.orb.place_forget()
+            self.orb_name.place_forget()
             self.root.minsize(self.px(330), self.px(300))
             self.titlebar.pack(fill="x", side="top")
             self.hairline.pack(fill="x")
