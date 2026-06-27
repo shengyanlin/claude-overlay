@@ -3,6 +3,28 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.7.1] — 2026-06-27
+
+### Added
+- **A "task done" badge on the collapsed orb.** When a reply finishes while the overlay is
+  collapsed to its orb, a small green ✓ now appears at the orb's top-right — so if you sent it off
+  to work and minimized it, you can see at a glance that the answer is ready. It clears when you
+  expand the overlay or start a new turn. (The floating-sprite clip region is rebuilt to include the
+  badge, so it isn't clipped away; it composes cleanly with the session name label too.)
+- **`setup.cmd` can now install Python for you.** If no real Python is found, setup offers to
+  install it automatically (a new `install-python.ps1`): it uses winget (user scope, no admin) when
+  available, otherwise downloads the official python.org per-user installer (which includes tkinter,
+  pip, and the `py` launcher). It then continues straight to installing the overlay's packages —
+  instead of the old dead-end that just told you Python was missing. Declining, or a failed install,
+  still prints clear manual steps.
+
+### Fixed
+- **Pasting copied text no longer turns into a pasted image.** Many apps (browsers, Office,
+  screenshot tools) put a bitmap on the clipboard *alongside* the text you copied, and the overlay's
+  Ctrl+V was treating any clipboard image as an image paste — so plain text came in as a picture. Text
+  now wins: if the clipboard has text, it pastes as text; an image is only attached when there's
+  image/file content and no text.
+
 ## [1.7.0] — 2026-06-27
 
 ### Added
@@ -474,6 +496,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.7.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.7.1
 [1.7.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.7.0
 [1.6.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.6.0
 [1.5.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.3

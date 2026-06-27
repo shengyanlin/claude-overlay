@@ -73,7 +73,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.7.0"
+__version__ = "1.7.1"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -393,6 +393,8 @@ _user32.IsClipboardFormatAvailable.restype = ctypes.c_int
 # on the UI thread, so we only spin up the (potentially slow) ImageGrab.grabclipboard() read
 # on a background thread when there's actually image/file content.
 CF_BITMAP, CF_DIB, CF_HDROP, CF_DIBV5 = 2, 8, 15, 17
+CF_TEXT, CF_UNICODETEXT = 1, 13   # so a text copy (which many apps ALSO put a bitmap on the
+                                  # clipboard for) pastes as text, not as an image
 
 # Exclude the overlay from screen captures at the OS level (DWM): the window stays
 # visible to the user but is omitted from PIL ImageGrab / PrintWindow, so the
@@ -1010,8 +1012,10 @@ class Overlay:
         # glance while collapsed. Empty → the default "Claude" everywhere (original behaviour).
         self.overlay_name = ""
         self._rename_entry = None         # the in-place rename Entry while editing, else None
-        self._collapsed_mask = None       # PIL 'L' silhouette (orb ∪ name-pill) for the clipped
-                                          # collapsed window when a name is set; None → orb only
+        self._collapsed_mask = None       # PIL 'L' silhouette (orb ∪ name-pill ∪ done-badge) for the
+                                          # clipped collapsed window; None → plain orb sprite/ellipse
+        self._task_done_badge = False     # show a "stage complete" badge on the collapsed orb after
+                                          # a reply finishes while collapsed; cleared on expand/new turn
 
         self._build()
         self._register_hotkey()
@@ -1747,6 +1751,28 @@ class Overlay:
         self.orb.delete("all")
         self._orb_photo = self._orb_image(s, hover)   # keep a ref so Tk won't GC it
         self.orb.create_image(s // 2, s // 2, image=self._orb_photo)
+        if getattr(self, "_task_done_badge", False):
+            self._draw_orb_badge()
+
+    def _badge_geom(self, x_off=0):
+        """(centre_x, centre_y, radius) of the done-badge, relative to a collapsed-window origin
+        with the orb's left edge at x_off (0 when drawing on the orb canvas itself). Tucked at the
+        orb's top-right and sized to fit inside the s x s orb box."""
+        s = self.orb_size
+        br = max(self.px(5), int(s * 0.15))
+        return x_off + int(s * 0.78), int(s * 0.22), br
+
+    def _draw_orb_badge(self):
+        """A small green check at the orb's top-right — signals the last reply finished while the
+        overlay was collapsed. Drawn on the orb canvas; the clip region (rebuilt in
+        _rebuild_collapsed_mask) includes this circle so the floating sprite doesn't clip it away."""
+        bx, by, br = self._badge_geom(0)
+        self.orb.create_oval(bx - br, by - br, bx + br, by + br,
+                             fill="#3FB950", outline="#FFFFFF", width=max(1, self.px(1.5)))
+        w = max(2, self.px(2))
+        self.orb.create_line(bx - br * 0.42, by + br * 0.04, bx - br * 0.08, by + br * 0.40,
+                             bx + br * 0.46, by - br * 0.42,
+                             fill="#FFFFFF", width=w, capstyle="round", joinstyle="round")
 
     # ── glossy 3-D orb (rendered with Pillow, cached per size+state) ──
     @staticmethod
@@ -2070,10 +2096,14 @@ class Overlay:
         return "" if self._ph_active else self.entry.get("1.0", "end").strip()
 
     def _clipboard_has_image(self):
-        """Cheap, non-blocking probe (no OLE render): is there image/file content on the
-        clipboard? Lets the UI thread decide whether to spin up the (possibly slow)
-        grabclipboard() read without blocking on it first."""
+        """Cheap, non-blocking probe (no OLE render): should this paste be treated as an image?
+        TEXT WINS: if the clipboard carries text, paste it as text — many apps (browsers, Office,
+        screenshot tools) ALSO put a bitmap/DIB on the clipboard next to copied text, which used to
+        make a plain text copy paste as an image. Only treat it as image when there's image/file
+        content AND no text."""
         try:
+            if any(_user32.IsClipboardFormatAvailable(f) for f in (CF_UNICODETEXT, CF_TEXT)):
+                return False
             return any(_user32.IsClipboardFormatAvailable(f)
                        for f in (CF_DIB, CF_DIBV5, CF_BITMAP, CF_HDROP))
         except Exception:
@@ -2409,31 +2439,69 @@ class Overlay:
         except Exception:
             return None
 
-    def _build_collapsed_mask(self, W, H, s, pw, ph, gap):
-        """Compose ONE alpha silhouette for the named-collapse window: the orb's own sprite
-        silhouette at the top (centred), the name label's halo silhouette below it. Fed to
-        _build_alpha_region in _apply_region so the window floats as orb-sprite + a haloed text
-        label — no surrounding box. Built once per collapse (never in a <Configure> loop → off the
-        v1.1.9 freeze path). Stored on self._collapsed_mask; None on failure (falls back to the
-        plain orb region)."""
+    def _rebuild_collapsed_mask(self):
+        """Compose the alpha silhouette for the collapsed window from current state: the orb sprite
+        at the top, the name label's halo below it (if named), and the done-badge circle (if set).
+        Fed to _build_alpha_region in _apply_region so the window floats as sprite [+ haloed name]
+        [+ badge] with no surrounding box. None when neither extra is present (the plain orb
+        sprite/ellipse fast path handles that). Built only on collapse / badge-or-name change — never
+        in a <Configure> loop, so it stays off the v1.1.9 freeze path. None on failure too."""
+        if self.expanded:
+            self._collapsed_mask = None
+            return
+        s = self.orb_size
+        named = bool((self.overlay_name or "").strip())
+        badge = bool(getattr(self, "_task_done_badge", False))
+        if not named and not badge:
+            self._collapsed_mask = None       # fast path: plain sprite/ellipse region
+            return
         try:
-            mask = Image.new("L", (W, H), 0)
+            if named:
+                pw, ph = self._name_pill_size
+                gap = self.px(5)
+                W, H = max(s, pw), s + gap + ph
+            else:
+                pw = ph = gap = 0
+                W, H = s, s
             x_orb = (W - s) // 2
+            mask = Image.new("L", (W, H), 0)
             om = getattr(self, "_orb_mask", None)
             if ORB_FLOAT and om is not None and om.size == (s, s):
                 mask.paste(om, (x_orb, 0))                       # the raw sprite silhouette
             else:
                 ImageDraw.Draw(mask).ellipse([x_orb, 0, x_orb + s - 1, s - 1], fill=255)  # circular orb
-            x_pill, y_pill = (W - pw) // 2, s + gap
-            lm = getattr(self, "_name_label_mask", None)
-            if lm is not None and lm.size == (pw, ph):
-                mask.paste(lm, (x_pill, y_pill))                 # the text-halo silhouette
-            else:                                                # fallback: a plain filled box
-                ImageDraw.Draw(mask).rectangle(
-                    [x_pill, y_pill, x_pill + pw - 1, y_pill + ph - 1], fill=255)
+            if named:
+                x_pill, y_pill = (W - pw) // 2, s + gap
+                lm = getattr(self, "_name_label_mask", None)
+                if lm is not None and lm.size == (pw, ph):
+                    mask.paste(lm, (x_pill, y_pill))             # the text-halo silhouette
+                else:                                            # fallback: a plain filled box
+                    ImageDraw.Draw(mask).rectangle(
+                        [x_pill, y_pill, x_pill + pw - 1, y_pill + ph - 1], fill=255)
+            if badge:
+                bx, by, br = self._badge_geom(x_orb)
+                ImageDraw.Draw(mask).ellipse([bx - br, by - br, bx + br, by + br], fill=255)
             self._collapsed_mask = mask
         except Exception:
             self._collapsed_mask = None
+
+    def _set_task_badge(self, on):
+        """Toggle the collapsed-orb done-badge. Redraws the orb + the clip region only when
+        collapsed (the badge is invisible while expanded; the flag is just cleared)."""
+        on = bool(on)
+        if on == getattr(self, "_task_done_badge", False):
+            return
+        self._task_done_badge = on
+        if not self.expanded:
+            self._draw_orb()                 # draw (or remove) the badge dot
+            self._rebuild_collapsed_mask()   # include/exclude the badge circle in the clip region
+            self.root.after(10, self._apply_region)
+
+    def _maybe_flag_done(self):
+        """A reply just finished — if we're collapsed and it actually produced text, badge the orb
+        so the user knows a result is waiting behind the icon."""
+        if not self.expanded and (self._turn_raw or "").strip():
+            self._set_task_badge(True)
 
     # ── chat rendering (main thread only) ──
     def _readonly_keys(self, e):
@@ -2486,6 +2554,7 @@ class Overlay:
         self._md_finalize()              # commit the previous turn's last line before a new bubble
         self._turn_raw = ""              # a new turn starts → fresh assistant-answer buffer
         self._turn_copy_added = False
+        self._set_task_badge(False)      # a new task → clear any stale "done" badge on the orb
         at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", "\n")
         self.chat.window_create("end", window=self._user_bubble(text), pady=self.px(3))
@@ -3395,18 +3464,19 @@ class Overlay:
                 x_orb, x_pill, y_pill = (W - s) // 2, (W - pw) // 2, s + gap
                 self.orb.place(x=x_orb, y=0, width=s, height=s)
                 self.orb_name.place(x=x_pill, y=y_pill, width=pw, height=ph)
-                self._build_collapsed_mask(W, H, s, pw, ph, gap)
                 self.root.minsize(W, H)
                 self.root.geometry(f"{W}x{H}+{gx + gw - W}+{gy}")   # right edge stays put
             else:
-                self._collapsed_mask = None
                 self.orb_name.place_forget()
                 self.orb.place(x=0, y=0, width=s, height=s)
                 self.root.minsize(s, s)
                 self.root.geometry(f"{s}x{s}+{gx + gw - s}+{gy}")   # stay at top-right corner
             self.expanded = False
+            self._draw_orb()                  # ensure the badge (if any) is drawn for this collapse
+            self._rebuild_collapsed_mask()    # silhouette = sprite [+ name] [+ badge]
         else:
             self._collapsed_mask = None
+            self._task_done_badge = False     # expanding = user is now looking → clear the badge
             self.orb.place_forget()
             self.orb_name.place_forget()
             self.root.minsize(self.px(330), self.px(300))
@@ -3616,6 +3686,7 @@ class Overlay:
             self._md_finalize()          # the turn ended → give the last line full block styling
             self._finish_turn_copy()     # then a Copy button under the reply
             self._set_busy(False)
+            self._maybe_flag_done()      # badge the orb if this finished while collapsed
         elif kind == "error":
             self.add_err(str(payload))
             self._set_busy(False)
