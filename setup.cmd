@@ -12,18 +12,49 @@ rem stub at %LOCALAPPDATA%\Microsoft\WindowsApps\python.exe that `where` finds e
 rem when Python is NOT installed -- running it just prints "Python was not found..."
 rem and exits 9009. So VERIFY by actually running --version, and prefer the `py`
 rem launcher (which the Store alias never shadows).
+rem Goto-structured (NOT nested parentheses) on purpose: a parenthesized block expands
+rem %PY%/%DOPY% at parse time, so a value set by `set /p` inside it would read stale. Labels
+rem let each line expand when reached.
 set "PY="
 py -3 --version >nul 2>nul && set "PY=py -3"
 if not defined PY ( python --version >nul 2>nul && set "PY=python" )
-if not defined PY (
-  echo [X] Python 3 not found. Install it from https://www.python.org/downloads/
-  echo     ^(tick "Add python.exe to PATH" in the installer^), then re-run setup.cmd.
-  echo     Note: the Microsoft Store "python" shortcut does NOT count -- install the
-  echo     real thing, or turn the stub off under Settings ^> Apps ^> Advanced app
-  echo     settings ^> App execution aliases.
-  pause & exit /b 1
-)
-for /f "tokens=*" %%v in ('%PY% --version 2^>^&1') do set "PYVER=%%v"
+if defined PY goto pyfound
+
+echo [X] Python 3 was not found on this PC.
+echo     ^(The Microsoft Store "python" shortcut does NOT count as a real install.^)
+set "DOPY=Y"
+set /p DOPY="Install Python 3 now, automatically? (recommended) [Y/n] "
+if /i "%DOPY%"=="n" goto pymanual
+echo.
+echo Installing Python 3 ^(per-user, no admin needed^) -- this can take a minute...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install-python.ps1"
+echo.
+rem Re-detect. The PATH is NOT refreshed inside this window, so after the install also look in
+rem the per-user dir where winget / the python.org installer place Python.
+set "PY="
+py -3 --version >nul 2>nul && set "PY=py -3"
+if not defined PY ( python --version >nul 2>nul && set "PY=python" )
+if defined PY goto pyfound
+rem (recurse from Programs\Python for python.exe -- a wildcard MID-path like Python3*\python.exe
+rem  is NOT matched by `dir /s`, so search the base dir for the filename instead)
+for /f "delims=" %%p in ('dir /b /s /a-d /o-n "%LOCALAPPDATA%\Programs\Python\python.exe" 2^>nul') do if not defined PY set PY="%%p"
+if defined PY goto pyfound
+
+:pymanual
+echo.
+echo [X] Python is not available in this window yet.
+echo     If you just installed it, CLOSE this window and run setup.cmd again -- a fresh
+echo     window picks up the updated PATH. Or install manually from
+echo     https://www.python.org/downloads/ ^(tick "Add python.exe to PATH"^), then re-run.
+pause & exit /b 1
+
+:pyfound
+rem Read the version robustly for EVERY form of %PY% -- including a quoted full path with spaces,
+rem which would break `for /f ... in ('%PY% ...')`; a temp file sidesteps the quoting entirely.
+%PY% --version > "%TEMP%\_ov_pyver.txt" 2>&1
+set "PYVER="
+set /p PYVER=<"%TEMP%\_ov_pyver.txt"
+del "%TEMP%\_ov_pyver.txt" >nul 2>nul
 echo [OK] Python found: %PY% ^(%PYVER%^)
 
 rem --- 2. claude CLI (auto-install via the native installer if missing; no Node needed) ---
