@@ -36,7 +36,12 @@ so it uses your **existing Claude subscription — no API key, no metered billin
 - 👁️ **It sees what you see.** Auto-captures each monitor on every message and
   labels primary vs. secondary — just ask *"what's wrong here?"* and it looks.
 - 🪟 **Never breaks your flow.** Always-on-top and frameless; it collapses to a
-  tiny draggable orb when you're not using it, and clicks back open when you are.
+  tiny draggable orb when you're not using it (with a real Windows **taskbar
+  button** to click it back), and drops a ✓ on the orb when a reply finishes
+  while it's tucked away — so you know a task is done without expanding it.
+- 🏷️ **Name each overlay; run several at once.** Click the title to name an
+  overlay for the task it's on — the name rides under the orb when collapsed, so a
+  row of orbs (one per task) stays tellable apart at a glance.
 - 🧠 **A real agent that acts, not a chatbot.** Full Claude Code (Opus 4.8) — it
   edits files, runs commands, and can even reach into the app on your screen (say,
   fix the wording on your open slide, or build a model in your open Excel), not just
@@ -204,7 +209,7 @@ isn't on PATH, and `ensurepip` bootstraps `pip` if your Python install shipped w
 
 ## Update
 
-The overlay shows its version in the bottom status line (e.g. `v1.1.1`) and checks
+The overlay shows its version in the bottom status line (e.g. `v1.7.2`) and checks
 GitHub for a newer release on startup — when one exists you'll see a 🔔 note and a `⬆`
 next to the version. To upgrade:
 
@@ -270,6 +275,8 @@ Double-click **`Create Desktop Shortcut.cmd`** to drop a **Claude Overlay** shor
 | Switch model | click the **statusline** (`model ▾`) |
 | Zoom text in / out | **Ctrl +** / **Ctrl −** (or **Ctrl + mouse-wheel**); **Ctrl 0** resets |
 | New conversation | **Clear** |
+| Copy a reply | click **⧉ Copy** under the message |
+| Name this overlay | click the title (**Claude**) — handy with several open |
 | Collapse to a Claude orb | **–**, or double-click the title bar |
 | Expand from the orb | click the orb (drag it to move) |
 | Quit | **✕** |
@@ -290,6 +297,15 @@ All settings are constants at the top of `claude_overlay.py`:
   Use `"acceptEdits"`, `"default"`, or `"plan"` to add confirmation / read-only.
 - `WORKING_DIR` — folder Claude operates in (default: your home directory).
 - `THEME` — `"light"` (warm paper) or `"dark"`.
+- `TASKBAR_BUTTON` — `True` (default) gives the frameless window a real, clickable
+  Windows taskbar button; `False` for the pure no-taskbar floating overlay.
+- `SKILLS` — which Agent SDK skills to expose: `"all"`, a list of names, or `None`.
+- `STRICT_MCP_CONFIG` — `True` (default) keeps the overlay lean by **not** inheriting
+  the MCP servers from your `~/.claude` config; set `False` to expose them here
+  (handier, but their tool schemas cost a lot of context).
+- `SHOT_FORMAT` / `SHOT_JPEG_QUALITY` (or the `CLAUDE_OVERLAY_SHOT_FORMAT` /
+  `CLAUDE_OVERLAY_SHOT_JPEG_QUALITY` env vars) — screenshot payload: `"auto"` keeps
+  the smaller of PNG/JPEG per capture; `"png"`/`"jpeg"` force one; JPEG quality 50–95.
 - `AUTO_SCREENSHOT_DEFAULT`, `FONT_SANS/SERIF/MONO`, `CORNER_RADIUS`, `ORB_SIZE`,
   `HIDE_SCREENSHOT_TOOL`, `WINDOW_ALPHA` — see inline comments.
 
