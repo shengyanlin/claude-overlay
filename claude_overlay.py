@@ -81,7 +81,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.7.2"
+__version__ = "1.8.0"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -187,6 +187,8 @@ MAX_CHAT_CHARS = 350_000    # also cap by characters — one giant whitespace-fr
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
 TOOL_IDLE_TIMEOUT = 1800    # once a tool call is in flight, allow a much longer silent gap
                             # (a long build/test can legitimately stream nothing for minutes)
+COMPACT_IDLE_TIMEOUT = 600  # /compact is one big summarization round-trip that streams nothing
+                            # for a while (≈30s even on a small context); bound it generously
 MAX_PASTE_SOURCES = 8       # cap how many files one paste fans out into
 MAX_PENDING_IMAGES = 16     # cap total queued attachments (a hostile clipboard can't pile up)
 MAX_PASTE_PIXELS = 32_000_000   # reject a pasted image above this pixel count BEFORE decode/
@@ -460,6 +462,7 @@ class ClaudeWorker(threading.Thread):
     def ask(self, text: str, image_paths=None):
         self.req.put(("ask", (text, list(image_paths or []))))
     def reset(self):                  self.req.put(("reset", None))
+    def compact(self):                self.req.put(("compact", None))
     def shutdown(self):
         self._running = False
         # If the worker is currently AWAITING a lifecycle call (connect/disconnect), the
@@ -614,6 +617,8 @@ class ClaudeWorker(threading.Thread):
                     self.ui.put(("reset_done", None))
                 elif kind == "ask":
                     await self._run_turn(payload)
+                elif kind == "compact":
+                    await self._run_compact()
                 elif kind == "set_model":
                     if self._client is None:
                         self.ui.put(("error", "Not connected to Claude yet — can't switch model."))
@@ -804,6 +809,105 @@ class ClaudeWorker(threading.Thread):
                 self._loop.create_task(self._emit_usage())
             except Exception:
                 pass
+
+    async def _run_compact(self):
+        """Compact the conversation by sending the CLI's `/compact` command. Compaction
+        streams only system/user messages (status → compact_boundary → the re-injected
+        summary → an empty result) — no assistant answer — so we DON'T render the stream as
+        chat. We just signal start/finish to the UI (which animates a CLI-style spinner) and
+        capture the compact_boundary's pre/post token counts for the result line."""
+        if self._client is None:        # not connected yet — try once
+            await self._open()
+        if self._client is None:
+            self.ui.put(("compact_done",
+                         {"status": "error", "meta": None,
+                          "detail": "not connected (check `claude --version`)"}))
+            return
+        self.ui.put(("compacting", None))   # → UI starts the animation
+        agen = None
+        meta = None
+        status = "ok"
+        detail = None
+        result_signal = None                # the CLI's own compact_result flag, if it sends one
+        try:
+            await asyncio.wait_for(self._client.query("/compact"), QUERY_TIMEOUT)
+            agen = self._client.receive_response()
+            while True:
+                try:
+                    msg = await asyncio.wait_for(agen.__anext__(), COMPACT_IDLE_TIMEOUT)
+                except StopAsyncIteration:
+                    break
+                info = self._compact_meta(msg)
+                if info is not None:
+                    meta = info
+                sig = self._compact_result_signal(msg)
+                if sig is not None:
+                    result_signal = sig
+            # The stream finished cleanly — but "no exception" is NOT "it compacted". Confirm it:
+            # trust the CLI's compact_result=="success" flag, OR a compact_boundary that shows the
+            # context actually shrank (post < pre). Otherwise report "unconfirmed" rather than
+            # claiming success (e.g. the CLI declined / nothing to compact / a silent internal fail).
+            shrank = bool(meta and meta.get("pre_tokens") and meta.get("post_tokens")
+                          and meta["post_tokens"] < meta["pre_tokens"])
+            if result_signal == "success" or shrank:
+                status = "ok"
+            else:
+                status = "unconfirmed"
+                detail = (f"CLI reported compact_result={result_signal!r}"
+                          if result_signal is not None
+                          else "no success signal or token reduction seen")
+        except asyncio.CancelledError:
+            status = "cancelled"        # Stop / Clear interrupted it — conversation unchanged
+        except (asyncio.TimeoutError, TimeoutError):
+            status = "timeout"
+            await self._reconnect()
+        except BaseException as e:
+            status = "error"
+            detail = f"{type(e).__name__}: {e}"
+            if isinstance(e, (CLIJSONDecodeError, CLIConnectionError, ProcessError, ClaudeSDKError)):
+                await self._reconnect()
+        finally:
+            if agen is not None:
+                aclose = getattr(agen, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await asyncio.wait_for(aclose(), DISCONNECT_TIMEOUT)
+                    except BaseException:
+                        pass
+            self.ui.put(("compact_done", {"status": status, "meta": meta, "detail": detail}))
+            try:
+                self._loop.create_task(self._emit_usage())
+            except Exception:
+                pass
+
+    @staticmethod
+    def _compact_meta(msg):
+        """Pull {pre_tokens, post_tokens, duration_ms, trigger} from a compact_boundary
+        system message (the authoritative before/after sizes), else None. Identified by
+        class name so this doesn't depend on importing the SDK's message types."""
+        if type(msg).__name__ != "SystemMessage":
+            return None
+        if getattr(msg, "subtype", None) != "compact_boundary":
+            return None
+        data = getattr(msg, "data", None)
+        md = data.get("compact_metadata") if isinstance(data, dict) else None
+        if not isinstance(md, dict):
+            return None
+        return {"pre_tokens": md.get("pre_tokens"), "post_tokens": md.get("post_tokens"),
+                "duration_ms": md.get("duration_ms"), "trigger": md.get("trigger")}
+
+    @staticmethod
+    def _compact_result_signal(msg):
+        """The CLI's own success flag: a status system message carries
+        `compact_result: "success"` (or an error string) once compaction settles.
+        Returns that value, or None for messages that don't carry it."""
+        if type(msg).__name__ != "SystemMessage":
+            return None
+        data = getattr(msg, "data", None)
+        if not isinstance(data, dict):
+            return None
+        cr = data.get("compact_result")
+        return cr if cr else None
 
     def _build_query(self, text: str, image_paths: list):
         """Return the prompt for client.query(). With inline images we yield a
@@ -1033,6 +1137,15 @@ class Overlay:
                                           # clipped collapsed window; None → plain orb sprite/ellipse
         self._task_done_badge = False     # show a "stage complete" badge on the collapsed orb after
                                           # a reply finishes while collapsed; cleared on expand/new turn
+        # /compact: a context-summarization pass driven by sending the CLI's `/compact` command.
+        # While it runs we animate a one-line banner in the chat (mirrors the CLI's compaction
+        # spinner) — REAL Text content rewritten in place, so it wraps + zooms — then rewrite
+        # that same line as the result.
+        self._compacting = False
+        self._compact_line = False        # True while the animated/result line exists in the chat
+        self._compact_anim_after = None   # pending animation timer id
+        self._compact_t0 = 0.0            # monotonic start (for the elapsed-seconds counter)
+        self._compact_frame = 0
 
         self._build()
         self._register_hotkey()
@@ -1625,6 +1738,7 @@ class Overlay:
         self.toggle_screen.bind("<Button-1>", lambda e: self.toggle_auto())
         self._paint_screen_toggle()
         self._chip(st, "Snap", self.snap_now)
+        self._chip(st, "Compact", self.compact_now)
         self._chip(st, "Clear", self.reset)
         self.attach_lbl = tk.Label(st, text="", bg=T["bg"], fg=T["accent"],
                                    font=self.f_small, cursor="hand2")
@@ -3508,6 +3622,33 @@ class Overlay:
         self._refresh_statusline()
         self.worker.reset()
         self._set_status("resetting…")
+        # Chat was just wiped — drop the compaction banner/timer so a stray result line
+        # can't land in the fresh conversation (the worker's interrupt above ends the turn).
+        if self._compacting:
+            self._compacting = False
+            self.busy = False
+            self._refresh_send()
+            if self._compact_anim_after is not None:
+                try:
+                    self.root.after_cancel(self._compact_anim_after)
+                except Exception:
+                    pass
+                self._compact_anim_after = None
+            self._compact_line = False
+            try:
+                self.chat.mark_unset("compact_ln")   # chat was wiped; drop the dangling mark
+            except Exception:
+                pass
+
+    def compact_now(self):
+        """Summarize the conversation so far to free up context (the CLI's /compact)."""
+        if self._compacting:
+            return
+        if self.busy:
+            self.add_sys("⏳ Finish (or Stop) the current reply before compacting.")
+            return
+        self.worker.compact()
+        self._set_status("compacting…")   # instant feedback; the animation starts on ("compacting")
 
     def toggle_collapse(self):
         if self.expanded:
@@ -3617,6 +3758,116 @@ class Overlay:
         ver = f"v{__version__}" + ("  ⬆" if self._update_available else "")
         self.statusline.configure(
             text=f"{self._model or 'Claude'} ▾   ·   context {p}   ·   {ver}", fg=T["muted"])
+
+    # ── compaction animation (mirrors the Claude Code CLI's /compact spinner) ──
+    def _start_compact_anim(self):
+        """Animate a one-line banner in the chat and pulse it until compaction finishes,
+        then rewrite that same line as the result. It's REAL Text content (not an embedded
+        widget), so it word-wraps with the window width and zooms with Ctrl +/−. The line is
+        rewritten in place via the left-gravity mark `compact_ln`."""
+        self._compacting = True
+        self.busy = True                  # send button → Stop, so the user can cancel compaction
+        self._refresh_send()
+        self._md_finalize()               # seal any prior streamed line before the banner
+        # dedicated wrapping tag for the live animation line (recoloured each frame to pulse)
+        self.chat.tag_configure("compact", foreground=T["accent"], font=self.f_chip,
+                                lmargin1=self.px(18), lmargin2=self.px(18), rmargin=self.px(14),
+                                spacing1=self.px(6), spacing3=self.px(4))
+        at_bottom = self.chat.yview()[1] > 0.999
+        self.chat.insert("end", "\n")
+        start = self.chat.index("end-1c")           # start of our (about-to-be-written) line
+        self.chat.insert("end", " \n", "compact")
+        self.chat.mark_set("compact_ln", start)
+        self.chat.mark_gravity("compact_ln", "left")  # stays at the line start across rewrites
+        self._compact_line = True
+        self._compact_t0 = time.monotonic()
+        self._compact_frame = 0
+        self._set_status("compacting…")
+        if at_bottom:
+            self.chat.see("end")
+        self._compact_tick()
+
+    def _compact_tick(self):
+        if not self._compacting or not self._compact_line:
+            return
+        frames = "✶✷✸✹✺✹✸✷"             # a sparkle that pulses (same ✦/✻ family as the rest of the UI)
+        i = self._compact_frame
+        spark = frames[i % len(frames)]
+        dots = "." * (i % 4)
+        el = int(time.monotonic() - self._compact_t0)
+        try:
+            self.chat.delete("compact_ln", "compact_ln lineend")
+            self.chat.insert("compact_ln", f"{spark}  Compacting conversation{dots}   ({el}s)",
+                             "compact")
+            self.chat.tag_configure(
+                "compact", foreground=(T["accent"] if (i // 2) % 2 == 0 else T["accent_hi"]))
+        except tk.TclError:
+            return                        # line/mark gone (chat cleared) → stop quietly
+        self._compact_frame = i + 1
+        self._compact_anim_after = self.root.after(110, self._compact_tick)
+
+    def _stop_compact_anim(self, payload):
+        self._compacting = False
+        self.busy = False
+        self._refresh_send()
+        if self._compact_anim_after is not None:
+            try:
+                self.root.after_cancel(self._compact_anim_after)
+            except Exception:
+                pass
+            self._compact_anim_after = None
+        if isinstance(payload, dict):
+            status = payload.get("status", "ok")
+            meta = payload.get("meta")
+            detail = payload.get("detail")
+        else:
+            status, meta, detail = "ok", payload, None
+        if status == "ok":
+            final = self._format_compact_result(meta)
+        elif status == "unconfirmed":
+            final = "⚠ Compaction finished, but success couldn't be confirmed — context may be unchanged."
+            if detail:
+                final += f"  ({detail})"
+        elif status == "cancelled":
+            final = "⏹ Compaction stopped — conversation unchanged."
+        elif status == "timeout":
+            final = "⚠ Compaction timed out — conversation unchanged."
+        else:
+            final = "⚠ Compaction failed — conversation unchanged."
+            if detail:
+                final += f"  ({detail})"
+        # Retag the result with a PERMANENT style tag (not the mutated "compact" tag) so a later
+        # compaction recolouring "compact" can't repaint this finished line. ok → faint "sys"
+        # line; everything else → "err". Both wrap + zoom like every other chat line.
+        tag = "sys" if status in ("ok", "cancelled") else "err"
+        active = self._compact_line
+        self._compact_line = False
+        self._set_status("")
+        if active:
+            try:
+                self.chat.delete("compact_ln", "compact_ln lineend")
+                self.chat.insert("compact_ln", final, tag)   # animation line → result line, in place
+                self.chat.mark_unset("compact_ln")
+                self._refresh_statusline()
+                return
+            except tk.TclError:
+                pass
+        # the banner line is gone (a Clear wiped the chat mid-compaction): a cancelled run needs
+        # no trailing line (reset prints "new conversation"); other outcomes still report.
+        if status != "cancelled":
+            self.add_sys(final)
+        self._refresh_statusline()
+
+    def _format_compact_result(self, meta):
+        if isinstance(meta, dict) and meta.get("pre_tokens") and meta.get("post_tokens"):
+            try:
+                pre, post = int(meta["pre_tokens"]), int(meta["post_tokens"])
+                saved = (1 - post / pre) * 100 if pre else 0
+                return (f"✦ Compacted — {pre:,} → {post:,} tokens "
+                        f"(saved {saved:.0f}%). History summarized; keep going.")
+            except Exception:
+                pass
+        return "✦ Compacted — conversation history summarized; keep going."
 
     def _model_menu(self, e):
         m = tk.Menu(self.root, tearoff=0, bg=T["field"], fg=T["text"],
@@ -3755,6 +4006,10 @@ class Overlay:
             self._finish_turn_copy()     # then a Copy button under the reply
             self._set_busy(False)
             self._maybe_flag_done()      # badge the orb if this finished while collapsed
+        elif kind == "compacting":
+            self._start_compact_anim()
+        elif kind == "compact_done":
+            self._stop_compact_anim(payload)
         elif kind == "error":
             self.add_err(str(payload))
             self._set_busy(False)

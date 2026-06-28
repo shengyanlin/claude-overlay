@@ -3,6 +3,18 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.8.0] — 2026-06-29
+
+### Added
+- **Compact the conversation to free up context — with a live animation.** A new **Compact** button
+  in the status bar (next to Snap/Clear) summarizes the conversation so far and drops the older
+  turns, so a long session stops eating into your context window — the same thing the Claude Code
+  CLI's `/compact` does. While it runs, the chat shows an animated line (a pulsing ✦ sparkle,
+  "Compacting conversation…", and an elapsed timer) that then turns into a one-line result reporting
+  how much was reclaimed — e.g. *"✦ Compacted — 43,196 → 4,970 tokens (saved 88%)."* Your earlier
+  context is **summarized, not lost**, so you can keep going. You can **Stop** it mid-run, and if the
+  result can't be confirmed it says so rather than claiming success.
+
 ## [1.7.2] — 2026-06-28
 
 ### Changed
@@ -505,6 +517,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.8.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.8.0
 [1.7.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.7.2
 [1.7.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.7.1
 [1.7.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.7.0

@@ -275,6 +275,7 @@ Double-click **`Create Desktop Shortcut.cmd`** to drop a **Claude Overlay** shor
 | Switch model | click the **statusline** (`model ▾`) |
 | Zoom text in / out | **Ctrl +** / **Ctrl −** (or **Ctrl + mouse-wheel**); **Ctrl 0** resets |
 | New conversation | **Clear** |
+| Compact the conversation (free up context) | **Compact** — summarizes older turns, keeps going |
 | Copy a reply | click **⧉ Copy** under the message |
 | Name this overlay | click the title (**Claude**) — handy with several open |
 | Collapse to a Claude orb | **–**, or double-click the title bar |
