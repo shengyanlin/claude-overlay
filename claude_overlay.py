@@ -39,6 +39,14 @@ os.environ["PATH"] = os.pathsep.join(filter(None, [
     os.environ.get("PATH", ""),
 ]))
 
+def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
+    try:
+        val = int(os.environ.get(name, ""))
+    except Exception:
+        return default
+    return max(min_value, min(max_value, val))
+
+
 # Spawn the `claude` CLI subprocess with no console window. Without this, running
 # under pythonw (no console) makes Windows pop a CMD window for the console-mode CLI.
 # Best-effort: if a future anyio drops/renames open_process, degrade gracefully
@@ -141,6 +149,10 @@ FONT_MONO = ["Consolas", "Cascadia Mono", "Courier New"]
 SHOT_DIR = Path(os.environ.get("TEMP", str(Path.home()))) / "claude_overlay_shots"
 KEEP_SHOTS = 24                  # retain a few captures worth (one file per monitor)
 SHOT_MAX_EDGE = 1568             # downscale captures to this long edge before sending.
+SHOT_FORMAT = os.environ.get("CLAUDE_OVERLAY_SHOT_FORMAT", "auto").strip().lower()
+                                 # "auto" saves PNG + JPEG and keeps the smaller payload;
+                                 # "png" preserves old behavior; "jpeg" favors upload speed.
+SHOT_JPEG_QUALITY = _env_int("CLAUDE_OVERLAY_SHOT_JPEG_QUALITY", 82, 50, 95)
                                  # Claude downsamples larger images internally anyway, so
                                  # bigger files only cost upload time + vision tokens.
 IMAGE_INPUT = "inline"           # "inline" → attach screenshots as base64 image blocks
@@ -644,7 +656,12 @@ class ClaudeWorker(threading.Thread):
             finally:
                 self._lifecycle_task = None
             self.ui.put(("ready", None))
-            await self._emit_usage()
+            # Context usage is informative only; do not block the first queued prompt on
+            # an extra CLI round-trip during startup/reconnect.
+            try:
+                self._loop.create_task(self._emit_usage())
+            except Exception:
+                pass
         except BaseException as e:   # incl. CancelledError — _open must never propagate
             self._client = None
             if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
@@ -1756,11 +1773,12 @@ class Overlay:
 
     def _badge_geom(self, x_off=0):
         """(centre_x, centre_y, radius) of the done-badge, relative to a collapsed-window origin
-        with the orb's left edge at x_off (0 when drawing on the orb canvas itself). Tucked at the
-        orb's top-right and sized to fit inside the s x s orb box."""
+        with the orb's left edge at x_off (0 when drawing on the orb canvas itself). Tucked high in
+        the orb's top-right corner so it sits on the sprite's body but clears its eyes; sized to fit
+        inside the s x s orb box (centre_y >= radius keeps the top from clipping the window edge)."""
         s = self.orb_size
         br = max(self.px(5), int(s * 0.15))
-        return x_off + int(s * 0.78), int(s * 0.22), br
+        return x_off + int(s * 0.78), int(s * 0.16), br
 
     def _draw_orb_badge(self):
         """A small green check at the orb's top-right — signals the last reply finished while the
@@ -3337,6 +3355,52 @@ class Overlay:
                      "Look at the attached image(s)/screen(s) and tell me what's there / what I might want help with.")
         return "\n\n".join(parts)
 
+    def _save_shot(self, img, stem: Path) -> Path:
+        """Save a captured screen with the smallest practical inline payload."""
+        fmt = SHOT_FORMAT if SHOT_FORMAT in {"auto", "png", "jpeg", "jpg"} else "auto"
+
+        def save_png() -> Path:
+            p = stem.with_suffix(".png")
+            img.save(p)
+            return p
+
+        def save_jpeg() -> Path:
+            p = stem.with_suffix(".jpg")
+            rgb = img.convert("RGB") if img.mode != "RGB" else img
+            rgb.save(p, format="JPEG", quality=SHOT_JPEG_QUALITY,
+                     optimize=False, progressive=False, subsampling=1)
+            return p
+
+        if fmt == "png":
+            return save_png()
+        if fmt in {"jpeg", "jpg"}:
+            return save_jpeg()
+
+        png_path = jpg_path = None
+        try:
+            png_path = save_png()
+        except Exception:
+            png_path = None
+        try:
+            jpg_path = save_jpeg()
+        except Exception:
+            jpg_path = None
+        if png_path is None and jpg_path is None:
+            raise OSError("could not save screenshot")
+        if png_path is None:
+            return jpg_path
+        if jpg_path is None:
+            return png_path
+        if jpg_path.stat().st_size < png_path.stat().st_size:
+            keep, drop = jpg_path, png_path
+        else:
+            keep, drop = png_path, jpg_path
+        try:
+            drop.unlink()
+        except Exception:
+            pass
+        return keep
+
     def _grab_shots(self, mons):
         """Pure capture: one screenshot per monitor → downscale → save. Touches NO Tk, so
         it is safe to run on a background thread (used by the precapture path). Returns
@@ -3350,8 +3414,7 @@ class Overlay:
                     img = ImageGrab.grab(bbox=bbox, all_screens=True) if bbox else ImageGrab.grab()
                     if SHOT_MAX_EDGE and max(img.size) > SHOT_MAX_EDGE:
                         img.thumbnail((SHOT_MAX_EDGE, SHOT_MAX_EDGE), Image.LANCZOS)
-                    p = SHOT_DIR / f"shot_{ts}_m{i}.png"
-                    img.save(p)
+                    p = self._save_shot(img, SHOT_DIR / f"shot_{ts}_m{i}")
                     shots.append({"path": str(p), "primary": m["primary"], "index": i})
                 except Exception as ex:
                     err = ex
@@ -3408,7 +3471,7 @@ class Overlay:
         # making paste silently fall back to the original path.
         try:
             files = []
-            for p in SHOT_DIR.glob("shot_*.png"):
+            for p in list(SHOT_DIR.glob("shot_*.png")) + list(SHOT_DIR.glob("shot_*.jpg")):
                 try:
                     files.append((p.stat().st_mtime, p))
                 except Exception:
