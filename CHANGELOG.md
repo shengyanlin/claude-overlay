@@ -3,6 +3,15 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.7.2] — 2026-06-28
+
+### Changed
+- **The collapsed "task done" badge now sticks around until you follow up.** Previously the green ✓
+  cleared as soon as you expanded the overlay, so expanding to read the reply and then re-collapsing
+  lost it. It now means *"the last turn finished — awaiting your next message"*: it appears when a
+  reply completes, **persists across expand/collapse**, and only clears when you send the next
+  message (or clear the chat). It still shows only while collapsed.
+
 ## [1.7.1] — 2026-06-27
 
 ### Added
@@ -496,6 +505,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.7.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.7.2
 [1.7.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.7.1
 [1.7.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.7.0
 [1.6.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.6.0

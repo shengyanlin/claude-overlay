@@ -73,7 +73,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.7.1"
+__version__ = "1.7.2"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -2498,9 +2498,12 @@ class Overlay:
             self.root.after(10, self._apply_region)
 
     def _maybe_flag_done(self):
-        """A reply just finished — if we're collapsed and it actually produced text, badge the orb
-        so the user knows a result is waiting behind the icon."""
-        if not self.expanded and (self._turn_raw or "").strip():
+        """A reply just finished — flag the orb as 'done' if it actually produced text. The badge
+        means "last turn complete, awaiting your next message": it PERSISTS across expand/collapse
+        and is only cleared when the next turn starts (add_user) or the chat is reset. It's shown
+        only while collapsed; setting it while expanded just records the state so the next collapse
+        shows it."""
+        if (self._turn_raw or "").strip():
             self._set_task_badge(True)
 
     # ── chat rendering (main thread only) ──
@@ -3432,6 +3435,7 @@ class Overlay:
         self._zoomables = []             # all embedded canvases were just destroyed with the text
         self._turn_raw = ""              # drop the assistant-answer buffer + its Copy-button guard
         self._turn_copy_added = False
+        self._set_task_badge(False)      # fresh conversation → drop any "task done" badge
         self._claude_header = False
         self._thinking_active = False    # don't carry a half-open thinking block into the new turn
         # Clear the shown % immediately so the OLD conversation's usage can't linger while the
@@ -3476,7 +3480,8 @@ class Overlay:
             self._rebuild_collapsed_mask()    # silhouette = sprite [+ name] [+ badge]
         else:
             self._collapsed_mask = None
-            self._task_done_badge = False     # expanding = user is now looking → clear the badge
+            # Do NOT clear the done-badge on expand: it must survive expand→collapse and only go
+            # away when the next turn starts (add_user) or on reset. Re-collapsing redraws it.
             self.orb.place_forget()
             self.orb_name.place_forget()
             self.root.minsize(self.px(330), self.px(300))
