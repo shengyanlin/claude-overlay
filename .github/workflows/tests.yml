@@ -6,6 +6,7 @@ name: tests
 
 on:
   push:
+    branches: [main]   # PR branches are covered by pull_request; avoids a double run per PR push
   pull_request:
 
 permissions:

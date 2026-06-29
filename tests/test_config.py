@@ -79,10 +79,18 @@ class TestEnvBool:
         monkeypatch.delenv(self._NAME, raising=False)
         assert config._env_bool(self._NAME, False) is False
 
-    @pytest.mark.parametrize("falsy", ["0", "false", "FALSE", "no", "off", ""])
+    @pytest.mark.parametrize("falsy", ["0", "false", "FALSE", "no", "off"])
     def test_falsy_strings_return_false(self, monkeypatch, falsy):
         monkeypatch.setenv(self._NAME, falsy)
         assert config._env_bool(self._NAME, True) is False
+
+    @pytest.mark.parametrize("blank", ["", " ", "   ", "\t"])
+    def test_blank_value_returns_default(self, monkeypatch, blank):
+        # set-but-blank (empty / whitespace-only) is treated as unset -> keep the
+        # default, so a stray space in an env var can't silently flip the flag.
+        monkeypatch.setenv(self._NAME, blank)
+        assert config._env_bool(self._NAME, True) is True
+        assert config._env_bool(self._NAME, False) is False
 
     def test_whitespace_zero_returns_false(self, monkeypatch):
         monkeypatch.setenv(self._NAME, "  0  ")

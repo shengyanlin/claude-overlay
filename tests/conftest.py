@@ -63,9 +63,12 @@ def _overlay_singleton():
     mp.setattr(co.Overlay, "_check_for_update", lambda self: None)
     try:
         ov = co.Overlay()
-    except tk.TclError as e:
+    except Exception as e:
+        # Headless / odd CI: skip the whole UI suite cleanly instead of erroring it.
+        # (Catch broadly: tk.Tk() raises TclError without a display, but _build also
+        # makes Win32/ctypes calls that could raise something else on a bare runner.)
         mp.undo()
-        pytest.skip(f"Tk unavailable (no display?): {e}")
+        pytest.skip(f"Overlay/Tk unavailable (no display?): {type(e).__name__}: {e}")
     ov.root.withdraw()
     ov.root.update_idletasks()
     try:
@@ -81,6 +84,17 @@ def _overlay_singleton():
 def _clean_overlay(ov):
     """Return the shared Overlay to a known baseline before each test."""
     import claude_overlay as co
+    # Cancel any after() timers a prior test may have scheduled (zoom re-render, region
+    # re-apply, compaction animation, precapture) so none fires mid-next-test.
+    for _attr in ("_rezoom_after", "_round_after", "_compact_anim_after",
+                  "_precapture_after"):
+        _tid = getattr(ov, _attr, None)
+        if _tid is not None:
+            try:
+                ov.root.after_cancel(_tid)
+            except Exception:
+                pass
+            setattr(ov, _attr, None)
     try:
         if not ov.expanded:
             ov.toggle_collapse()        # back to expanded
@@ -94,16 +108,26 @@ def _clean_overlay(ov):
         ov._set_zoom(1.0)               # back to 100%
     except Exception:
         pass
+    # View / per-turn state reset() doesn't cover:
     ov.auto_shot = co.AUTO_SCREENSHOT_DEFAULT
     ov.share_visible = co.SHOW_IN_SCREEN_SHARE_DEFAULT
     ov.overlay_name = ""
-    ov.busy = False
     ov._model = None
     ov._ctx_pct = None
     ov.pending_images = []
     ov.pending_shot = None
+    ov._precaptured = None
+    ov._capture_busy = False
+    ov._paste_busy = False
+    ov._send_hover = False
+    ov._thinking_active = False
     try:
-        ov._refresh_send()
+        ov._set_busy(False)             # busy flag + Send button image + busy_lbl text, together
+    except Exception:
+        pass
+    try:                                # empty input showing the placeholder (clears _ph_active drift)
+        ov.entry.delete("1.0", "end")
+        ov._ph_in()
     except Exception:
         pass
     try:

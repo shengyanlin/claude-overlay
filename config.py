@@ -19,12 +19,16 @@ def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
 
 def _env_bool(name: str, default: bool) -> bool:
     """Read a boolean from the environment so a machine can override a committed
-    default WITHOUT editing source (used by STRICT_MCP_CONFIG below). Unset -> default;
-    "0"/"false"/"no"/"off"/"" -> False; anything else -> True."""
+    default WITHOUT editing source (used by STRICT_MCP_CONFIG below). Unset OR blank
+    (empty / whitespace-only) -> default, so a stray space can't silently flip the
+    flag; "0"/"false"/"no"/"off" (any case) -> False; anything else -> True."""
     v = os.environ.get(name)
     if v is None:
         return default
-    return v.strip().lower() not in ("0", "false", "no", "off", "")
+    v = v.strip().lower()
+    if v == "":
+        return default
+    return v not in ("0", "false", "no", "off")
 
 WORKING_DIR = str(Path.home())
 # NOTE: the Agent SDK's model=None does NOT follow the CLI's interactive default
