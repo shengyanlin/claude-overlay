@@ -81,7 +81,7 @@ except Exception:  # pragma: no cover
     class CLIJSONDecodeError(ClaudeSDKError): ...
     class ProcessError(ClaudeSDKError): ...
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 # ───────────────────────────── configuration ──────────────────────────────
 WORKING_DIR = str(Path.home())
@@ -110,6 +110,12 @@ SKILLS = "all"                    # which Agent SDK skills to enable in the over
                                   # but NOT MCP servers (STRICT_MCP_CONFIG still blocks those).
                                   # None → skills off entirely.
 AUTO_SCREENSHOT_DEFAULT = True
+SHOW_IN_SCREEN_SHARE_DEFAULT = False  # False (default) = the overlay is excluded from screen
+                                  # captures at the OS/DWM level (WDA_EXCLUDEFROMCAPTURE): it
+                                  # stays visible to YOU but is omitted from Teams/Zoom/Meet/OBS
+                                  # screen shares, PrintScreen, and our own screenshots — private.
+                                  # True = the overlay shows up in screen shares. Flip it live via
+                                  # the status-bar "shareable" toggle; no restart needed.
 HIDE_SCREENSHOT_TOOL = True       # hide the noisy "⚙ Read …shot_*.png" lines every turn
 HOTKEY = "ctrl+alt+space"
 THEME = "light"                  # "light" (Claude paper) or "dark" (warm dark)
@@ -415,6 +421,9 @@ CF_TEXT, CF_UNICODETEXT = 1, 13   # so a text copy (which many apps ALSO put a b
 # screenshots we send Claude never contain the overlay obscuring the content — and
 # we no longer have to withdraw() + sleep() on every capture. Verified on this
 # machine (returns the content behind the window, not black).
+# WDA_NONE clears the affinity again → the window becomes capturable (shows up in
+# Teams/Zoom/OBS screen shares); the "shareable" status-bar toggle flips between them.
+WDA_NONE = 0x00
 WDA_EXCLUDEFROMCAPTURE = 0x11
 
 
@@ -1087,6 +1096,7 @@ class Overlay:
         self.worker.start()
 
         self.auto_shot = AUTO_SCREENSHOT_DEFAULT
+        self.share_visible = SHOW_IN_SCREEN_SHARE_DEFAULT   # True → overlay shows in screen shares
         self.pending_shot = None
         self.pending_images: list = []
         self._precaptured = None        # (shots, monotonic_ts) grabbed while typing
@@ -1222,7 +1232,7 @@ class Overlay:
         self.root.bind("<Map>", self._on_map, add="+")   # restore (incl. from taskbar) re-asserts the frameless look
         self.root.bind("<FocusIn>", self._on_focus_in, add="+")  # taskbar-click / alt-tab activation → raise above topmost peers
         self.root.after(170, self._apply_region)
-        self.root.after(180, self._exclude_from_capture)
+        self.root.after(180, self._apply_share_visibility)
         self.root.after(220, self._install_taskbar_button)
         self.root.after(1200, self._check_for_update)
         self._start_hang_watchdog()    # diagnostic: dumps all-thread stacks if the UI pump stalls
@@ -1294,15 +1304,26 @@ class Overlay:
                 pass
         threading.Thread(target=work, daemon=True).start()
 
-    def _exclude_from_capture(self):
-        """Ask DWM to omit the overlay from screen captures so our own window never
-        appears in the screenshots we send Claude. If it succeeds, capture() can skip
-        the withdraw()+sleep() dance entirely (no flicker, no UI freeze)."""
+    def _apply_share_visibility(self):
+        """Apply the current screen-share visibility to the window's DWM display affinity.
+        share_visible=False (default) → WDA_EXCLUDEFROMCAPTURE: the overlay is omitted from
+        ALL screen captures (Teams/Zoom/OBS share, PrintScreen, our own screenshots) while
+        staying visible to the user — and capture() can then skip the withdraw()+sleep()
+        dance (no flicker, no UI freeze). share_visible=True → WDA_NONE: the overlay shows up
+        in screen shares again, and capture() falls back to a brief withdraw during its own
+        grabs so Claude's screenshots still never contain the overlay. The affinity is bound
+        to the HWND and persists across show/hide (verified: the +180ms exclusion survives the
+        +220ms taskbar withdraw→deiconify), so this only needs re-applying when the toggle flips."""
         try:
             self.root.update_idletasks()
             hwnd = _user32.GetAncestor(self.root.winfo_id(), 2) or self.root.winfo_id()
-            if _user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE):
-                self._capture_excluded = True
+            want_excluded = not self.share_visible
+            affinity = WDA_EXCLUDEFROMCAPTURE if want_excluded else WDA_NONE
+            ok = bool(_user32.SetWindowDisplayAffinity(hwnd, affinity))
+            # Only claim exclusion when we asked for it AND the call succeeded. If anything
+            # failed, treat the window as capturable so capture() still hides it via withdraw()
+            # — never leak the overlay into the screenshots we send Claude.
+            self._capture_excluded = want_excluded and ok
         except Exception:
             self._capture_excluded = False
 
@@ -1737,7 +1758,10 @@ class Overlay:
         self.toggle_screen.pack(side="left", padx=(self.px(16), self.px(2)), pady=pad)
         self.toggle_screen.bind("<Button-1>", lambda e: self.toggle_auto())
         self._paint_screen_toggle()
-        self._chip(st, "Snap", self.snap_now)
+        self.toggle_share = tk.Label(st, bg=T["bg"], font=self.f_small, cursor="hand2")
+        self.toggle_share.pack(side="left", padx=(self.px(8), self.px(2)), pady=pad)
+        self.toggle_share.bind("<Button-1>", lambda e: self.toggle_screen_share())
+        self._paint_share_toggle()
         self._chip(st, "Compact", self.compact_now)
         self._chip(st, "Clear", self.reset)
         self.attach_lbl = tk.Label(st, text="", bg=T["bg"], fg=T["accent"],
@@ -2121,8 +2145,14 @@ class Overlay:
 
     def _paint_screen_toggle(self):
         on = self.auto_shot
-        self.toggle_screen.configure(text=("◉  auto-screenshot" if on else "○  auto-screenshot"),
+        self.toggle_screen.configure(text=("◉  Auto-shot" if on else "○  Auto-shot"),
                                      fg=(T["accent"] if on else T["muted"]))
+
+    def _paint_share_toggle(self):
+        # ON (◉, accent) = the overlay shows up in screen shares; OFF (○, muted) = hidden/private.
+        on = self.share_visible
+        self.toggle_share.configure(text=("◉  Shareable" if on else "○  Shareable"),
+                                    fg=(T["accent"] if on else T["muted"]))
 
     # ── rounded input layout ──
     def _layout_input(self, e=None):
@@ -3601,6 +3631,18 @@ class Overlay:
     def toggle_auto(self):
         self.auto_shot = not self.auto_shot
         self._paint_screen_toggle()
+
+    def toggle_screen_share(self):
+        """Flip whether the overlay is visible in screen shares (Teams/Zoom/OBS). The change
+        is invisible on your OWN screen — the window looks identical either way; it only
+        affects what others see — so confirm it in-chat so you know the toggle took."""
+        self.share_visible = not self.share_visible
+        self._apply_share_visibility()
+        self._paint_share_toggle()
+        if self.share_visible:
+            self.add_sys("📺 Overlay will now appear in screen shares (Teams / Zoom / OBS).")
+        else:
+            self.add_sys("🙈 Overlay hidden from screen shares again — private (only you can see it).")
 
     def reset(self):
         # Interrupt any in-flight turn FIRST. Otherwise the worker is blocked in

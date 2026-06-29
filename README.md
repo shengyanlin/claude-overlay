@@ -47,8 +47,8 @@ so it uses your **existing Claude subscription — no API key, no metered billin
   fix the wording on your open slide, or build a model in your open Excel), not just
   answer questions.
 - 💸 **No API key, no extra cost.** Runs on your existing Claude subscription.
-- 🖼️ **Screenshots *and* pasted images.** Snap a screen on demand, or paste any
-  image with **Ctrl+V** to ask about it.
+- 🖼️ **Screenshots *and* pasted images.** It grabs your screen automatically on every
+  message, or paste any image with **Ctrl+V** to ask about it.
 - ⚡ **Live, polished UI.** Responses stream token-by-token with clean tool-call
   chips, an in-place model switcher, and a context-usage meter.
 - 🎨 **Looks the part, crisp anywhere.** Styled after the Claude desktop app,
@@ -269,9 +269,9 @@ Double-click **`Create Desktop Shortcut.cmd`** to drop a **Claude Overlay** shor
 | Send message | `Enter` (or click the **↑** button) |
 | New line | `Shift+Enter` |
 | Stop a running reply | click **Stop** (the ↑ becomes ■ while busy) |
-| Attach screen to next msg | **Snap** |
 | Paste an image | **Ctrl+V** (click **📎** to clear) |
-| Toggle auto-screenshot | **◉ / ○ auto-screenshot** (orange = on) |
+| Toggle auto-screenshot | **◉ / ○ Auto-shot** (orange = on) |
+| Show / hide in screen shares | **◉ / ○ Shareable** (orange = visible to Teams/Zoom/OBS; off = private, the default) |
 | Switch model | click the **statusline** (`model ▾`) |
 | Zoom text in / out | **Ctrl +** / **Ctrl −** (or **Ctrl + mouse-wheel**); **Ctrl 0** resets |
 | New conversation | **Clear** |

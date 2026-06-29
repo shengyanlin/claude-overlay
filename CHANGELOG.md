@@ -3,6 +3,25 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.9.0] — 2026-06-29
+
+### Added
+- **Show the overlay in screen shares when you want to — a new "Shareable" toggle.** By design the
+  overlay is invisible to screen capture (Teams / Zoom / Meet / OBS screen share, PrintScreen, even
+  its own screenshots), so your private chat with Claude never leaks onto a shared screen — which is
+  also exactly why you couldn't share it on purpose. The new **◉ / ○ Shareable** switch in the status
+  bar lets you flip that per meeting: turn it **on** to make the overlay appear in your screen share
+  (e.g. to demo it, or to reference an answer while presenting), turn it **off** to go private again.
+  Default is **off (private)**, no restart needed, and a one-line confirmation tells you it took —
+  handy because the change is invisible on your *own* screen (the window looks identical either way;
+  only what others see in the share changes). When it's on, screenshots the overlay sends Claude still
+  never contain the overlay itself.
+
+### Changed
+- **Tidier status bar.** Removed the **Snap** button — your screen is already captured automatically
+  on every message — and renamed the **auto-screenshot** toggle to **Auto-shot** so it reads
+  consistently next to the **Compact** and **Clear** buttons.
+
 ## [1.8.0] — 2026-06-29
 
 ### Added
@@ -517,6 +536,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.9.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.9.0
 [1.8.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.8.0
 [1.7.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.7.2
 [1.7.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.7.1
