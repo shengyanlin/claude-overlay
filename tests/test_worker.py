@@ -339,51 +339,39 @@ class TestMsgHasTool:
     def test_stream_event_tool_use_returns_true(self):
         """A StreamEvent with content_block_start / tool_use should return True."""
         from claude_agent_sdk import StreamEvent
-        try:
-            ev = StreamEvent(
-                uuid="test-uuid",
-                session_id="test-session",
-                event={
-                    "type": "content_block_start",
-                    "content_block": {"type": "tool_use"},
-                },
-            )
-            assert ClaudeWorker._msg_has_tool(ev) is True
-        except Exception as e:
-            pytest.xfail(f"Could not construct StreamEvent for positive test: {e}")
+        ev = StreamEvent(
+            uuid="test-uuid",
+            session_id="test-session",
+            event={
+                "type": "content_block_start",
+                "content_block": {"type": "tool_use"},
+            },
+        )
+        assert ClaudeWorker._msg_has_tool(ev) is True
 
     def test_stream_event_text_block_returns_false(self):
         """A StreamEvent with content_block_start / text should return False."""
         from claude_agent_sdk import StreamEvent
-        try:
-            ev = StreamEvent(
-                uuid="test-uuid",
-                session_id="test-session",
-                event={
-                    "type": "content_block_start",
-                    "content_block": {"type": "text"},
-                },
-            )
-            assert ClaudeWorker._msg_has_tool(ev) is False
-        except Exception as e:
-            pytest.xfail(f"Could not construct StreamEvent for negative StreamEvent test: {e}")
+        ev = StreamEvent(
+            uuid="test-uuid",
+            session_id="test-session",
+            event={
+                "type": "content_block_start",
+                "content_block": {"type": "text"},
+            },
+        )
+        assert ClaudeWorker._msg_has_tool(ev) is False
 
     def test_assistant_message_with_tool_use_block_returns_true(self):
         """An AssistantMessage whose content list contains a ToolUseBlock → True."""
         from claude_agent_sdk import AssistantMessage, ToolUseBlock
-        try:
-            tub = ToolUseBlock(id="tid", name="bash", input={"command": "ls"})
-            msg = AssistantMessage(role="assistant", content=[tub])
-            assert ClaudeWorker._msg_has_tool(msg) is True
-        except Exception as e:
-            pytest.xfail(f"Could not construct AssistantMessage with ToolUseBlock: {e}")
+        tub = ToolUseBlock(id="tid", name="bash", input={"command": "ls"})
+        msg = AssistantMessage(content=[tub], model="claude-opus-4-8")
+        assert ClaudeWorker._msg_has_tool(msg) is True
 
     def test_assistant_message_with_text_block_returns_false(self):
-        """An AssistantMessage whose content has only a TextBlock → False."""
+        """An AssistantMessage whose content has only a TextBlock → False (no ToolUseBlock)."""
         from claude_agent_sdk import AssistantMessage, TextBlock
-        try:
-            tb = TextBlock(type="text", text="hello")
-            msg = AssistantMessage(role="assistant", content=[tb])
-            assert ClaudeWorker._msg_has_tool(msg) is False
-        except Exception as e:
-            pytest.xfail(f"Could not construct AssistantMessage with TextBlock: {e}")
+        tb = TextBlock(text="hello")
+        msg = AssistantMessage(content=[tb], model="claude-opus-4-8")
+        assert ClaudeWorker._msg_has_tool(msg) is False
