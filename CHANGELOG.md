@@ -3,6 +3,19 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.10.0] — 2026-07-01
+
+### Changed
+- **The model switcher now always offers the *latest* model of each family — automatically.**
+  The in-app model menu (click the statusline) used to list pinned versions like *"Opus 4.8"*,
+  so a newly released model wouldn't show up until you updated the app. Its entries are now
+  **family aliases** — **Opus**, **Opus (1M)**, **Sonnet**, **Haiku** — which the Claude CLI
+  resolves to the newest model of each family at run time. So when Anthropic ships a new model
+  (say a future Sonnet 5), the overlay picks it up with **no update needed**: click the family
+  and you're on its latest. The statusline still shows the concrete version each alias resolved
+  to (e.g. `claude-opus-4-8`), so you can always see exactly what you're running, and the
+  startup default is likewise the latest Opus.
+
 ## [1.9.0] — 2026-06-29
 
 ### Added

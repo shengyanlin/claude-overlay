@@ -159,8 +159,10 @@ class TestThemes:
 class TestModels:
     """Tests for config.MODEL and config.MODELS."""
 
-    def test_model_is_claude_opus_4_8(self):
-        assert config.MODEL == "claude-opus-4-8"
+    def test_model_is_opus_alias(self):
+        # A family alias, not a pinned version, so new Opus releases are adopted
+        # automatically (no code change). See config.py's MODEL comment.
+        assert config.MODEL == "opus"
 
     def test_models_is_non_empty_list(self):
         assert isinstance(config.MODELS, list)
@@ -176,9 +178,21 @@ class TestModels:
 
     def test_models_contains_1m_variant(self):
         ids = [model_id for _, model_id in config.MODELS]
-        assert "claude-opus-4-8[1m]" in ids, (
-            f"Expected 'claude-opus-4-8[1m]' in MODELS ids, got: {ids}"
+        assert "opus[1m]" in ids, (
+            f"Expected 'opus[1m]' in MODELS ids, got: {ids}"
         )
+
+    def test_models_use_family_aliases_not_pinned_versions(self):
+        # The whole point of the switcher: every entry tracks the LATEST model of its
+        # family, so no id may hardcode a version (e.g. "claude-opus-4-8") — that would
+        # freeze the overlay on an old model until someone edits this file. Allowed ids
+        # are the bare family aliases opus/sonnet/haiku, optionally with a "[1m]" suffix.
+        for _, model_id in config.MODELS:
+            base = model_id.replace("[1m]", "")
+            assert base in ("opus", "sonnet", "haiku"), (
+                f"MODELS id {model_id!r} is not a bare family alias — it won't auto-update "
+                f"to new model releases. Use 'opus'/'sonnet'/'haiku' (optionally '[1m]')."
+            )
 
 
 # ---------------------------------------------------------------------------

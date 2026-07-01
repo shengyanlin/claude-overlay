@@ -290,10 +290,12 @@ Double-click **`Create Desktop Shortcut.cmd`** to drop a **Claude Overlay** shor
 
 All settings are constants at the top of `claude_overlay.py`:
 
-- `MODEL` — defaults to `"claude-opus-4-8"` (Opus 4.8, 200K context). Append the
-  `[1m]` suffix for the 1M-context variant (also one click away in the in-app model
-  switcher). Don't use `None`: the Agent SDK resolves `None` to an older model, not
-  the CLI's interactive default.
+- `MODEL` — defaults to `"opus"`, a **family alias for the latest Opus**, so a future
+  Opus release is adopted automatically. Use `"opus[1m]"` for the 1M-context variant, or
+  `"sonnet"` / `"haiku"` — every alias tracks the newest model of its family, and the
+  in-app switcher lists them all (the statusline shows the concrete version each alias
+  resolved to, e.g. `claude-opus-4-8`). Don't use `None`: the Agent SDK resolves `None`
+  to an older model, not the CLI's interactive default.
 - `PERMISSION_MODE` — `"bypassPermissions"` by default (see security note below).
   Use `"acceptEdits"`, `"default"`, or `"plan"` to add confirmation / read-only.
 - `WORKING_DIR` — folder Claude operates in (default: your home directory).
