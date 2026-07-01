@@ -311,3 +311,32 @@ def test_set_busy_false_clears_busy(overlay):
     overlay._set_busy(True)
     overlay._set_busy(False)
     assert overlay.busy is False
+
+
+# ── _ensure_on_screen: recover from a window stranded off an unplugged monitor ──────────
+
+def test_ensure_on_screen_noop_when_visible(overlay, monkeypatch):
+    """When the window sits on a connected monitor, _ensure_on_screen is a no-op (returns
+    None) — it must never yank a window that's already reachable."""
+    import claude_overlay as co
+    huge = [{"rect": (-10000, -10000, 10000, 10000),
+             "work": (-10000, -10000, 10000, 10000), "primary": True}]
+    monkeypatch.setattr(co, "enumerate_monitors", lambda: huge)
+    assert overlay._ensure_on_screen() is None
+
+
+def test_ensure_on_screen_relocates_stranded_window(overlay, monkeypatch):
+    """With only a far-away monitor connected (simulating the one the window was on being
+    unplugged), _ensure_on_screen moves the window onto that monitor's work area."""
+    import claude_overlay as co
+    before = overlay.root.geometry()
+    try:
+        far = [{"rect": (5000, 5000, 7000, 7000),
+                "work": (5000, 5000, 7000, 6960), "primary": True}]
+        monkeypatch.setattr(co, "enumerate_monitors", lambda: far)
+        moved = overlay._ensure_on_screen()
+        assert moved is not None                 # it decided to relocate
+        nx, ny = moved
+        assert 5000 <= nx <= 7000 and 5000 <= ny <= 6960
+    finally:
+        overlay.root.geometry(before)            # don't leave the shared window off-screen

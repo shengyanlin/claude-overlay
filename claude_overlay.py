@@ -120,6 +120,8 @@ class Overlay:
         self._update_available = None     # set to the newer version string if one exists
         self._mapping = False             # re-entrancy guard for the <Map> taskbar re-assert
         self._fronting = False            # re-entrancy guard for _raise_to_front (focus churn)
+        self._vscreen_sig = None          # last virtual-desktop bounding box (display-topology sig)
+        self._vscreen_checked = 0.0       # throttle the topology watchdog to ~1.5s in _poll
         # Per-overlay custom name (session-only, set by clicking the titlebar "Claude"). Shown
         # in the titlebar + window title when expanded, and as a small pill UNDER the orb when
         # collapsed — so several overlays open at once (one per task) are tellable apart at a
@@ -412,6 +414,8 @@ class Overlay:
         self._fronting = True
         try:
             hwnd = self._hwnd()
+            self._ensure_on_screen()   # a raise is z-order only; if the window was stranded off a
+                                       # now-unplugged monitor, first bring it back into view
             self.root.lift()
             _user32.BringWindowToTop(hwnd)
             # re-insert at the top of the topmost band → above other always-on-top windows;
@@ -440,6 +444,43 @@ class Overlay:
                 _user32.AttachThreadInput(cur, me, False)
         except Exception:
             pass
+
+    def _ensure_on_screen(self):
+        """If the window has drifted off EVERY connected monitor — e.g. a secondary monitor it
+        was sitting on got unplugged — move it back onto a visible monitor's work area. Without
+        this, a taskbar-button click / hotkey / restore correctly raises the window's z-order but
+        leaves it at coordinates that no longer exist, so it never appears (the "can't bring it to
+        the front after unplugging a screen" bug). A no-op when the window is already reachable, so
+        it's safe on every bring-to-front path. Move-only geometry (never resizes) → can't trigger
+        a SetWindowRgn size change, so it's clear of the v1.1.9 freeze class. Returns the applied
+        (x, y) when it moved, else None."""
+        try:
+            x, y = self.root.winfo_x(), self.root.winfo_y()
+            w, h = self.root.winfo_width(), self.root.winfo_height()
+        except Exception:
+            return None
+        if w <= 1 or h <= 1:
+            return None
+        try:
+            mons = enumerate_monitors()
+        except Exception:
+            return None
+        move = compute_onscreen_move((x, y, w, h), mons,
+                                     min_vis_w=self.px(48), min_vis_h=self.px(32))
+        if move is None:
+            return None
+        nx, ny = move
+        try:
+            self.root.geometry(f"+{nx}+{ny}")   # move-only; keeps size, so no region churn
+        except Exception:
+            return None
+        if DEBUG_LOG:
+            try:
+                dbg("onscreen", "stranded window pulled back: (%d,%d %dx%d)->(%d,%d)"
+                    % (x, y, w, h, nx, ny))
+            except Exception:
+                pass
+        return (nx, ny)
 
     def _on_focus_in(self, e):
         """The OS activated our top-level window — a taskbar-button click while we're visible-
@@ -2722,9 +2763,10 @@ class Overlay:
             self.chat_wrap.pack(fill="both", expand=True, side="top")
             self._show_edges()
             if hasattr(self, "_geo_before"):
-                self.root.geometry(self._geo_before)
+                self.root.geometry(self._geo_before)   # may be a now-unplugged monitor's coords
             self.expanded = True
         self.root.after(30, self._apply_region)
+        self.root.after(35, self._ensure_on_screen)   # keep the restored geometry on a live monitor
 
     # ── visibility (hotkey) ──
     def _register_hotkey(self):
@@ -2938,6 +2980,20 @@ class Overlay:
         # guarantees the next tick; per-message guarding keeps one bad render from
         # dropping the rest of the queue.
         self._last_pump = time.monotonic()    # hang-watchdog heartbeat (see _start_hang_watchdog)
+        # Display-topology watchdog: if a monitor was just plugged/unplugged (the virtual-desktop
+        # box changed), the frameless window may have been stranded off-screen — pull it back so it
+        # comes forward on its own, without waiting for a taskbar click. Cheap (4 GetSystemMetrics)
+        # and throttled to ~1.5s, so it's off the streaming/scroll path (no v1.1.9-class cost).
+        if self._last_pump - self._vscreen_checked > 1.5:
+            self._vscreen_checked = self._last_pump
+            try:
+                sig = virtual_screen_metrics()
+                if sig is not None:
+                    if self._vscreen_sig is not None and sig != self._vscreen_sig:
+                        self._ensure_on_screen()
+                    self._vscreen_sig = sig
+            except Exception:
+                pass
         if DEBUG_LOG and (self._last_pump - getattr(self, "_pump_logged", 0.0)) > 10.0:
             self._pump_logged = self._last_pump
             try:

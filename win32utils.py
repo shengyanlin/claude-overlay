@@ -90,6 +90,13 @@ _user32.AttachThreadInput.argtypes = [wt.DWORD, wt.DWORD, wt.BOOL]
 _user32.AttachThreadInput.restype = wt.BOOL
 _user32.IsClipboardFormatAvailable.argtypes = [ctypes.c_uint]
 _user32.IsClipboardFormatAvailable.restype = ctypes.c_int
+# Virtual-desktop bounding box — used as a cheap display-topology change signature (the box
+# changes when a monitor is plugged/unplugged or a resolution changes), so we can detect that
+# the frameless (overrideredirect) window may have been stranded off-screen and pull it back.
+_user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+_user32.GetSystemMetrics.restype = ctypes.c_int
+SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN   = 76, 77
+SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
 # Standard clipboard format ids — used for a cheap, non-blocking "is there an image?" probe
 # on the UI thread, so we only spin up the (potentially slow) ImageGrab.grabclipboard() read
 # on a background thread when there's actually image/file content.
@@ -112,15 +119,18 @@ class _MONITORINFO(ctypes.Structure):
                 ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
 
 def enumerate_monitors():
-    """Return [{'rect': (l, t, r, b), 'primary': bool}, ...], primary first."""
+    """Return [{'rect': (l,t,r,b), 'work': (l,t,r,b), 'primary': bool}, ...], primary first.
+    'rect' is the full monitor; 'work' is the work area (excludes the taskbar) — used to place
+    a stranded window somewhere clickable rather than under the taskbar."""
     mons = []
 
     def _cb(hmon, hdc, lprc, lparam):
         mi = _MONITORINFO()
         mi.cbSize = ctypes.sizeof(_MONITORINFO)
         if _user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
-            r = mi.rcMonitor
+            r, wk = mi.rcMonitor, mi.rcWork
             mons.append({"rect": (r.left, r.top, r.right, r.bottom),
+                         "work": (wk.left, wk.top, wk.right, wk.bottom),
                          "primary": bool(mi.dwFlags & 1)})   # MONITORINFOF_PRIMARY
         return 1
 
@@ -131,3 +141,73 @@ def enumerate_monitors():
         pass
     mons.sort(key=lambda m: (not m["primary"], m["rect"][0], m["rect"][1]))  # primary, then L→R
     return mons
+
+
+def virtual_screen_metrics():
+    """(x, y, w, h) bounding box of the whole virtual desktop (all monitors combined), or None.
+    Cheap (4 GetSystemMetrics calls) so it's usable as a per-poll display-topology signature:
+    the box changes when a monitor is plugged/unplugged or a resolution changes."""
+    try:
+        g = _user32.GetSystemMetrics
+        return (g(SM_XVIRTUALSCREEN), g(SM_YVIRTUALSCREEN),
+                g(SM_CXVIRTUALSCREEN), g(SM_CYVIRTUALSCREEN))
+    except Exception:
+        return None
+
+
+def _mon_rect(m):
+    """The usable rectangle of a monitor dict: prefer the work area, fall back to the full rect."""
+    return m.get("work") or m.get("rect")
+
+
+def _visible_extent(win, rect):
+    """Visible (w, h) of the overlap of window win=(x,y,w,h) with a monitor rect=(l,t,r,b)."""
+    x, y, w, h = win
+    iw = min(x + w, rect[2]) - max(x, rect[0])
+    ih = min(y + h, rect[3]) - max(y, rect[1])
+    return max(0, iw), max(0, ih)
+
+
+def _clamp_into(x, y, w, h, rect):
+    """Slide a (w, h) window so it sits fully inside monitor rect=(l,t,r,b); top-left wins if the
+    window is larger than the monitor."""
+    l, t, r, b = rect
+    if x + w > r:
+        x = r - w
+    if y + h > b:
+        y = b - h
+    return max(x, l), max(y, t)
+
+
+def compute_onscreen_move(win, monitors, min_vis_w=48, min_vis_h=32):
+    """Decide whether a window has drifted off EVERY connected monitor and, if so, where to
+    move its top-left back to (keeping its size).
+
+    win       -- (x, y, w, h) window rectangle, in virtual-desktop pixels.
+    monitors  -- an enumerate_monitors()-style list (each entry's 'work' rect is used when
+                 present, else 'rect'; a falsy rect is ignored).
+    Returns (nx, ny) when the window must move, or None when it's still reachable — i.e. at
+    least min_vis_w x min_vis_h of it shows on some monitor. The threshold means a window the
+    user deliberately parked slightly off an edge is left alone; only a fully-stranded window
+    (e.g. it was on a monitor that got unplugged) is pulled back, onto the monitor whose centre
+    is nearest the window's centre.
+
+    Pure geometry — no Win32 calls — so it's unit-testable off Windows."""
+    x, y, w, h = win
+    if w <= 0 or h <= 0:
+        return None
+    rects = [r for r in (_mon_rect(m) for m in (monitors or [])) if r]
+    if not rects:
+        return None
+    need_w, need_h = min(min_vis_w, w), min(min_vis_h, h)
+    for rect in rects:
+        vw, vh = _visible_extent(win, rect)
+        if vw >= need_w and vh >= need_h:
+            return None                       # still reachable on this monitor → leave it
+    cx, cy = x + w / 2.0, y + h / 2.0         # off every monitor → clamp onto the nearest one
+    best, best_d = None, None
+    for rect in rects:
+        d = ((rect[0] + rect[2]) / 2.0 - cx) ** 2 + ((rect[1] + rect[3]) / 2.0 - cy) ** 2
+        if best_d is None or d < best_d:
+            best, best_d = rect, d
+    return _clamp_into(x, y, w, h, best)

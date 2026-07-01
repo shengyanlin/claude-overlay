@@ -3,6 +3,21 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.10.1] — 2026-07-01
+
+### Fixed
+- **Unplugging a monitor could leave the overlay impossible to bring to the front.** If the
+  overlay was sitting on a screen that then got disconnected (or you changed your display
+  layout), its position could end up outside every remaining monitor — so it was there, but
+  drawn where you couldn't see it. Clicking its taskbar button, Alt-Tabbing to it, or pressing
+  the hotkey correctly *activated* it but only ever changed its stacking order, never its
+  position, so it stayed stranded off-screen and never appeared. The overlay now makes sure it's
+  on a connected monitor whenever you summon it (taskbar click / Alt-Tab / restore / hotkey /
+  expand), and also notices a display change on its own (a monitor plugged or unplugged, a
+  resolution change) and pulls itself back onto a visible screen — placed within the monitor's
+  work area, so it never lands under the taskbar. A window you've deliberately parked slightly
+  off an edge is left alone; only a fully off-screen window is moved.
+
 ## [1.10.0] — 2026-07-01
 
 ### Changed
@@ -549,6 +564,8 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.10.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.1
+[1.10.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.0
 [1.9.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.9.0
 [1.8.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.8.0
 [1.7.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.7.2
