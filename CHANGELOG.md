@@ -3,6 +3,23 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.10.2] — 2026-07-02
+
+### Fixed
+- **The overlay was quietly running one Opus version behind (statusline showed 4.7, not 4.8).**
+  v1.10.0 switched the model config to family aliases (`opus`) so the overlay would always run
+  the *latest* model with no updates — but it turns out the CLI, when driven the way the overlay
+  drives it (the Agent SDK's streaming transport), resolves a bare alias to a **version-behind**
+  model: `opus` came back as `claude-opus-4-7` even though the same CLI in one-shot mode — and
+  Claude Code itself — resolve `opus` to `claude-opus-4-8`. So "always latest via alias" silently
+  gave you last-generation-latest. The overlay now resolves the family alias to the concrete
+  latest id at startup (by asking the CLI's honest resolution path) before it connects, and does
+  the same when you switch models from the statusline menu — so you actually get 4.8. The alias
+  stays in the config (auto-update on new releases is preserved), and the lookup is cached per CLI
+  version, so it costs at most one quick probe after a CLI upgrade and nothing on normal launches.
+  If the probe can't run (offline, not logged in), it falls back to the old behaviour rather than
+  failing to start.
+
 ## [1.10.1] — 2026-07-01
 
 ### Fixed
@@ -564,6 +581,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.10.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.2
 [1.10.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.1
 [1.10.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.0
 [1.9.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.9.0

@@ -309,10 +309,21 @@ class TestMakeOptions:
         assert opts is not None
 
     def test_has_model_attribute(self):
+        # A fresh worker defaults _resolved_model to config.MODEL (the alias), so before any
+        # startup resolution runs the options carry the alias — unchanged old behaviour.
         w = make_worker()
+        assert w._resolved_model == config.MODEL
         opts = w._make_options()
         assert hasattr(opts, "model")
         assert opts.model == config.MODEL
+
+    def test_make_options_uses_resolved_model(self):
+        # Once run() has resolved the alias to a concrete id, _make_options must pass THAT
+        # id to the SDK (the streaming-alias-lag fix) — not the raw alias.
+        w = make_worker()
+        w._resolved_model = "claude-opus-4-8"
+        opts = w._make_options()
+        assert opts.model == "claude-opus-4-8"
 
     def test_has_cwd_attribute(self):
         w = make_worker()

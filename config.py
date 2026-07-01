@@ -6,7 +6,7 @@ so anything may import it without a circular-import risk."""
 import os
 from pathlib import Path
 
-__version__ = "1.10.1"
+__version__ = "1.10.2"
 
 def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     try:
@@ -36,10 +36,17 @@ WORKING_DIR = str(Path.home())
 # (e.g. a future Sonnet 5), it's picked up automatically with NO code change. The CLI
 # documents these as "an alias for the latest model" (`claude --help`, see --model), and
 # the "[1m]" 1M-context suffix composes with the alias too ("opus[1m]" → the latest Opus
-# at 1M context — verified via the CLI's JSON modelUsage). Don't use model=None: the
-# Agent SDK resolves None to an OLDER model (SDK 0.2.87 → opus-4-7), not the CLI default,
-# so we always pass an explicit alias. The statusline shows the concrete version each
-# alias resolved to (e.g. "claude-opus-4-8"), so you can always see what you're on.
+# at 1M context). Don't use model=None: the Agent SDK resolves None to an OLDER model
+# (SDK 0.2.87 → opus-4-7), not the CLI default, so we always pass an explicit alias.
+# CAVEAT (measured 2026-07, CLI 2.1.156 / SDK 0.2.87): over the SDK's *streaming*
+# transport — which is exactly how the overlay talks to the CLI — the CLI resolves a bare
+# alias to a VERSION-BEHIND model (streaming "opus" → 4-7) even though its one-shot `-p`
+# mode resolves the same alias to the latest (4-8). So we keep the alias HERE (to preserve
+# auto-update on new releases) but the worker resolves it to the concrete latest id at
+# startup via modelresolve.resolve_model (which probes the CLI's honest `-p` path once and
+# caches the result, re-probing only when the CLI itself changes). The statusline shows the
+# concrete version each alias resolved to
+# (e.g. "claude-opus-4-8"), so you can always see what you're on.
 MODEL = "opus"   # startup default: the latest Opus family
 MODELS = [("Opus", "opus"), ("Opus (1M)", "opus[1m]"),
           ("Sonnet", "sonnet"), ("Haiku", "haiku")]  # click the statusline to switch

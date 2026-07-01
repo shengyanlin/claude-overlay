@@ -58,6 +58,7 @@ except Exception:  # pragma: no cover
 
 from config import *
 from debuglog import dbg, DEBUG_LOG, _UIQueueTap, _dbg_stream_last, _dbg_think_last
+from modelresolve import resolve_model
 
 class ClaudeWorker(threading.Thread):
     def __init__(self, ui_queue: "queue.Queue"):
@@ -71,6 +72,10 @@ class ClaudeWorker(threading.Thread):
         self._running = True
         self._saw_stream = False
         self._lifecycle_task = None   # the in-flight connect()/disconnect() task, if any
+        # Concrete id the family alias (config.MODEL) resolves to. Resolved once in run()
+        # before the event loop starts; defaults to the raw alias so nothing breaks if
+        # resolution is skipped or fails. See modelresolve for WHY (streaming alias lag).
+        self._resolved_model = MODEL
 
     def ask(self, text: str, image_paths=None):
         self.req.put(("ask", (text, list(image_paths or []))))
@@ -121,7 +126,18 @@ class ClaudeWorker(threading.Thread):
 
     async def _do_set_model(self, client, model):
         try:
-            await client.set_model(model)
+            # Switching also goes through the streaming transport, which lags the alias the
+            # same way startup does — so resolve the alias to a concrete id here too. Run it
+            # in a thread (resolve_model shells out to the CLI) so a cache-miss probe can't
+            # block the event loop; fall back to the raw alias on any failure.
+            resolved = model
+            try:
+                resolved = await self._loop.run_in_executor(None, resolve_model, model)
+                if not (isinstance(resolved, str) and resolved):
+                    resolved = model
+            except Exception:
+                resolved = model
+            await client.set_model(resolved)
             await self._emit_usage()
             self.ui.put(("status", ""))   # clear the "switching model…" notice
         except Exception as e:
@@ -140,7 +156,7 @@ class ClaudeWorker(threading.Thread):
 
     def _make_options(self) -> ClaudeAgentOptions:
         opts = dict(
-            permission_mode=PERMISSION_MODE, cwd=WORKING_DIR, model=MODEL,
+            permission_mode=PERMISSION_MODE, cwd=WORKING_DIR, model=self._resolved_model,
             can_use_tool=self._allow_tool,
             include_partial_messages=True,
             # exclude_dynamic_sections strips the per-turn-changing bits (cwd, git
@@ -184,6 +200,24 @@ class ClaudeWorker(threading.Thread):
         # dies), bring it back so the overlay self-heals instead of becoming a zombie
         # window that never answers again.
         dbg("worker_start")
+        # Resolve the family alias (e.g. "opus") to a concrete id ONCE, here in the worker
+        # thread before the event loop spins up — the streaming transport otherwise runs a
+        # version-behind model (see modelresolve). A cache hit / any failure is ~instant; only
+        # a cache miss (first launch, or after a CLI upgrade) blocks this thread — not the UI —
+        # for one short probe turn (~15s). The status note is set+cleared around it, so it's
+        # invisible on the fast path but explains the rare wait. Guarded so resolution can
+        # never stop the worker from starting; on failure we keep the raw alias.
+        self.ui.put(("status", "finding latest model…"))
+        try:
+            resolved = resolve_model(MODEL)
+            if isinstance(resolved, str) and resolved:
+                self._resolved_model = resolved
+            if self._resolved_model != MODEL:
+                dbg("model_resolved", {"alias": MODEL, "id": self._resolved_model})
+        except Exception as e:
+            dbg("model_resolve_err", f"{type(e).__name__}: {e}")
+        finally:
+            self.ui.put(("status", ""))
         attempts = 0
         last_start = 0.0
         while self._running and attempts < 5:
