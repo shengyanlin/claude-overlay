@@ -3,6 +3,20 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.10.3] — 2026-07-02
+
+### Fixed
+- **The overlay no longer freezes when Claude wants to ask you a multiple-choice question.**
+  Claude Code has an interactive "pick one of these options" question tool (AskUserQuestion). In
+  the full CLI it pops up a little chooser; in this overlay there's no such chooser to answer it,
+  so when Claude reached for that tool the turn just hung — stuck "thinking…" for up to half an
+  hour before it gave up. (A recent CLI update made Claude start using that tool where older
+  versions didn't, which is why it began happening.) Now the overlay tells Claude that tool isn't
+  available here, so instead of stalling it simply **asks its question inline as normal text** —
+  and you answer by typing your reply, the way any other message works. Belt-and-suspenders: the
+  tool is both removed up front *and* refused at run time, so a question can never hang the window
+  again.
+
 ## [1.10.2] — 2026-07-02
 
 ### Fixed
@@ -581,6 +595,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.10.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.3
 [1.10.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.2
 [1.10.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.1
 [1.10.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.0

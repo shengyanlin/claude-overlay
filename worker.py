@@ -44,6 +44,13 @@ from claude_agent_sdk import (  # noqa: E402
     ClaudeSDKClient, ClaudeAgentOptions, AssistantMessage, TextBlock,
     ToolUseBlock, ResultMessage, StreamEvent, PermissionResultAllow,
 )
+# Deny result for the AskUserQuestion run-time guard (see _allow_tool). Imported
+# defensively: an older SDK may lack it, in which case the guard degrades to allowing the
+# tool (disallowed_tools still removes it from the schema, so it can't be called anyway).
+try:
+    from claude_agent_sdk import PermissionResultDeny  # noqa: E402
+except Exception:  # pragma: no cover
+    PermissionResultDeny = None
 # Error types used to decide when the transport is broken and we should reconnect.
 # Imported defensively: older/newer SDKs may not export all of them.
 try:
@@ -144,7 +151,19 @@ class ClaudeWorker(threading.Thread):
             self.ui.put(("error", f"set_model failed: {type(e).__name__}: {e}"))
 
     async def _allow_tool(self, tool_name, input_data, context):
-        # Auto-approve every tool. permission_mode="bypassPermissions" already does
+        # Run-time guard for interactive tools this GUI can't service. AskUserQuestion
+        # blocks the turn waiting for an answer a no-TTY overlay can't supply — it should
+        # already be gone via disallowed_tools (_make_options), but if it ever leaks back
+        # in (a skill, a future CLI that ignores that list) DENY it here so the turn can't
+        # hang for TOOL_IDLE_TIMEOUT (30 min). The deny message nudges the model to ask its
+        # question inline as plain text instead, which the chat renders and the user answers
+        # by typing. Falls through to allow if the SDK lacks PermissionResultDeny (then
+        # disallowed_tools is the sole line of defence — still enough to stop the call).
+        if tool_name in DISALLOWED_TOOLS and PermissionResultDeny is not None:
+            return PermissionResultDeny(
+                message="This overlay has no interactive question UI. Ask the user your "
+                        "question inline as plain text and wait for their typed reply.")
+        # Auto-approve every other tool. permission_mode="bypassPermissions" already does
         # this on most machines, but managed/enterprise installs can DISABLE bypass
         # mode (managed-settings.json: disableBypassPermissionsMode), which makes the
         # CLI fall back to "default" and emit a permission prompt. The overlay is a
@@ -166,6 +185,11 @@ class ClaudeWorker(threading.Thread):
                            "append": SYSTEM_APPEND, "exclude_dynamic_sections": True},
         )
         opts["max_buffer_size"] = MAX_BUFFER_SIZE
+        if DISALLOWED_TOOLS:
+            # Remove interactive tools the overlay can't service (AskUserQuestion) from the
+            # tool schema entirely, so the model can't call them and hang the turn — it asks
+            # inline as text instead. See config.DISALLOWED_TOOLS + _allow_tool's guard.
+            opts["disallowed_tools"] = list(DISALLOWED_TOOLS)
         if SKILLS is not None:
             # Enable Agent SDK skills (e.g. the slide-check skill). The SDK only injects the
             # Skill tool + sets setting_sources=["user","project"] when this is provided; left
@@ -183,7 +207,7 @@ class ClaudeWorker(threading.Thread):
         # SDKs. Strip any the installed SDK rejects, one at a time, so an older install still
         # loads (with reduced features) instead of failing to construct options at all.
         droppable = ["strict_mcp_config", "max_buffer_size", "can_use_tool",
-                     "include_partial_messages", "skills"]
+                     "include_partial_messages", "skills", "disallowed_tools"]
         while True:
             try:
                 return ClaudeAgentOptions(**opts)

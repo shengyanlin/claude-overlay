@@ -6,7 +6,7 @@ so anything may import it without a circular-import risk."""
 import os
 from pathlib import Path
 
-__version__ = "1.10.2"
+__version__ = "1.10.3"
 
 def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     try:
@@ -51,6 +51,17 @@ MODEL = "opus"   # startup default: the latest Opus family
 MODELS = [("Opus", "opus"), ("Opus (1M)", "opus[1m]"),
           ("Sonnet", "sonnet"), ("Haiku", "haiku")]  # click the statusline to switch
 PERMISSION_MODE = "bypassPermissions"
+# Tools the overlay must NEVER let the model call, because they need an interactive UI
+# this app can't provide. AskUserQuestion (Claude Code's structured multiple-choice
+# question tool) is the one that bites: when the model calls it, the CLI blocks waiting
+# for an answer that a GUI-with-no-TTY has no way to supply — so the turn hangs until the
+# 30-min TOOL_IDLE_TIMEOUT fires (the "overlay froze on a question" bug). Disallowing it
+# removes it from the tool schema entirely, so the model can't call it and instead asks
+# its question inline as plain text — which the chat renders and you just type a reply to
+# (the behaviour the overlay had before a CLI update started actively invoking the tool).
+# Belt-and-suspenders: worker._allow_tool also DENIES it at run time, so even if it ever
+# leaks back in (a skill, a future CLI that ignores this list) the turn can't hang.
+DISALLOWED_TOOLS = ["AskUserQuestion"]
 # Lean by default: do NOT inherit the user's ~/.claude MCP servers. The overlay is a
 # lightweight screen-chat that only needs the core Claude Code tools; inheriting every
 # MCP server the user has configured (Atlassian, Figma, M365, ...) injects their tool
@@ -174,6 +185,10 @@ SYSTEM_APPEND = (
     "Use them to see what the user is looking at, then help. "
     "Keep replies concise and skimmable since they render in a small floating window; "
     "expand only when asked. "
+    "If you need to ask the user something, ask it inline as plain text and wait for "
+    "their typed reply. This overlay is a plain chat with no interactive question UI, so "
+    "never use a structured multiple-choice question tool — such a tool has no way to be "
+    "answered here and would just stall the turn. "
     "When automating Office (PowerPoint/Excel/Word) via PowerShell+COM, optimize for "
     "speed: a NEW PowerShell process runs per tool call and COM state does NOT persist "
     "across calls, and every property access is a slow cross-process round-trip. So: "

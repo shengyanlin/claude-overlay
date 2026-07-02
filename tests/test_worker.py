@@ -331,6 +331,41 @@ class TestMakeOptions:
         assert hasattr(opts, "cwd")
         assert opts.cwd == config.WORKING_DIR
 
+    def test_disallows_ask_user_question(self):
+        # AskUserQuestion must be removed from the tool schema so the model can't call an
+        # interactive question tool the overlay can't answer (which would hang the turn).
+        w = make_worker()
+        opts = w._make_options()
+        assert hasattr(opts, "disallowed_tools")
+        assert "AskUserQuestion" in (opts.disallowed_tools or [])
+
+
+# ---------------------------------------------------------------------------
+# 5b. _allow_tool (permission callback / interactive-tool guard)
+# ---------------------------------------------------------------------------
+
+class TestAllowTool:
+
+    def test_denies_ask_user_question(self):
+        # The run-time guard must refuse AskUserQuestion so a leaked call can't hang the
+        # turn. On an SDK new enough to expose PermissionResultDeny it returns a Deny; on an
+        # older SDK (no Deny type) it degrades to Allow — disallowed_tools is then the sole,
+        # still-sufficient, line of defence.
+        w = make_worker()
+        result = asyncio.run(w._allow_tool("AskUserQuestion", {}, None))
+        from worker import PermissionResultAllow
+        if worker_module.PermissionResultDeny is not None:
+            assert isinstance(result, worker_module.PermissionResultDeny)
+        else:
+            assert isinstance(result, PermissionResultAllow)
+
+    def test_allows_ordinary_tool(self):
+        # Every non-blacklisted tool is still auto-approved (bypass-disabled hosts rely on this).
+        w = make_worker()
+        result = asyncio.run(w._allow_tool("Bash", {"command": "ls"}, None))
+        from worker import PermissionResultAllow
+        assert isinstance(result, PermissionResultAllow)
+
 
 # ---------------------------------------------------------------------------
 # 6. _msg_has_tool
