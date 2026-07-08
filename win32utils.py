@@ -5,8 +5,14 @@ taskbar/app-id settings (one-way: win32utils -> config)."""
 
 import ctypes
 import ctypes.wintypes as wt
+import json
+import os
+import subprocess
+import sys
 
-from config import TASKBAR_BUTTON, APP_ID
+from config import TASKBAR_BUTTON, APP_ID, APP_ICON
+
+_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 def set_dpi_awareness():
     """Make the process DPI-aware so 1 Tk pixel == 1 physical pixel (crisp, no
@@ -29,6 +35,82 @@ def set_app_user_model_id():
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
     except Exception:
         pass
+
+
+def _pythonw_exe():
+    """The interpreter to launch the overlay from a taskbar-pin relaunch. Prefer a
+    windowless pythonw.exe (so the relaunch doesn't flash a console); fall back to the
+    running interpreter. Uses sys.executable so it tracks whatever Python is actually in
+    use, even a moved/reinstalled one."""
+    exe = sys.executable or ""
+    if exe and os.path.basename(exe).lower() == "python.exe":
+        cand = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.exists(cand):
+            return cand
+    return exe
+
+
+def ensure_taskbar_shortcut(script_path, app_id=APP_ID, icon=APP_ICON, name="Claude Overlay"):
+    """Self-heal the Start Menu shortcut Windows needs to pin the overlay to the taskbar
+    like a normal app. The overlay is a frameless pythonw window that declares an explicit
+    AppUserModelID; Windows will only back a taskbar PIN with a Start Menu .lnk whose
+    System.AppUserModel.ID matches that id. With no such shortcut, pinning degrades to the
+    raw pythonw.exe — so the pin won't relaunch the overlay once it's closed, and it shows
+    pythonw's generic icon instead of Clawd. Creating this matching shortcut fixes both.
+
+    Cheap by design: the common path is a couple of file reads (a stored-signature match)
+    and spawns NO subprocess. The one-shot PowerShell builder runs only when the .lnk is
+    missing or its recorded signature changed (first launch, the folder moved via OneDrive,
+    a new interpreter or icon). Windows-only, never raises; returns one of
+    'skipped' / 'ok' / 'created' / 'error' for logging."""
+    if sys.platform != "win32" or not (TASKBAR_BUTTON and app_id):
+        return "skipped"
+    try:
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return "skipped"
+        script_path = os.path.abspath(script_path)
+        repo = os.path.dirname(script_path)
+        target = _pythonw_exe()
+        if not target:
+            return "skipped"
+        icon_abs = ""
+        if icon:
+            ip = icon if os.path.isabs(icon) else os.path.join(repo, icon)
+            if os.path.exists(ip):
+                icon_abs = ip
+        lnk = os.path.join(appdata, "Microsoft", "Windows", "Start Menu",
+                           "Programs", name + ".lnk")
+        # The recorded signature: if the live .lnk still matches this exactly, do nothing.
+        desired = {"v": 1, "lnk": lnk, "target": target, "args": script_path,
+                   "workdir": repo, "icon": icon_abs, "app_id": app_id}
+        state_dir = os.path.join(os.path.expanduser("~"), ".claude-overlay")
+        marker = os.path.join(state_dir, "startmenu_shortcut.json")
+        try:
+            if os.path.exists(lnk) and os.path.exists(marker):
+                with open(marker, "r", encoding="utf-8") as f:
+                    if json.load(f) == desired:
+                        return "ok"
+        except Exception:
+            pass
+        ps1 = os.path.join(repo, "install-startmenu-shortcut.ps1")
+        if not os.path.exists(ps1):
+            return "error"
+        args = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
+                "-Lnk", lnk, "-Target", target, "-Arguments", script_path,
+                "-WorkingDir", repo, "-AppId", app_id]
+        if icon_abs:
+            args += ["-Icon", icon_abs]
+        r = subprocess.run(args, capture_output=True, timeout=60,
+                           creationflags=_CREATE_NO_WINDOW)
+        if r.returncode != 0:
+            return "error"
+        os.makedirs(state_dir, exist_ok=True)
+        with open(marker, "w", encoding="utf-8") as f:
+            json.dump(desired, f)
+        return "created"
+    except Exception:
+        return "error"
 
 # Win32 region calls — set argtypes so 64-bit handles aren't truncated.
 _gdi32, _user32 = ctypes.windll.gdi32, ctypes.windll.user32

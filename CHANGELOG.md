@@ -3,6 +3,23 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.10.4] — 2026-07-08
+
+### Fixed
+- **Pinning the overlay to the taskbar now works like a normal app — the pin relaunches
+  it and keeps the Clawd icon.** Previously, if you pinned the overlay's taskbar button
+  and then closed the app, clicking the pin wouldn't reopen it, and the pinned icon
+  turned into a generic Python icon. Root cause: the overlay declares its own app identity
+  (an AppUserModelID) so the taskbar groups it and shows the Clawd icon — but Windows will
+  only let you *pin* such a window if there's a matching **Start Menu shortcut** carrying
+  the same identity. There wasn't one, so pinning fell back to the bare `pythonw.exe`
+  Python launcher: nothing to relaunch, and Python's own icon. The overlay now
+  **automatically creates that Start Menu shortcut on launch** (pointing at itself, with
+  the Clawd icon and the matching identity), so pinning behaves correctly for everyone with
+  no manual step. It's a one-time thing — the check on every later launch is a cheap no-op,
+  and it quietly re-creates the shortcut if you move the folder. If you already have a
+  broken pin from before, unpin it and pin again after this update.
+
 ## [1.10.3] — 2026-07-02
 
 ### Fixed
@@ -595,6 +612,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.10.4]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.4
 [1.10.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.3
 [1.10.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.2
 [1.10.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.1

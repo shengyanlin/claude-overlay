@@ -3179,9 +3179,24 @@ class Overlay:
         self.root.mainloop()
 
 
+def _selfheal_taskbar_shortcut():
+    """Make sure the Start Menu shortcut (matching AppUserModelID) exists so the overlay
+    pins to the taskbar correctly — relaunches when closed and shows the Clawd icon, not
+    pythonw's. Runs off the UI thread: the common case is a cheap file-read no-op, and only
+    the first launch (or a moved folder) pays a one-time ~1s builder spawn."""
+    try:
+        threading.Thread(
+            target=lambda: dbg("shortcut",
+                               ensure_taskbar_shortcut(os.path.abspath(__file__))),
+            daemon=True).start()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     set_dpi_awareness()
     set_app_user_model_id()   # before any window, so the taskbar uses our icon
+    _selfheal_taskbar_shortcut()
     try:
         Overlay().run()
     except KeyboardInterrupt:

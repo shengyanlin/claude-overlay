@@ -1,6 +1,7 @@
 """Tests for win32utils — the Windows-only ctypes helpers. They call the real Win32
 API, so the module is skipped off Windows, and assertions stay at the level of
 contracts that hold even on a headless CI runner (which may enumerate zero monitors)."""
+import os
 import sys
 
 import pytest
@@ -115,3 +116,96 @@ def test_onscreen_move_barely_visible_strip_counts_as_reachable():
     # is left alone (only a fully-stranded window is pulled back).
     win = (1920 - 120, 100, 420, 620)   # 120px still visible on the primary
     assert win32utils.compute_onscreen_move(win, [_PRIMARY], min_vis_w=48, min_vis_h=32) is None
+
+
+# ── ensure_taskbar_shortcut: the self-heal that makes taskbar pinning work ──
+# (The Start Menu .lnk carrying a matching AppUserModelID is what lets a pin relaunch the
+# overlay when closed and show the Clawd icon, not pythonw's. Tests mock the PowerShell
+# builder + isolate HOME/APPDATA, so they never touch the real Start Menu or spawn a shell.)
+
+def test_pythonw_exe_prefers_windowless(tmp_path, monkeypatch):
+    (tmp_path / "python.exe").write_text("")
+    (tmp_path / "pythonw.exe").write_text("")
+    monkeypatch.setattr(win32utils.sys, "executable", str(tmp_path / "python.exe"))
+    assert win32utils._pythonw_exe() == str(tmp_path / "pythonw.exe")
+
+
+def test_pythonw_exe_falls_back_without_sibling(tmp_path, monkeypatch):
+    (tmp_path / "python.exe").write_text("")   # no pythonw.exe next to it
+    monkeypatch.setattr(win32utils.sys, "executable", str(tmp_path / "python.exe"))
+    assert win32utils._pythonw_exe() == str(tmp_path / "python.exe")
+
+
+class _FakeProc:
+    def __init__(self, rc):
+        self.returncode, self.stdout, self.stderr = rc, b"", b""
+
+
+def _setup_shortcut_env(tmp_path, monkeypatch, rc=0):
+    """Build an isolated fake repo + HOME/APPDATA and stub the PowerShell builder so the
+    builder 'creates' the .lnk on success. Returns (script_path, calls-list)."""
+    home = tmp_path / "home"; home.mkdir()
+    repo = tmp_path / "repo"; repo.mkdir()
+    (repo / "install-startmenu-shortcut.ps1").write_text("stub")
+    (repo / "claude_overlay_2.ico").write_text("ico")
+    script = repo / "claude_overlay.py"; script.write_text("app")
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setattr(win32utils, "TASKBAR_BUTTON", True)
+    calls = []
+
+    def fake_run(args, **kw):
+        calls.append(args)
+        if rc == 0:                                  # emulate the builder writing the .lnk
+            lnk = args[args.index("-Lnk") + 1]
+            os.makedirs(os.path.dirname(lnk), exist_ok=True)
+            open(lnk, "w").close()
+        return _FakeProc(rc)
+
+    monkeypatch.setattr(win32utils.subprocess, "run", fake_run)
+    return str(script), calls
+
+
+def test_ensure_shortcut_creates_then_noops(tmp_path, monkeypatch):
+    script, calls = _setup_shortcut_env(tmp_path, monkeypatch, rc=0)
+    assert win32utils.ensure_taskbar_shortcut(script, app_id="test.app") == "created"
+    assert len(calls) == 1
+    # Second launch: .lnk + marker already match → cheap no-op, NO second spawn.
+    assert win32utils.ensure_taskbar_shortcut(script, app_id="test.app") == "ok"
+    assert len(calls) == 1
+
+
+def test_ensure_shortcut_skipped_without_taskbar_button(tmp_path, monkeypatch):
+    script, calls = _setup_shortcut_env(tmp_path, monkeypatch, rc=0)
+    monkeypatch.setattr(win32utils, "TASKBAR_BUTTON", False)
+    assert win32utils.ensure_taskbar_shortcut(script, app_id="test.app") == "skipped"
+    assert calls == []
+
+
+def test_ensure_shortcut_skipped_without_app_id(tmp_path, monkeypatch):
+    script, calls = _setup_shortcut_env(tmp_path, monkeypatch, rc=0)
+    assert win32utils.ensure_taskbar_shortcut(script, app_id="") == "skipped"
+    assert calls == []
+
+
+def test_ensure_shortcut_error_on_builder_failure(tmp_path, monkeypatch):
+    script, calls = _setup_shortcut_env(tmp_path, monkeypatch, rc=2)
+    # A failed build must NOT write the marker, so the next launch retries.
+    assert win32utils.ensure_taskbar_shortcut(script, app_id="test.app") == "error"
+    assert win32utils.ensure_taskbar_shortcut(script, app_id="test.app") == "error"
+    assert len(calls) == 2
+
+
+def test_ensure_shortcut_error_when_builder_missing(tmp_path, monkeypatch):
+    script, calls = _setup_shortcut_env(tmp_path, monkeypatch, rc=0)
+    os.remove(os.path.join(os.path.dirname(script), "install-startmenu-shortcut.ps1"))
+    assert win32utils.ensure_taskbar_shortcut(script, app_id="test.app") == "error"
+    assert calls == []
+
+
+def test_ensure_shortcut_recreates_when_signature_changes(tmp_path, monkeypatch):
+    script, calls = _setup_shortcut_env(tmp_path, monkeypatch, rc=0)
+    assert win32utils.ensure_taskbar_shortcut(script, app_id="test.app") == "created"
+    # A different AppUserModelID changes the recorded signature → rebuild, not a no-op.
+    assert win32utils.ensure_taskbar_shortcut(script, app_id="other.app") == "created"
+    assert len(calls) == 2
