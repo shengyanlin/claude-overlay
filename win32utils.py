@@ -112,6 +112,29 @@ def ensure_taskbar_shortcut(script_path, app_id=APP_ID, icon=APP_ICON, name="Cla
     except Exception:
         return "error"
 
+def relaunch_overlay(script_path):
+    """Start a FRESH overlay instance (pythonw + the script) that OUTLIVES this process, so the
+    app can restart itself — e.g. after updating the CLI, to pick up the newest models without
+    the user manually reopening. The child is fully detached (its own process group, untied from
+    this process's console) so the caller can then quit() — which ends in os._exit — without
+    taking the new instance down with it. The overlay already supports several instances at once,
+    so a brief overlap during the hand-off is fine. Windows-only meaningful. Returns the child
+    pid, or RAISES so the caller can choose NOT to quit if the relaunch didn't even start."""
+    exe = _pythonw_exe()
+    if not exe:
+        raise RuntimeError("no interpreter to relaunch with")
+    script_path = os.path.abspath(script_path)
+    flags = 0
+    if sys.platform == "win32":
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: cut the child loose from this process's
+        # console/lifetime so closing this window can't cascade to the new one. pythonw is a GUI
+        # binary (no console), so there's no window to suppress.
+        flags = 0x00000008 | 0x00000200
+    p = subprocess.Popen([exe, script_path],
+                         cwd=os.path.dirname(script_path) or None, creationflags=flags)
+    return p.pid
+
+
 # Win32 region calls — set argtypes so 64-bit handles aren't truncated.
 _gdi32, _user32 = ctypes.windll.gdi32, ctypes.windll.user32
 _gdi32.CreateRoundRectRgn.restype = wt.HRGN

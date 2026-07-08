@@ -209,3 +209,35 @@ def test_ensure_shortcut_recreates_when_signature_changes(tmp_path, monkeypatch)
     # A different AppUserModelID changes the recorded signature → rebuild, not a no-op.
     assert win32utils.ensure_taskbar_shortcut(script, app_id="other.app") == "created"
     assert len(calls) == 2
+
+
+# ── relaunch_overlay: spawn a fresh, detached instance so the app can restart itself ──
+
+class _FakePopen:
+    def __init__(self, pid=4321):
+        self.pid = pid
+
+
+def test_relaunch_overlay_spawns_detached_child(tmp_path, monkeypatch):
+    rec = {}
+
+    def fake_popen(args, cwd=None, creationflags=0):
+        rec.update(args=args, cwd=cwd, flags=creationflags)
+        return _FakePopen(4321)
+
+    monkeypatch.setattr(win32utils, "_pythonw_exe", lambda: r"C:\py\pythonw.exe")
+    monkeypatch.setattr(win32utils.subprocess, "Popen", fake_popen)
+    script = str(tmp_path / "claude_overlay.py")
+    assert win32utils.relaunch_overlay(script) == 4321
+    assert rec["args"][0] == r"C:\py\pythonw.exe"
+    assert rec["args"][1].endswith("claude_overlay.py")
+    # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP so quitting this instance can't kill the child.
+    assert rec["flags"] == (0x00000008 | 0x00000200)
+    assert rec["cwd"] == os.path.dirname(os.path.abspath(script))
+
+
+def test_relaunch_overlay_raises_without_interpreter(monkeypatch):
+    # No interpreter → raise (caller must NOT then quit, or the user is left with nothing).
+    monkeypatch.setattr(win32utils, "_pythonw_exe", lambda: "")
+    with pytest.raises(Exception):
+        win32utils.relaunch_overlay("x.py")

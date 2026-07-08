@@ -6,7 +6,7 @@ so anything may import it without a circular-import risk."""
 import os
 from pathlib import Path
 
-__version__ = "1.10.4"
+__version__ = "1.11.0"
 
 def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     try:
@@ -176,6 +176,13 @@ MAX_INLINE_TOTAL_BYTES = 32 * 1024 * 1024   # ... and aggregate bytes (the per-f
                             # doesn't bound many-attachment memory blow-up)
 MAX_UPDATE_BODY = 1 * 1024 * 1024   # cap the update-check response body before json.loads
 MAX_UPDATE_TAGS = 300       # and the number of tags parsed
+CLI_UPDATE_CHECK = _env_bool("CLAUDE_OVERLAY_CLI_UPDATE_CHECK", True)   # on launch, check whether
+                            # the `claude` CLI the overlay drives is behind the latest npm release
+                            # and, if so, show a one-click Update notice in the chat (see
+                            # cliupdate.py). The overlay and the CLI update independently: keeping
+                            # the overlay current never advances the CLI, and an old CLI silently
+                            # runs an older model. Set CLAUDE_OVERLAY_CLI_UPDATE_CHECK=0 to disable
+                            # (e.g. a locked-down box where global npm installs aren't allowed)
 
 SYSTEM_APPEND = (
     "You are running as an always-on-top floating overlay assistant on the user's "

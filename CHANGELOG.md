@@ -3,6 +3,30 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.11.0] — 2026-07-08
+
+### Added
+- **The overlay now tells you when the Claude CLI it runs on is out of date — and updates
+  it in one click.** The overlay is a thin layer over the `claude` command-line tool, and
+  which models you can use is decided by *that tool*, not the overlay. So you could update
+  the overlay to the newest version and still be stuck on an older model, simply because the
+  CLI underneath hadn't been updated (its own auto-updater doesn't run for the npm install
+  the overlay uses, so it can quietly fall many versions behind). Now, on launch, the overlay
+  checks in the background whether your installed CLI is behind the latest release; if it is,
+  it shows a one-line notice with an **Update** button that runs the upgrade for you
+  (`npm install -g @anthropic-ai/claude-code@latest`). Nothing happens silently or without a
+  click, and after it finishes you just restart the overlay to pick up the newest models. The
+  check is best-effort and quiet on any failure (no npm, offline, corporate proxy), and it's
+  throttled to once a day so it costs nothing on normal launches. Turn it off by setting
+  `CLAUDE_OVERLAY_CLI_UPDATE_CHECK=0` (e.g. a locked-down machine where global npm installs
+  aren't allowed). Once the update finishes, the same button turns into **"✓ Updated — click
+  to restart"** — one click relaunches the overlay for you so the new models take effect,
+  no manual close-and-reopen. If the update can't complete because a running Claude process is
+  holding the CLI (Windows won't let an executable be replaced while it's in use — often the
+  overlay's own session, or another open Claude Code window), the button says so in plain
+  language and lets you **click to retry** after closing the other window, instead of showing
+  npm's raw error.
+
 ## [1.10.4] — 2026-07-08
 
 ### Fixed
@@ -612,6 +636,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.11.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.0
 [1.10.4]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.4
 [1.10.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.3
 [1.10.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.2

@@ -118,6 +118,9 @@ class Overlay:
         self._last_cfg_size = None   # last (w,h) we re-applied the window region for
         self._capture_excluded = False   # set once WDA_EXCLUDEFROMCAPTURE is applied
         self._update_available = None     # set to the newer version string if one exists
+        self._cli_update_shown = False    # show the "CLI is out of date" notice at most once/session
+        self._cli_update_btn_ref = None   # the in-chat Update button, so its result can restyle it
+        self._restarting = False          # guard: one self-restart (relaunch + quit) at a time
         self._mapping = False             # re-entrancy guard for the <Map> taskbar re-assert
         self._fronting = False            # re-entrancy guard for _raise_to_front (focus churn)
         self._vscreen_sig = None          # last virtual-desktop bounding box (display-topology sig)
@@ -220,6 +223,7 @@ class Overlay:
         self.root.after(180, self._apply_share_visibility)
         self.root.after(220, self._install_taskbar_button)
         self.root.after(1200, self._check_for_update)
+        self.root.after(1500, self._check_cli_update)
         self._start_hang_watchdog()    # diagnostic: dumps all-thread stacks if the UI pump stalls
 
     def _start_hang_watchdog(self):
@@ -288,6 +292,24 @@ class Overlay:
             except Exception:
                 pass
         threading.Thread(target=work, daemon=True).start()
+
+    def _check_cli_update(self):
+        """Best-effort, background: if the installed `claude` CLI is behind the latest npm
+        release, surface a one-click update notice (see cliupdate.py). The overlay and the CLI
+        update independently — a current overlay still drives whatever CLI is installed, and an
+        old CLI silently runs an older model. Silent on any failure (no npm, offline, corporate
+        proxy) so it never blocks or nags; the check is throttled to once/day inside cliupdate."""
+        if not CLI_UPDATE_CHECK:
+            return
+        def work():
+            try:
+                from cliupdate import check_update
+                info = check_update()
+                if info and info.get("behind"):
+                    self.ui_q.put(("cli_update", info))
+            except Exception:
+                pass
+        threading.Thread(target=work, name="cli-update-check", daemon=True).start()
 
     def _apply_share_visibility(self):
         """Apply the current screen-share visibility to the window's DWM display affinity.
@@ -2374,6 +2396,137 @@ class Overlay:
         self._md_finalize()
         self._ins("\n⚠  " + ("" if text is None else str(text)) + "\n", "err")
 
+    # ── "your CLI is out of date" notice + one-click update (see cliupdate.py) ──────────
+    def _show_cli_update_notice(self, info):
+        """Render the 'CLI is behind' notice + a one-click Update button in the chat. Shown at
+        most once per session (guarded), and only reached when cliupdate found the CLI behind."""
+        if getattr(self, "_cli_update_shown", False) or not isinstance(info, dict):
+            return
+        self._cli_update_shown = True
+        inst, latest = info.get("installed", "?"), info.get("latest", "?")
+        self.add_sys(f"🔔 Your Claude CLI is out of date (v{inst} → v{latest}). The overlay is "
+                     "current, but the CLI it drives isn't — and the newest models need the "
+                     "latest CLI. Update it in one click:")
+        at_bottom = self.chat.yview()[1] > 0.999
+        self.chat.insert("end", "\n")
+        self.chat.window_create("end", window=self._cli_update_btn(latest),
+                                padx=self.px(16), pady=self.px(2))
+        self.chat.insert("end", "\n")
+        if at_bottom:
+            self.chat.see("end")
+        self._prune_chat()
+
+    def _cli_update_btn(self, latest):
+        """One-click 'Update CLI' button embedded in the chat (same embedded-canvas pattern as the
+        Copy button). Click runs `npm install -g @anthropic-ai/claude-code@latest` in a background
+        thread; the button shows 'Updating…' meanwhile and the outcome arrives as a
+        ('cli_update_result', ...) event that restyles it. Forwards the wheel so it can't swallow
+        scrolling (the v1.4.1 embedded-widget trap)."""
+        latest = str(latest)
+        c = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0, cursor="hand2", takefocus=0)
+        c._ustate = "idle"                              # idle | working | done | error
+        st = {"f": None, "w": 0, "h": 0, "rad": 0}      # current-zoom font + box, set by render()
+        labels = {"idle": f"⬆  Update CLI to v{latest}",
+                  "working": "Updating…  (≈1 min)",
+                  "done": "✓  Updated — click to restart",
+                  "error": "⚠  Update failed — click to retry"}
+
+        def draw(hover=False):
+            c.delete("all")
+            state = c._ustate
+            if state in ("idle", "done"):
+                bg = T["accent_hi"] if (hover and state in ("idle", "done")) else T["accent"]
+                fg = T["on_accent"]
+            elif state == "error":                      # clickable (retry) → hover-lit
+                bg, fg = (T["hover"] if hover else T["tool_bg"]), T["err"]
+            else:                                       # working
+                bg, fg = T["tool_bg"], T["muted"]
+            round_rect(c, 1, 1, st["w"] - 1, st["h"] - 1, st["rad"], fill=bg, outline="")
+            c.create_text(st["w"] / 2, st["h"] / 2, text=labels[c._ustate], fill=fg,
+                          font=st["f"], anchor="center")
+
+        def render():
+            f = tkfont.Font(root=self.root, font=self.f_small)   # current zoom
+            c._overlay_fonts = [f]                               # keep a ref so Tk won't GC it
+            pad = self.px(11)
+            widest = max(f.measure(v) for v in labels.values())  # widest state → no reflow
+            st.update(f=f, h=self.px(24), rad=self.px(7), w=pad + widest + pad)
+            c.configure(width=st["w"], height=st["h"])
+            draw()
+
+        def set_state(s):
+            c._ustate = s
+            try:
+                c.configure(cursor="hand2" if s in ("idle", "done", "error") else "arrow")
+                draw()
+            except Exception:
+                pass
+        c._set_ustate = set_state    # let the result handler restyle this exact button
+
+        def on_click(_e):
+            if c._ustate in ("idle", "error"):          # first click, or retry after a failure
+                set_state("working")
+                self._cli_update_btn_ref = c
+                def work():
+                    try:
+                        from cliupdate import run_update
+                        ok, msg = run_update()
+                    except Exception as e:
+                        ok, msg = False, type(e).__name__
+                    self.ui_q.put(("cli_update_result", (bool(ok), str(msg))))
+                threading.Thread(target=work, name="cli-update", daemon=True).start()
+            elif c._ustate == "done":                   # after a successful update → restart now
+                self._restart_overlay()
+            return "break"                              # working → inert
+        c._click = on_click    # a named handle so the routing is directly testable
+
+        render()
+        c.bind("<Enter>", lambda e: draw(hover=True))
+        c.bind("<Leave>", lambda e: draw(hover=False))
+        c.bind("<Button-1>", on_click)
+        c.bind("<MouseWheel>", self._fwd_wheel)          # embedded widget must not swallow scroll
+        self._register_zoomable(c, render)
+        return c
+
+    def _show_cli_update_result(self, payload):
+        """Restyle the Update button to its final state and print a follow-up line: success →
+        'restart to use it'; failure → the reason + the manual npm command as a fallback."""
+        try:
+            ok, msg = payload
+        except Exception:
+            ok, msg = False, str(payload)
+        c = getattr(self, "_cli_update_btn_ref", None)
+        if c is not None:
+            try:
+                c._set_ustate("done" if ok else "error")
+            except Exception:
+                pass
+        if ok:
+            self.add_sys(f"✅ Claude CLI updated to v{msg}. Click the button above to restart the "
+                         "overlay now and load the newest models (or restart it yourself later).")
+        else:
+            self.add_err(f"CLI update didn't complete — {msg}. You can also update from a terminal: "
+                         " npm install -g @anthropic-ai/claude-code@latest")
+
+    def _restart_overlay(self):
+        """Relaunch a fresh overlay instance, then close this one — the 'click to restart' action
+        on the Update button (and reusable for any future restart affordance). Launches the new
+        instance DETACHED (see win32utils.relaunch_overlay) so quitting this one can't take it
+        down, then tears this one down after a short beat so the two barely overlap. If the
+        relaunch can't even start, DON'T quit — leave the user with a working window + a note."""
+        if getattr(self, "_restarting", False):
+            return
+        self._restarting = True
+        try:
+            relaunch_overlay(os.path.abspath(__file__))
+        except Exception as e:
+            self._restarting = False
+            dbg("restart", f"relaunch failed: {type(e).__name__}: {e}")
+            self.add_err("Couldn't relaunch automatically — please close and reopen the overlay.")
+            return
+        self.add_sys("↻ Restarting the overlay…")
+        self.root.after(500, self.quit)
+
     def _format_turn_error(self, payload):
         """Turn the CLI's errored ResultMessage (subtype / result / stop_reason) into a one-line
         reason, so the chat says WHY the turn errored instead of a generic message. The leading ⚠
@@ -3126,6 +3279,10 @@ class Overlay:
             self.add_sys(f"🔔 Update available: v{payload} (you have v{__version__}). "
                          "Close the overlay and run update.cmd (or: git pull) to upgrade.")
             self._refresh_statusline()
+        elif kind == "cli_update":
+            self._show_cli_update_notice(payload)
+        elif kind == "cli_update_result":
+            self._show_cli_update_result(payload)
 
     def _intro(self):
         self._ins("\n✦ Claude\n", "ah")
