@@ -37,6 +37,85 @@ def set_app_user_model_id():
         pass
 
 
+def set_window_app_id(hwnd, app_id=APP_ID):
+    """Pin THIS window's taskbar identity to app_id by writing PKEY_AppUserModel_ID onto the
+    window's shell property store (SHGetPropertyStoreForWindow -> IPropertyStore::SetValue).
+
+    A window-level AppUserModelID OUTRANKS both the process-wide id and the host process's
+    PACKAGE id, so this is what makes the taskbar icon work when the overlay runs under
+    Microsoft Store Python: that interpreter is an MSIX-packaged host, and Windows forces a
+    packaged process's taskbar button to the package identity (pythonw's Python icon),
+    silently ignoring set_app_user_model_id()'s SetCurrentProcessExplicitAppUserModelID and
+    even the window's own Clawd icon. Re-stamping the id on the window itself pulls the button
+    out of the "Python" group and onto our matching Start Menu shortcut, so it shows Clawd.
+
+    Must run BEFORE the taskbar button materializes (Windows binds the button's identity/icon
+    when it's first shown). Windows-only, best-effort via raw COM vtable calls, never raises;
+    returns True only when SetValue reported success."""
+    if sys.platform != "win32" or not (TASKBAR_BUTTON and app_id and hwnd):
+        return False
+    try:
+        HRESULT = ctypes.c_long
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
+                        ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+        def _guid(d1, d2, d3, tail):
+            g = GUID()
+            g.Data1, g.Data2, g.Data3 = d1, d2, d3
+            g.Data4 = (ctypes.c_ubyte * 8)(*tail)
+            return g
+
+        class PROPERTYKEY(ctypes.Structure):
+            _fields_ = [("fmtid", GUID), ("pid", ctypes.c_ulong)]
+
+        # Minimal PROPVARIANT: 8-byte header + one 8-byte union slot (a pointer for the
+        # VT_LPWSTR we store). Matches the size the shortcut builder uses for the same key.
+        class PROPVARIANT(ctypes.Structure):
+            _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort),
+                        ("r2", ctypes.c_ushort), ("r3", ctypes.c_ushort),
+                        ("p", ctypes.c_void_p)]
+
+        iid_ps = _guid(0x886D8EEB, 0x8CF2, 0x4446,
+                       (0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99))
+        pk = PROPERTYKEY()
+        pk.fmtid = _guid(0x9F4C2855, 0x9F79, 0x4B39,   # PKEY_AppUserModel_ID
+                         (0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3))
+        pk.pid = 5
+
+        shell32 = ctypes.windll.shell32
+        shell32.SHGetPropertyStoreForWindow.argtypes = [
+            wt.HWND, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)]
+        shell32.SHGetPropertyStoreForWindow.restype = HRESULT
+        pps = ctypes.c_void_p()
+        if shell32.SHGetPropertyStoreForWindow(wt.HWND(hwnd), ctypes.byref(iid_ps),
+                                               ctypes.byref(pps)) != 0 or not pps:
+            return False
+        # Call SetValue/Commit/Release through the raw IPropertyStore vtable (IUnknown's 3
+        # slots first, then GetCount/GetAt/GetValue, so SetValue=6, Commit=7, Release=2).
+        vtbl = ctypes.cast(pps, ctypes.POINTER(ctypes.c_void_p))[0]
+        slots = ctypes.cast(vtbl, ctypes.POINTER(ctypes.c_void_p))
+        SetValue = ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p,
+                                      ctypes.POINTER(PROPERTYKEY),
+                                      ctypes.POINTER(PROPVARIANT))(slots[6])
+        Commit = ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p)(slots[7])
+        Release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(slots[2])
+        try:
+            s = ctypes.c_wchar_p(app_id)   # kept alive across the call; SetValue copies it
+            pv = PROPVARIANT()
+            pv.vt = 31                     # VT_LPWSTR
+            pv.p = ctypes.cast(s, ctypes.c_void_p)
+            ok = SetValue(pps, ctypes.byref(pk), ctypes.byref(pv)) == 0
+            if ok:
+                Commit(pps)
+            return ok
+        finally:
+            Release(pps)
+    except Exception:
+        return False
+
+
 def _pythonw_exe():
     """The interpreter to launch the overlay from a taskbar-pin relaunch. Prefer a
     windowless pythonw.exe (so the relaunch doesn't flash a console); fall back to the

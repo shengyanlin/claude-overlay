@@ -362,6 +362,14 @@ class Overlay:
             return
         try:
             hwnd = self._hwnd()
+            # Stamp our AppUserModelID onto the window BEFORE the app-window style flip so the
+            # taskbar button is born under our id (and its Clawd shortcut icon) rather than the
+            # host's — this is what makes the icon right under MSIX-packaged hosts like Microsoft
+            # Store Python, where the process-wide id is ignored. Re-stamped on EVERY call (not
+            # one-shot): toggling overrideredirect / a withdraw→deiconify recreates the top-level
+            # HWND, so the id must be re-applied to whatever handle is current. Cheap enough — a
+            # few COM calls, only on show/restore, never on the streaming path.
+            set_window_app_id(hwnd)
             style = _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
             new = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
             if new != style:
