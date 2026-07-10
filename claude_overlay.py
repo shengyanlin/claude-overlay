@@ -362,18 +362,21 @@ class Overlay:
             return
         try:
             hwnd = self._hwnd()
-            # Stamp our AppUserModelID onto the window BEFORE the app-window style flip so the
-            # taskbar button is born under our id (and its Clawd shortcut icon) rather than the
-            # host's — this is what makes the icon right under MSIX-packaged hosts like Microsoft
-            # Store Python, where the process-wide id is ignored. Re-stamped on EVERY call (not
-            # one-shot): toggling overrideredirect / a withdraw→deiconify recreates the top-level
-            # HWND, so the id must be re-applied to whatever handle is current. Cheap enough — a
-            # few COM calls, only on show/restore, never on the streaming path.
-            set_window_app_id(hwnd)
+            # Stamp our full taskbar identity onto the window BEFORE the app-window style flip so
+            # the button is born under our id: PKEY_AppUserModel_ID (fixes MSIX/Store-Python,
+            # where the process-wide id is ignored) PLUS RelaunchCommand + RelaunchIconResource so
+            # a pin made from it stays correct — right icon AND relaunches the overlay — even with
+            # NO Start Menu shortcut (a locked-down box where the shortcut builder is blocked).
+            # Re-stamped on EVERY call: toggling overrideredirect / a withdraw→deiconify recreates
+            # the top-level HWND, so it must be re-applied to whatever handle is current.
+            set_window_app_id(hwnd, script_path=os.path.abspath(__file__))
             style = _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
             new = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
             if new != style:
                 _user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new)
+            # Belt-and-suspenders for the RUNNING button: stamp the Clawd icon straight onto the
+            # window (WM_SETICON) so it's right even when no shortcut / relaunch icon resolves.
+            set_window_icon(hwnd)
         except Exception:
             pass
 

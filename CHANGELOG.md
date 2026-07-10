@@ -3,6 +3,22 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.11.2] — 2026-07-10
+
+### Fixed
+- **The taskbar button now shows the Clawd icon in more of the cases where it used to fall
+  back to the generic Python icon — including on locked-down machines, and after the overlay
+  has been closed.** The earlier taskbar-icon fixes relied on a Start Menu shortcut the
+  overlay creates for itself; on a managed machine where security policy (AppLocker /
+  PowerShell ExecutionPolicy) blocks that shortcut from being created, the icon still fell
+  back to pythonw's — and the closed/pinned icon depended on that shortcut too. The overlay
+  now *also* stamps its identity, a relaunch command, and its icon directly onto the window
+  itself, with no shortcut involved at all, so: a pin made from the running overlay keeps the
+  Clawd icon **and** relaunches the overlay when you click it after closing — even with no
+  Start Menu shortcut; and the running window's button is given the Clawd icon directly. This
+  is all done in-process (no extra files, no PowerShell), so it works on machines where the
+  shortcut approach can't run.
+
 ## [1.11.1] — 2026-07-10
 
 ### Fixed
@@ -649,6 +665,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.11.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.2
 [1.11.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.1
 [1.11.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.0
 [1.10.4]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.4

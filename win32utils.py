@@ -37,22 +37,50 @@ def set_app_user_model_id():
         pass
 
 
-def set_window_app_id(hwnd, app_id=APP_ID):
-    """Pin THIS window's taskbar identity to app_id by writing PKEY_AppUserModel_ID onto the
-    window's shell property store (SHGetPropertyStoreForWindow -> IPropertyStore::SetValue).
+def set_window_app_id(hwnd, app_id=APP_ID, script_path=None, icon=APP_ICON):
+    """Stamp THIS window's taskbar identity onto its shell property store so the taskbar
+    button -- AND a pin created from it -- are correct with NO dependency on a Start Menu
+    shortcut (so it works even on a locked-down box where the PowerShell shortcut builder is
+    blocked by AppLocker / ExecutionPolicy).
 
-    A window-level AppUserModelID OUTRANKS both the process-wide id and the host process's
-    PACKAGE id, so this is what makes the taskbar icon work when the overlay runs under
-    Microsoft Store Python: that interpreter is an MSIX-packaged host, and Windows forces a
-    packaged process's taskbar button to the package identity (pythonw's Python icon),
-    silently ignoring set_app_user_model_id()'s SetCurrentProcessExplicitAppUserModelID and
-    even the window's own Clawd icon. Re-stamping the id on the window itself pulls the button
-    out of the "Python" group and onto our matching Start Menu shortcut, so it shows Clawd.
+    Writes, in one property-store session (SHGetPropertyStoreForWindow -> IPropertyStore):
+      * PKEY_AppUserModel_ID (pid 5) = app_id -- a WINDOW-level id OUTRANKS both the
+        process-wide id AND an MSIX host's package id, which is what fixes Microsoft Store
+        Python (that packaged interpreter otherwise forces the button to pythonw's icon);
+      * PKEY_AppUserModel_RelaunchCommand (pid 2) -- so a pin made from the running window
+        relaunches the overlay after it's closed, and
+      * PKEY_AppUserModel_RelaunchIconResource (pid 3) = "<clawd.ico>,0" -- so that pin shows
+        the Clawd icon. The last two are built from script_path + icon and skipped when
+        script_path is omitted (so the bare AUMID call is unchanged).
 
-    Must run BEFORE the taskbar button materializes (Windows binds the button's identity/icon
-    when it's first shown). Windows-only, best-effort via raw COM vtable calls, never raises;
-    returns True only when SetValue reported success."""
+    Re-stamp on EVERY show/restore call: toggling overrideredirect / a withdraw->deiconify
+    recreates the top-level HWND, so the id must be re-applied to whatever handle is current.
+    Windows-only, best-effort, never raises; returns True only when every SetValue succeeded."""
     if sys.platform != "win32" or not (TASKBAR_BUTTON and app_id and hwnd):
+        return False
+    props = {5: app_id}   # PKEY_AppUserModel_ID
+    try:
+        target = _pythonw_exe()
+        if script_path and target:
+            sp = os.path.abspath(script_path)
+            props[2] = '"%s" "%s"' % (target, sp)           # RelaunchCommand (quoted cmdline)
+            ip = icon if (icon and os.path.isabs(icon)) else (
+                os.path.join(os.path.dirname(sp), icon) if icon else "")
+            if ip and os.path.exists(ip):
+                props[3] = "%s,0" % ip                       # RelaunchIconResource: path,index
+    except Exception:
+        pass
+    return _set_window_props(hwnd, props)
+
+
+def _set_window_props(hwnd, props):
+    """Write a set of PKEY_AppUserModel_* STRING properties onto a window's shell property
+    store in ONE session. `props` maps a pid under the AppUserModel fmtid
+    ({9F4C2855-...D5F3}) to a string value (2=RelaunchCommand, 3=RelaunchIconResource,
+    5=AppUserModel_ID). Raw COM vtable calls (SHGetPropertyStoreForWindow -> IPropertyStore
+    SetValue/Commit/Release). Windows-only, best-effort, never raises; returns True only when
+    EVERY SetValue reported success."""
+    if sys.platform != "win32" or not (hwnd and props):
         return False
     try:
         HRESULT = ctypes.c_long
@@ -70,8 +98,9 @@ def set_window_app_id(hwnd, app_id=APP_ID):
         class PROPERTYKEY(ctypes.Structure):
             _fields_ = [("fmtid", GUID), ("pid", ctypes.c_ulong)]
 
-        # Minimal PROPVARIANT: 8-byte header + one 8-byte union slot (a pointer for the
-        # VT_LPWSTR we store). Matches the size the shortcut builder uses for the same key.
+        # Minimal PROPVARIANT: 8-byte header + one 8-byte union slot (a pointer, for the
+        # VT_LPWSTR we store). Safe ONLY because SetValue's internal copy reads just vt + that
+        # pointer for an LPWSTR -- never past offset 16. Do NOT reuse this for a wider variant.
         class PROPVARIANT(ctypes.Structure):
             _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort),
                         ("r2", ctypes.c_ushort), ("r3", ctypes.c_ushort),
@@ -79,10 +108,8 @@ def set_window_app_id(hwnd, app_id=APP_ID):
 
         iid_ps = _guid(0x886D8EEB, 0x8CF2, 0x4446,
                        (0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99))
-        pk = PROPERTYKEY()
-        pk.fmtid = _guid(0x9F4C2855, 0x9F79, 0x4B39,   # PKEY_AppUserModel_ID
-                         (0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3))
-        pk.pid = 5
+        fmtid = _guid(0x9F4C2855, 0x9F79, 0x4B39,          # PKEY_AppUserModel_* family
+                      (0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3))
 
         shell32 = ctypes.windll.shell32
         shell32.SHGetPropertyStoreForWindow.argtypes = [
@@ -92,8 +119,8 @@ def set_window_app_id(hwnd, app_id=APP_ID):
         if shell32.SHGetPropertyStoreForWindow(wt.HWND(hwnd), ctypes.byref(iid_ps),
                                                ctypes.byref(pps)) != 0 or not pps:
             return False
-        # Call SetValue/Commit/Release through the raw IPropertyStore vtable (IUnknown's 3
-        # slots first, then GetCount/GetAt/GetValue, so SetValue=6, Commit=7, Release=2).
+        # Raw IPropertyStore vtable: IUnknown's 3 slots, then GetCount/GetAt/GetValue, so
+        # SetValue=6, Commit=7, Release=2.
         vtbl = ctypes.cast(pps, ctypes.POINTER(ctypes.c_void_p))[0]
         slots = ctypes.cast(vtbl, ctypes.POINTER(ctypes.c_void_p))
         SetValue = ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p,
@@ -102,16 +129,74 @@ def set_window_app_id(hwnd, app_id=APP_ID):
         Commit = ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p)(slots[7])
         Release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(slots[2])
         try:
-            s = ctypes.c_wchar_p(app_id)   # kept alive across the call; SetValue copies it
-            pv = PROPVARIANT()
-            pv.vt = 31                     # VT_LPWSTR
-            pv.p = ctypes.cast(s, ctypes.c_void_p)
-            ok = SetValue(pps, ctypes.byref(pk), ctypes.byref(pv)) == 0
-            if ok:
-                Commit(pps)
-            return ok
+            keepalive = []            # hold each c_wchar_p alive through Commit
+            all_ok = True
+            for pid, value in props.items():
+                pk = PROPERTYKEY()
+                pk.fmtid = fmtid
+                pk.pid = pid
+                s = ctypes.c_wchar_p(value)   # SetValue copies it; kept alive to be safe
+                keepalive.append(s)
+                pv = PROPVARIANT()
+                pv.vt = 31                     # VT_LPWSTR
+                pv.p = ctypes.cast(s, ctypes.c_void_p)
+                if SetValue(pps, ctypes.byref(pk), ctypes.byref(pv)) != 0:
+                    all_ok = False
+            Commit(pps)
+            return all_ok
         finally:
             Release(pps)
+    except Exception:
+        return False
+
+
+_icon_handle_cache = {}   # (abspath, cx, cy) -> HICON int, so re-asserts reuse the handles
+
+
+def set_window_icon(hwnd, icon=APP_ICON):
+    """Stamp the Clawd icon straight onto THIS window's taskbar button via WM_SETICON, with NO
+    dependency on any Start Menu shortcut. This is the fallback that keeps the RUNNING window's
+    button icon correct even when the AUMID->shortcut chain can't be built (a locked-down box
+    where AppLocker / ExecutionPolicy blocks the shortcut builder), and it reinforces the
+    Store-Python case after set_window_app_id() pulls the button off the package group. Meant
+    to be re-applied on every taskbar re-assert (the HWND can be recreated by a
+    withdraw->deiconify / overrideredirect toggle); HICONs are LOADED ONCE and cached, so those
+    frequent calls reuse the same 1-2 handles and never leak GDI handles (the v1.1.8
+    handle-budget discipline). Windows-only, best-effort, never raises; True iff the big icon
+    was set."""
+    if sys.platform != "win32" or not (TASKBAR_BUTTON and icon and hwnd):
+        return False
+    try:
+        ip = icon if os.path.isabs(icon) else os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), icon)
+        if not os.path.exists(ip):
+            return False
+        WM_SETICON, ICON_SMALL, ICON_BIG = 0x0080, 0, 1
+        IMAGE_ICON, LR_LOADFROMFILE = 1, 0x00000010
+        SM_CXICON, SM_CYICON, SM_CXSMICON, SM_CYSMICON = 11, 12, 49, 50
+        _user32.LoadImageW.restype = wt.HANDLE
+        _user32.LoadImageW.argtypes = [wt.HINSTANCE, wt.LPCWSTR, ctypes.c_uint,
+                                       ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        _user32.SendMessageW.restype = ctypes.c_ssize_t
+        _user32.SendMessageW.argtypes = [wt.HWND, ctypes.c_uint, ctypes.c_size_t,
+                                         ctypes.c_void_p]
+
+        def _load(cx, cy):
+            key = (ip, cx, cy)
+            if key not in _icon_handle_cache:
+                _icon_handle_cache[key] = _user32.LoadImageW(
+                    None, ip, IMAGE_ICON, cx, cy, LR_LOADFROMFILE) or None
+            return _icon_handle_cache[key]
+
+        hbig = _load(_user32.GetSystemMetrics(SM_CXICON) or 32,
+                     _user32.GetSystemMetrics(SM_CYICON) or 32)
+        hsmall = _load(_user32.GetSystemMetrics(SM_CXSMICON) or 16,
+                       _user32.GetSystemMetrics(SM_CYSMICON) or 16)
+        if hsmall:
+            _user32.SendMessageW(wt.HWND(hwnd), WM_SETICON, ICON_SMALL, hsmall)
+        if hbig:
+            _user32.SendMessageW(wt.HWND(hwnd), WM_SETICON, ICON_BIG, hbig)
+        return bool(hbig)
     except Exception:
         return False
 

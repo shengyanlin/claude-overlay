@@ -272,3 +272,52 @@ def test_set_window_app_id_bogus_hwnd_degrades_to_false(monkeypatch):
     # it must report the failure as False and never raise, honouring the best-effort contract.
     monkeypatch.setattr(win32utils, "TASKBAR_BUTTON", True)
     assert win32utils.set_window_app_id(0x1, app_id="test.app") is False
+
+
+def test_set_window_app_id_relaunch_props_bogus_hwnd_never_raises(tmp_path, monkeypatch):
+    # With script_path given, the call ALSO builds RelaunchCommand + RelaunchIconResource; a
+    # bogus hwnd must still degrade to False without raising (proves the extra prop-building
+    # path is safe even when the store can't be opened).
+    monkeypatch.setattr(win32utils, "TASKBAR_BUTTON", True)
+    script = tmp_path / "claude_overlay.py"
+    script.write_text("app")
+    assert win32utils.set_window_app_id(0x1, app_id="test.app",
+                                        script_path=str(script)) is False
+
+
+def test_set_window_props_false_on_null_hwnd_or_empty_props():
+    # The generalized writer rejects a null handle or an empty prop set before any COM.
+    assert win32utils._set_window_props(0, {5: "x"}) is False
+    assert win32utils._set_window_props(0x1, {}) is False
+
+
+# ── set_window_icon: WM_SETICON fallback so the RUNNING button shows Clawd with NO shortcut ──
+# (Independent of the Start Menu shortcut, so it covers a locked-down box where the shortcut
+# builder is blocked. HICONs are cached, so re-asserts never leak GDI handles.)
+
+def test_set_window_icon_false_without_taskbar_button(monkeypatch):
+    monkeypatch.setattr(win32utils, "TASKBAR_BUTTON", False)
+    assert win32utils.set_window_icon(0x1) is False
+
+
+def test_set_window_icon_false_without_hwnd(monkeypatch):
+    monkeypatch.setattr(win32utils, "TASKBAR_BUTTON", True)
+    assert win32utils.set_window_icon(0) is False
+
+
+def test_set_window_icon_false_when_icon_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(win32utils, "TASKBAR_BUTTON", True)
+    assert win32utils.set_window_icon(0x1, icon=str(tmp_path / "nope.ico")) is False
+
+
+def test_set_window_icon_caches_handles_no_leak(monkeypatch):
+    # With the real bundled .ico, the icon is loaded once and reused: a second call adds NO new
+    # cache entry (hence no new GDI handle), honouring the v1.1.8 bounded-handle discipline. A
+    # bogus hwnd is fine here — LoadImage reads the file; SendMessage just no-ops on the handle.
+    monkeypatch.setattr(win32utils, "TASKBAR_BUTTON", True)
+    win32utils._icon_handle_cache.clear()
+    r1 = win32utils.set_window_icon(0x1)               # populates the cache
+    snapshot = dict(win32utils._icon_handle_cache)
+    r2 = win32utils.set_window_icon(0x1)               # must reuse, not grow
+    assert isinstance(r1, bool) and isinstance(r2, bool)   # never raised
+    assert win32utils._icon_handle_cache == snapshot       # no new handles loaded
