@@ -241,3 +241,34 @@ def test_relaunch_overlay_raises_without_interpreter(monkeypatch):
     monkeypatch.setattr(win32utils, "_pythonw_exe", lambda: "")
     with pytest.raises(Exception):
         win32utils.relaunch_overlay("x.py")
+
+
+# ── set_window_app_id: stamp the window-level AppUserModelID (Store-Python taskbar-icon fix) ──
+# A window-level AUMID outranks both the process id and an MSIX host's package id, so Microsoft
+# Store Python shows the Clawd icon instead of pythonw's. The COM happy path needs a live
+# top-level HWND (can't be faked on a headless runner), so these lock in the best-effort
+# contract instead: every guard and every failure path returns False and never raises.
+
+def test_set_window_app_id_false_without_taskbar_button(monkeypatch):
+    # Taskbar button disabled → short-circuit before any COM call.
+    monkeypatch.setattr(win32utils, "TASKBAR_BUTTON", False)
+    assert win32utils.set_window_app_id(0x10, app_id="test.app") is False
+
+
+def test_set_window_app_id_false_without_app_id(monkeypatch):
+    # Empty id → nothing to stamp.
+    monkeypatch.setattr(win32utils, "TASKBAR_BUTTON", True)
+    assert win32utils.set_window_app_id(0x10, app_id="") is False
+
+
+def test_set_window_app_id_false_without_hwnd(monkeypatch):
+    # A null handle → no window to stamp.
+    monkeypatch.setattr(win32utils, "TASKBAR_BUTTON", True)
+    assert win32utils.set_window_app_id(0, app_id="test.app") is False
+
+
+def test_set_window_app_id_bogus_hwnd_degrades_to_false(monkeypatch):
+    # A non-zero but invalid HWND drives the REAL COM path (SHGetPropertyStoreForWindow):
+    # it must report the failure as False and never raise, honouring the best-effort contract.
+    monkeypatch.setattr(win32utils, "TASKBAR_BUTTON", True)
+    assert win32utils.set_window_app_id(0x1, app_id="test.app") is False

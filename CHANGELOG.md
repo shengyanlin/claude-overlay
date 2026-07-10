@@ -3,6 +3,19 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.11.1] — 2026-07-10
+
+### Fixed
+- **The taskbar button now shows the Clawd icon even when the overlay runs under Microsoft
+  Store Python.** If your Python came from the Microsoft Store (an MSIX-packaged build),
+  Windows forces every window that process opens to use the *package's* taskbar identity —
+  pythonw's generic Python icon — and silently ignores the app identity the overlay sets for
+  itself, so the earlier Start Menu shortcut fix couldn't take effect for those users. The
+  overlay now stamps its identity directly onto the window (not just the process); a
+  window-level identity outranks the package one, pulling the button onto the matching Start
+  Menu shortcut that already carries the Clawd icon. Regular (non-Store) Python was never
+  affected. Thanks to @krystallinyuheng-cpu for the fix.
+
 ## [1.11.0] — 2026-07-08
 
 ### Added
@@ -636,6 +649,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.11.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.1
 [1.11.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.0
 [1.10.4]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.4
 [1.10.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.3
