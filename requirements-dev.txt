@@ -1,0 +1,4 @@
+# Dev/test dependencies. Runtime deps come from requirements.txt (pulled in below so a
+# fresh checkout can import worker/claude_overlay, which the smoke test exercises).
+-r requirements.txt
+pytest>=7.0

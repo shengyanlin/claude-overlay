@@ -3,6 +3,235 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.11.2] — 2026-07-10
+
+### Fixed
+- **The taskbar button now shows the Clawd icon in more of the cases where it used to fall
+  back to the generic Python icon — including on locked-down machines, and after the overlay
+  has been closed.** The earlier taskbar-icon fixes relied on a Start Menu shortcut the
+  overlay creates for itself; on a managed machine where security policy (AppLocker /
+  PowerShell ExecutionPolicy) blocks that shortcut from being created, the icon still fell
+  back to pythonw's — and the closed/pinned icon depended on that shortcut too. The overlay
+  now *also* stamps its identity, a relaunch command, and its icon directly onto the window
+  itself, with no shortcut involved at all, so: a pin made from the running overlay keeps the
+  Clawd icon **and** relaunches the overlay when you click it after closing — even with no
+  Start Menu shortcut; and the running window's button is given the Clawd icon directly. This
+  is all done in-process (no extra files, no PowerShell), so it works on machines where the
+  shortcut approach can't run.
+
+## [1.11.1] — 2026-07-10
+
+### Fixed
+- **The taskbar button now shows the Clawd icon even when the overlay runs under Microsoft
+  Store Python.** If your Python came from the Microsoft Store (an MSIX-packaged build),
+  Windows forces every window that process opens to use the *package's* taskbar identity —
+  pythonw's generic Python icon — and silently ignores the app identity the overlay sets for
+  itself, so the earlier Start Menu shortcut fix couldn't take effect for those users. The
+  overlay now stamps its identity directly onto the window (not just the process); a
+  window-level identity outranks the package one, pulling the button onto the matching Start
+  Menu shortcut that already carries the Clawd icon. Regular (non-Store) Python was never
+  affected. Thanks to @krystallinyuheng-cpu for the fix.
+
+## [1.11.0] — 2026-07-08
+
+### Added
+- **The overlay now tells you when the Claude CLI it runs on is out of date — and updates
+  it in one click.** The overlay is a thin layer over the `claude` command-line tool, and
+  which models you can use is decided by *that tool*, not the overlay. So you could update
+  the overlay to the newest version and still be stuck on an older model, simply because the
+  CLI underneath hadn't been updated (its own auto-updater doesn't run for the npm install
+  the overlay uses, so it can quietly fall many versions behind). Now, on launch, the overlay
+  checks in the background whether your installed CLI is behind the latest release; if it is,
+  it shows a one-line notice with an **Update** button that runs the upgrade for you
+  (`npm install -g @anthropic-ai/claude-code@latest`). Nothing happens silently or without a
+  click, and after it finishes you just restart the overlay to pick up the newest models. The
+  check is best-effort and quiet on any failure (no npm, offline, corporate proxy), and it's
+  throttled to once a day so it costs nothing on normal launches. Turn it off by setting
+  `CLAUDE_OVERLAY_CLI_UPDATE_CHECK=0` (e.g. a locked-down machine where global npm installs
+  aren't allowed). Once the update finishes, the same button turns into **"✓ Updated — click
+  to restart"** — one click relaunches the overlay for you so the new models take effect,
+  no manual close-and-reopen. If the update can't complete because a running Claude process is
+  holding the CLI (Windows won't let an executable be replaced while it's in use — often the
+  overlay's own session, or another open Claude Code window), the button says so in plain
+  language and lets you **click to retry** after closing the other window, instead of showing
+  npm's raw error.
+
+## [1.10.4] — 2026-07-08
+
+### Fixed
+- **Pinning the overlay to the taskbar now works like a normal app — the pin relaunches
+  it and keeps the Clawd icon.** Previously, if you pinned the overlay's taskbar button
+  and then closed the app, clicking the pin wouldn't reopen it, and the pinned icon
+  turned into a generic Python icon. Root cause: the overlay declares its own app identity
+  (an AppUserModelID) so the taskbar groups it and shows the Clawd icon — but Windows will
+  only let you *pin* such a window if there's a matching **Start Menu shortcut** carrying
+  the same identity. There wasn't one, so pinning fell back to the bare `pythonw.exe`
+  Python launcher: nothing to relaunch, and Python's own icon. The overlay now
+  **automatically creates that Start Menu shortcut on launch** (pointing at itself, with
+  the Clawd icon and the matching identity), so pinning behaves correctly for everyone with
+  no manual step. It's a one-time thing — the check on every later launch is a cheap no-op,
+  and it quietly re-creates the shortcut if you move the folder. If you already have a
+  broken pin from before, unpin it and pin again after this update.
+
+## [1.10.3] — 2026-07-02
+
+### Fixed
+- **The overlay no longer freezes when Claude wants to ask you a multiple-choice question.**
+  Claude Code has an interactive "pick one of these options" question tool (AskUserQuestion). In
+  the full CLI it pops up a little chooser; in this overlay there's no such chooser to answer it,
+  so when Claude reached for that tool the turn just hung — stuck "thinking…" for up to half an
+  hour before it gave up. (A recent CLI update made Claude start using that tool where older
+  versions didn't, which is why it began happening.) Now the overlay tells Claude that tool isn't
+  available here, so instead of stalling it simply **asks its question inline as normal text** —
+  and you answer by typing your reply, the way any other message works. Belt-and-suspenders: the
+  tool is both removed up front *and* refused at run time, so a question can never hang the window
+  again.
+
+## [1.10.2] — 2026-07-02
+
+### Fixed
+- **The overlay was quietly running one Opus version behind (statusline showed 4.7, not 4.8).**
+  v1.10.0 switched the model config to family aliases (`opus`) so the overlay would always run
+  the *latest* model with no updates — but it turns out the CLI, when driven the way the overlay
+  drives it (the Agent SDK's streaming transport), resolves a bare alias to a **version-behind**
+  model: `opus` came back as `claude-opus-4-7` even though the same CLI in one-shot mode — and
+  Claude Code itself — resolve `opus` to `claude-opus-4-8`. So "always latest via alias" silently
+  gave you last-generation-latest. The overlay now resolves the family alias to the concrete
+  latest id at startup (by asking the CLI's honest resolution path) before it connects, and does
+  the same when you switch models from the statusline menu — so you actually get 4.8. The alias
+  stays in the config (auto-update on new releases is preserved), and the lookup is cached per CLI
+  version, so it costs at most one quick probe after a CLI upgrade and nothing on normal launches.
+  If the probe can't run (offline, not logged in), it falls back to the old behaviour rather than
+  failing to start.
+
+## [1.10.1] — 2026-07-01
+
+### Fixed
+- **Unplugging a monitor could leave the overlay impossible to bring to the front.** If the
+  overlay was sitting on a screen that then got disconnected (or you changed your display
+  layout), its position could end up outside every remaining monitor — so it was there, but
+  drawn where you couldn't see it. Clicking its taskbar button, Alt-Tabbing to it, or pressing
+  the hotkey correctly *activated* it but only ever changed its stacking order, never its
+  position, so it stayed stranded off-screen and never appeared. The overlay now makes sure it's
+  on a connected monitor whenever you summon it (taskbar click / Alt-Tab / restore / hotkey /
+  expand), and also notices a display change on its own (a monitor plugged or unplugged, a
+  resolution change) and pulls itself back onto a visible screen — placed within the monitor's
+  work area, so it never lands under the taskbar. A window you've deliberately parked slightly
+  off an edge is left alone; only a fully off-screen window is moved.
+
+## [1.10.0] — 2026-07-01
+
+### Changed
+- **The model switcher now always offers the *latest* model of each family — automatically.**
+  The in-app model menu (click the statusline) used to list pinned versions like *"Opus 4.8"*,
+  so a newly released model wouldn't show up until you updated the app. Its entries are now
+  **family aliases** — **Opus**, **Opus (1M)**, **Sonnet**, **Haiku** — which the Claude CLI
+  resolves to the newest model of each family at run time. So when Anthropic ships a new model
+  (say a future Sonnet 5), the overlay picks it up with **no update needed**: click the family
+  and you're on its latest. The statusline still shows the concrete version each alias resolved
+  to (e.g. `claude-opus-4-8`), so you can always see exactly what you're running, and the
+  startup default is likewise the latest Opus.
+
+## [1.9.0] — 2026-06-29
+
+### Added
+- **Show the overlay in screen shares when you want to — a new "Shareable" toggle.** By design the
+  overlay is invisible to screen capture (Teams / Zoom / Meet / OBS screen share, PrintScreen, even
+  its own screenshots), so your private chat with Claude never leaks onto a shared screen — which is
+  also exactly why you couldn't share it on purpose. The new **◉ / ○ Shareable** switch in the status
+  bar lets you flip that per meeting: turn it **on** to make the overlay appear in your screen share
+  (e.g. to demo it, or to reference an answer while presenting), turn it **off** to go private again.
+  Default is **off (private)**, no restart needed, and a one-line confirmation tells you it took —
+  handy because the change is invisible on your *own* screen (the window looks identical either way;
+  only what others see in the share changes). When it's on, screenshots the overlay sends Claude still
+  never contain the overlay itself.
+
+### Changed
+- **Tidier status bar.** Removed the **Snap** button — your screen is already captured automatically
+  on every message — and renamed the **auto-screenshot** toggle to **Auto-shot** so it reads
+  consistently next to the **Compact** and **Clear** buttons.
+
+## [1.8.0] — 2026-06-29
+
+### Added
+- **Compact the conversation to free up context — with a live animation.** A new **Compact** button
+  in the status bar (next to Snap/Clear) summarizes the conversation so far and drops the older
+  turns, so a long session stops eating into your context window — the same thing the Claude Code
+  CLI's `/compact` does. While it runs, the chat shows an animated line (a pulsing ✦ sparkle,
+  "Compacting conversation…", and an elapsed timer) that then turns into a one-line result reporting
+  how much was reclaimed — e.g. *"✦ Compacted — 43,196 → 4,970 tokens (saved 88%)."* Your earlier
+  context is **summarized, not lost**, so you can keep going. You can **Stop** it mid-run, and if the
+  result can't be confirmed it says so rather than claiming success.
+
+## [1.7.2] — 2026-06-28
+
+### Changed
+- **The collapsed "task done" badge now sticks around until you follow up.** Previously the green ✓
+  cleared as soon as you expanded the overlay, so expanding to read the reply and then re-collapsing
+  lost it. It now means *"the last turn finished — awaiting your next message"*: it appears when a
+  reply completes, **persists across expand/collapse**, and only clears when you send the next
+  message (or clear the chat). It still shows only while collapsed.
+
+## [1.7.1] — 2026-06-27
+
+### Added
+- **A "task done" badge on the collapsed orb.** When a reply finishes while the overlay is
+  collapsed to its orb, a small green ✓ now appears at the orb's top-right — so if you sent it off
+  to work and minimized it, you can see at a glance that the answer is ready. It clears when you
+  expand the overlay or start a new turn. (The floating-sprite clip region is rebuilt to include the
+  badge, so it isn't clipped away; it composes cleanly with the session name label too.)
+- **`setup.cmd` can now install Python for you.** If no real Python is found, setup offers to
+  install it automatically (a new `install-python.ps1`): it uses winget (user scope, no admin) when
+  available, otherwise downloads the official python.org per-user installer (which includes tkinter,
+  pip, and the `py` launcher). It then continues straight to installing the overlay's packages —
+  instead of the old dead-end that just told you Python was missing. Declining, or a failed install,
+  still prints clear manual steps.
+
+### Fixed
+- **Pasting copied text no longer turns into a pasted image.** Many apps (browsers, Office,
+  screenshot tools) put a bitmap on the clipboard *alongside* the text you copied, and the overlay's
+  Ctrl+V was treating any clipboard image as an image paste — so plain text came in as a picture. Text
+  now wins: if the clipboard has text, it pastes as text; an image is only attached when there's
+  image/file content and no text.
+
+## [1.7.0] — 2026-06-27
+
+### Added
+- **Name each overlay — tell several apart at a glance.** Click the **"Claude"** title to give this
+  overlay a name (type inline, Enter or click away to save, Esc to cancel); an unnamed overlay shows
+  a faint **"Click to name this session"** hint next to the title to point the way. The name also
+  becomes the window's taskbar/Alt-Tab title. Most useful **collapsed**: when you minimize a named
+  overlay to its orb, the name now floats **beneath the orb** as crisp black text with a soft white
+  halo around the letters (no box, no frame) — so if you keep several overlays open, one per task,
+  you can tell which orb is which without expanding them. The name is per session (it isn't saved
+  across restarts). Unnamed overlays collapse to just the orb, exactly as before.
+
+### Fixed
+- **Clicking the taskbar button now brings the overlay to the front.** Because the window is
+  always-on-top *and* frameless, a taskbar-button click activated it but didn't re-order it above
+  other always-on-top windows, so it could stay buried (or just unfocused). It now raises itself to
+  the very front on a taskbar click, Alt-Tab, or restore. (Pure z-order — no `<Configure>`/region
+  churn, so it stays clear of the v1.1.9 freeze class.)
+
+## [1.6.0] — 2026-06-23
+
+### Added
+- **A real taskbar button — like any other app.** The overlay is a frameless, always-on-top
+  window, which on Windows means it had *no* taskbar button at all: no way to click it back to the
+  front, no Alt-Tab entry, no at-a-glance "it's running". It now shows a proper taskbar button with
+  the Clawd icon — click it to focus/raise the overlay, find it in Alt-Tab, and see that it's
+  running. The window stays frameless and rounded; only the taskbar presence changes. Set the new
+  `TASKBAR_BUTTON` config constant to `False` for the original no-taskbar floating-only behaviour.
+  (Under the hood: `WS_EX_APPWINDOW` forces the button onto the borderless window, an explicit
+  AppUserModelID makes the taskbar show the overlay's own icon instead of Python's, and every
+  show/restore re-asserts the frameless look so a taskbar restore never flashes a title bar.)
+- **Skills are now available to the overlay.** A new `SKILLS` config constant exposes your enabled
+  Claude Code skills to the overlay (default `"all"` — every skill installed on the machine; or pass
+  a list to enable only specific ones, or `None` to disable). Previously the overlay wired up no
+  skill discovery at all. Enabling skills also lets the underlying CLI load your `~/.claude` user
+  settings; MCP servers stay blocked by `STRICT_MCP_CONFIG`, and the added context cost is minimal
+  (~1% of a 200K window for ~16 skills).
+
 ## [1.5.3] — 2026-06-17
 
 ### Fixed
@@ -436,6 +665,20 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.11.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.2
+[1.11.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.1
+[1.11.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.0
+[1.10.4]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.4
+[1.10.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.3
+[1.10.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.2
+[1.10.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.1
+[1.10.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.10.0
+[1.9.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.9.0
+[1.8.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.8.0
+[1.7.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.7.2
+[1.7.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.7.1
+[1.7.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.7.0
+[1.6.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.6.0
 [1.5.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.3
 [1.5.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.2
 [1.5.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.5.1

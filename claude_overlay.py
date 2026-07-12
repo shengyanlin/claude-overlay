@@ -30,831 +30,12 @@ from tkinter import font as tkfont
 
 from PIL import Image, ImageGrab, ImageDraw, ImageChops, ImageFilter, ImageTk
 
-# Make sure both common `claude` install locations are on PATH, in case it was just
-# installed this session (PATH not yet refreshed): the native installer drops it in
-# %USERPROFILE%\.local\bin, and a global npm install in %APPDATA%\npm.
-os.environ["PATH"] = os.pathsep.join(filter(None, [
-    os.path.join(os.environ.get("USERPROFILE", ""), ".local", "bin"),
-    os.path.join(os.environ.get("APPDATA", ""), "npm"),
-    os.environ.get("PATH", ""),
-]))
-
-# Spawn the `claude` CLI subprocess with no console window. Without this, running
-# under pythonw (no console) makes Windows pop a CMD window for the console-mode CLI.
-# Best-effort: if a future anyio drops/renames open_process, degrade gracefully
-# (worst case a CMD window flashes) rather than crash on import.
-try:
-    import anyio as _anyio  # noqa: E402
-    if sys.platform == "win32":
-        _CREATE_NO_WINDOW = 0x08000000
-        _orig_open_process = _anyio.open_process
-
-        async def _open_process_no_window(*args, **kwargs):
-            kwargs["creationflags"] = kwargs.get("creationflags", 0) | _CREATE_NO_WINDOW
-            return await _orig_open_process(*args, **kwargs)
-
-        _anyio.open_process = _open_process_no_window
-except Exception:
-    pass
-
-from claude_agent_sdk import (  # noqa: E402
-    ClaudeSDKClient, ClaudeAgentOptions, AssistantMessage, TextBlock,
-    ToolUseBlock, ResultMessage, StreamEvent, PermissionResultAllow,
-)
-# Error types used to decide when the transport is broken and we should reconnect.
-# Imported defensively: older/newer SDKs may not export all of them.
-try:
-    from claude_agent_sdk import (  # noqa: E402
-        ClaudeSDKError, CLIConnectionError, CLIJSONDecodeError, ProcessError,
-    )
-except Exception:  # pragma: no cover
-    class ClaudeSDKError(Exception): ...
-    class CLIConnectionError(ClaudeSDKError): ...
-    class CLIJSONDecodeError(ClaudeSDKError): ...
-    class ProcessError(ClaudeSDKError): ...
-
-__version__ = "1.5.3"
-
-# ───────────────────────────── configuration ──────────────────────────────
-WORKING_DIR = str(Path.home())
-# NOTE: the Agent SDK's model=None does NOT follow the CLI's interactive default
-# (which is opus-4-8); SDK 0.2.87 resolves None → opus-4-7. So pin the ID explicitly.
-# Default to the standard 200K-context Opus: overlay chats never approach 200K, so the
-# "[1m]" 1M-context variant only buys latency for context we never use. The 1M variant
-# stays one click away in the MODELS switcher.
-MODEL = "claude-opus-4-8"
-MODELS = [("Opus 4.8", "claude-opus-4-8"), ("Opus 4.8 (1M)", "claude-opus-4-8[1m]"),
-          ("Sonnet", "sonnet"), ("Haiku", "haiku")]  # click the statusline to switch
-PERMISSION_MODE = "bypassPermissions"
-STRICT_MCP_CONFIG = True          # do NOT inherit the user's ~/.claude MCP servers. The overlay
-                                  # is a lightweight screen-chat that only needs the core Claude
-                                  # Code tools; inheriting every MCP server the user has configured
-                                  # (Atlassian, Figma, M365, …) injects their tool schemas into the
-                                  # context — easily 50-70K+ tokens, a third of a 200K window, gone
-                                  # before you type. Flip to False to expose your MCP tools here.
-AUTO_SCREENSHOT_DEFAULT = True
-HIDE_SCREENSHOT_TOOL = True       # hide the noisy "⚙ Read …shot_*.png" lines every turn
-HOTKEY = "ctrl+alt+space"
-THEME = "light"                  # "light" (Claude paper) or "dark" (warm dark)
-WINDOW_ALPHA = 1.0
-CORNER_RADIUS = 18
-ORB_SIZE = 56                    # diameter (logical px) of the collapsed Claude orb
-ORB_IMAGE = "claude_overlay_2.png"  # collapsed-orb artwork. "" → procedural glossy
-                                 # terracotta sphere (original look). A path (relative
-                                 # to this script, or absolute) to a PNG/ICO renders that
-                                 # image instead: it's auto-scaled + centred so the whole
-                                 # opaque shape fits inside the circular orb. RGBA with a
-                                 # transparent background works best.
-ORB_IMAGE_MARGIN = 0.04          # fraction of the radius kept clear around the artwork
-                                 # (0 = touches the circle edge; 0.04 = tiny breathing room)
-ORB_FLOAT = True                 # True + an ORB_IMAGE → the collapsed orb is clipped to the
-                                 # artwork's own silhouette (a free-floating pixel sprite, no
-                                 # circular frame; clicks outside the shape pass through).
-                                 # False → the classic circular orb. Ignored without artwork.
-ORB_ALPHA_THRESHOLD = 110        # pixels at/above this alpha (0-255) count as "solid" when
-                                 # building the silhouette — higher = tighter, crisper edge
-# Fonts. Noto Sans/Serif TC cover Chinese + English in one family (closest free
-# stand-in for Claude's proprietary Styrene/Copernicus). First available wins.
-FONT_SANS = ["Noto Sans TC", "Inter", "Segoe UI Variable Text", "Segoe UI"]
-FONT_SERIF = ["Noto Serif TC", "Georgia", "Cambria"]   # the "Claude" wordmark
-FONT_MONO = ["Consolas", "Cascadia Mono", "Courier New"]
-SHOT_DIR = Path(os.environ.get("TEMP", str(Path.home()))) / "claude_overlay_shots"
-KEEP_SHOTS = 24                  # retain a few captures worth (one file per monitor)
-SHOT_MAX_EDGE = 1568             # downscale captures to this long edge before sending.
-                                 # Claude downsamples larger images internally anyway, so
-                                 # bigger files only cost upload time + vision tokens.
-IMAGE_INPUT = "inline"           # "inline" → attach screenshots as base64 image blocks
-                                 # (no per-turn Read round-trip); "read" → legacy path:
-                                 # save PNG + ask Claude to Read it. Flip to "read" if a
-                                 # future CLI rejects inline images.
-PRECAPTURE_ON_TYPING = True      # grab the screen ~as you type (off the send path) so
-                                 # send latency excludes the capture.
-PRECAPTURE_MAX_AGE = 6.0         # seconds a pre-captured frame stays reusable; older than
-                                 # this at send time → re-grab fresh (bounds staleness).
-MAX_BUFFER_SIZE = 64 * 1024 * 1024   # the SDK aborts a turn with CLIJSONDecodeError when a
-                                 # single stream-json line exceeds this (default 1MB). Inline
-                                 # screenshots (base64, ×monitors) blow past 1MB easily and
-                                 # used to crash the worker — 64MB gives huge headroom.
-# A hang is NOT an exception, so the reconnect / bounded-restart guards (which only fire
-# on a raised error) can't preempt an SDK call that never resolves — a wedged transport
-# (broken corporate TLS, half-open socket, CLI waiting on a prompt with no TTY) would pin
-# the worker forever. Bound every SDK lifecycle call so a hang degrades to a clean
-# reconnect instead of a permanent freeze.
-CONNECT_TIMEOUT = 30        # connect() that hasn't resolved by here ⇒ wedged transport
-QUERY_TIMEOUT = 60          # sending the request is near-instant; bound it anyway
-DISCONNECT_TIMEOUT = 10     # don't let a stuck disconnect hang shutdown/reconnect
-RECV_IDLE_TIMEOUT = 300     # no stream activity for this long ⇒ treat the transport as dead
-                            # (generous: a long-running tool can legitimately go quiet a while)
-MAX_INLINE_IMAGE_BYTES = 16 * 1024 * 1024   # never base64-inline a local file bigger than this
-                            # (a multi-GB file with an image extension would otherwise be read
-                            # whole into RAM and explode the query payload)
-MAX_CHAT_LINES = 4000       # cap the rendered transcript; prune oldest lines past this so a
-                            # very long session doesn't slow Tk layout / leak embedded canvases
-MAX_CHAT_CHARS = 350_000    # also cap by characters — one giant whitespace-free assistant
-                            # line counts as 1 line and would otherwise bypass the line cap
-IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
-TOOL_IDLE_TIMEOUT = 1800    # once a tool call is in flight, allow a much longer silent gap
-                            # (a long build/test can legitimately stream nothing for minutes)
-MAX_PASTE_SOURCES = 8       # cap how many files one paste fans out into
-MAX_PENDING_IMAGES = 16     # cap total queued attachments (a hostile clipboard can't pile up)
-MAX_PASTE_PIXELS = 32_000_000   # reject a pasted image above this pixel count BEFORE decode/
-                            # thumbnail — a "decompression bomb" PNG decodes to a huge bitmap
-                            # (Pillow only *warns*, doesn't raise, below ~178M px)
-MAX_INLINE_IMAGES = 16      # cap images per turn (count) ...
-MAX_INLINE_TOTAL_BYTES = 32 * 1024 * 1024   # ... and aggregate bytes (the per-file cap alone
-                            # doesn't bound many-attachment memory blow-up)
-MAX_UPDATE_BODY = 1 * 1024 * 1024   # cap the update-check response body before json.loads
-MAX_UPDATE_TAGS = 300       # and the number of tags parsed
-
-# ── debug / activity log (monitoring) ──────────────────────────────────────
-# Under pythonw the overlay has no console and exposes no IPC, so its work can't be
-# watched from outside. Opt in by setting the CLAUDE_OVERLAY_DEBUG_LOG environment
-# variable to a file path: you then get a timestamped, one-line-per-event trace of the
-# worker (turn start, tool calls, results, errors, reconnects, a throttled streaming
-# heartbeat) — enough to see what it's doing and whether a turn is stuck. Default is OFF
-# (empty) so nothing is written. Privacy note: even when enabled, reply text is NEVER
-# logged (deltas/thinking are logged only as a ~2s heartbeat + char count), but a
-# turn-start prompt preview (≤120 chars) IS written — so only enable it on a trusted
-# machine. Each PID tags its own lines so several overlays don't get confused.
-DEBUG_LOG = os.environ.get("CLAUDE_OVERLAY_DEBUG_LOG", "")
-DEBUG_LOG_MAX_BYTES = 2_000_000     # truncate (best-effort) once the log grows past this
-_dbg_lock = threading.Lock()
-_dbg_stream_last = [0.0]             # throttle high-frequency streaming deltas to a heartbeat
-_dbg_think_last = [0.0]             # ditto for thinking deltas (separate, so a thinking heartbeat
-                                    # can't suppress the first answer delta we use to time TTFT)
-
-
-def dbg(kind, payload=None):
-    """Append one best-effort line to DEBUG_LOG. Never raises into the caller."""
-    if not DEBUG_LOG:
-        return
-    try:
-        if kind in ("delta", "think"):   # streaming token text → heartbeat only, NEVER the content
-            now = time.monotonic()       # (thinking is reply content too — must not hit disk verbatim)
-            last = _dbg_stream_last if kind == "delta" else _dbg_think_last
-            if now - last[0] < 2.0:
-                return
-            last[0] = now
-            n = len(payload) if isinstance(payload, str) else 0
-            payload = f"<{'streaming' if kind == 'delta' else 'thinking'} +{n} chars>"
-        elif kind == "tool":        # (name, input_dict) → name + a short arg preview
-            name, inp = payload if isinstance(payload, tuple) and len(payload) == 2 else (payload, None)
-            arg = ""
-            if isinstance(inp, dict):
-                arg = " ".join(f"{k}={str(v)[:40]}" for k, v in list(inp.items())[:2])
-            payload = f"{name} {arg}".strip()
-        elif isinstance(payload, dict):
-            payload = " ".join(f"{k}={v}" for k, v in payload.items())
-        elif isinstance(payload, str):
-            payload = payload[:200].replace("\n", " ")
-        _now = time.time()
-        _ts = time.strftime('%H:%M:%S', time.localtime(_now)) + f".{int((_now % 1) * 1000):03d}"
-        line = f"{_ts} pid={os.getpid()} {kind} {payload if payload is not None else ''}".rstrip() + "\n"
-        with _dbg_lock:
-            try:
-                if os.path.exists(DEBUG_LOG) and os.path.getsize(DEBUG_LOG) > DEBUG_LOG_MAX_BYTES:
-                    open(DEBUG_LOG, "w", encoding="utf-8").close()
-            except Exception:
-                pass
-            with open(DEBUG_LOG, "a", encoding="utf-8") as f:
-                f.write(line)
-    except Exception:
-        pass
-
-
-class _UIQueueTap:
-    """Wraps the worker→UI queue so every event the worker emits is also written to the
-    debug log. The worker's entire observable behavior already flows through this one
-    queue (`ready`/`tool`/`result`/`error`/`system`/`turn_done`/`delta`/…), so a single
-    tap here logs all of it without scattering calls through the worker. The UI keeps
-    reading the underlying queue directly; only the worker's `put` side is wrapped."""
-    def __init__(self, q):
-        self._q = q
-
-    def put(self, item, *a, **k):
-        try:
-            if isinstance(item, tuple) and len(item) == 2:
-                dbg(item[0], item[1])
-            else:
-                dbg(item)
-        except Exception:
-            pass
-        return self._q.put(item, *a, **k)
-
-    def __getattr__(self, name):
-        return getattr(self._q, name)
-
-
-SYSTEM_APPEND = (
-    "You are running as an always-on-top floating overlay assistant on the user's "
-    "Windows 11 desktop. The user talks to you without leaving their current app. "
-    "Messages may include live screenshots of the user's screen — attached directly "
-    "as images, or (legacy) as an [ATTACHMENTS] path you open with the Read tool. "
-    "Use them to see what the user is looking at, then help. "
-    "Keep replies concise and skimmable since they render in a small floating window; "
-    "expand only when asked. "
-    "When automating Office (PowerPoint/Excel/Word) via PowerShell+COM, optimize for "
-    "speed: a NEW PowerShell process runs per tool call and COM state does NOT persist "
-    "across calls, and every property access is a slow cross-process round-trip. So: "
-    "(1) BATCH — do all inspection in ONE script (return what you need, e.g. as JSON), "
-    "then apply ALL edits in ONE script; never one tool call per shape/cell/slide. "
-    "(2) Within a script cache COM references in variables (grab the slide/shape/table "
-    "once) instead of re-walking the object model, and don't re-read everything to verify "
-    "after each write. (3) For Excel bulk writes, set Application.ScreenUpdating=$false, "
-    "Calculation=xlManual and EnableEvents=$false around them, then restore. (4) For large "
-    "purely-textual edits where the live open document isn't needed, python-pptx/openpyxl "
-    "on the file is far faster than COM — but only when the file is NOT open in Office."
-)
-
-THEMES = {
-    "light": {
-        "bg": "#FAF9F5", "field": "#FFFFFF", "user_card": "#EFEBE1",
-        "text": "#28261F", "muted": "#73706A", "faint": "#A9A59B",
-        "accent": "#D97757", "accent_hi": "#C25E40", "on_accent": "#FFFFFF",
-        "border": "#E6E2D8", "tool_bg": "#F2EFE7", "err": "#B4413A",
-        "sel": "#EADDD3", "hover": "#EFEBE1",
-    },
-    "dark": {
-        "bg": "#262624", "field": "#1F1E1D", "user_card": "#34332F",
-        "text": "#ECEAE3", "muted": "#9B978D", "faint": "#6F6C64",
-        "accent": "#D97757", "accent_hi": "#E68A6C", "on_accent": "#FFFFFF",
-        "border": "#3A3934", "tool_bg": "#2E2D2A", "err": "#E0897D",
-        "sel": "#3A3934", "hover": "#30302E",
-    },
-}
-T = THEMES.get(THEME, THEMES["light"])
-
-
-def set_dpi_awareness():
-    """Make the process DPI-aware so 1 Tk pixel == 1 physical pixel (crisp, no
-    OS bitmap-stretch). Must run before the Tk interpreter starts."""
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)   # PER-MONITOR aware
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
-
-
-# Win32 region calls — set argtypes so 64-bit handles aren't truncated.
-_gdi32, _user32 = ctypes.windll.gdi32, ctypes.windll.user32
-_gdi32.CreateRoundRectRgn.restype = wt.HRGN
-_gdi32.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
-_user32.SetWindowRgn.restype = ctypes.c_int
-_user32.SetWindowRgn.argtypes = [wt.HWND, wt.HRGN, ctypes.c_bool]
-_gdi32.DeleteObject.restype = ctypes.c_int
-_gdi32.DeleteObject.argtypes = [ctypes.c_void_p]   # free a region Windows didn't take ownership of
-_user32.GetAncestor.restype = wt.HWND
-_user32.GetAncestor.argtypes = [wt.HWND, ctypes.c_uint]
-_gdi32.CreateEllipticRgn.restype = wt.HRGN
-_gdi32.CreateEllipticRgn.argtypes = [ctypes.c_int] * 4
-# Region from arbitrary silhouette (used to float the collapsed orb as a pixel sprite,
-# with no circular frame): OR together one rect per opaque run of the artwork's alpha.
-_gdi32.CreateRectRgn.restype = wt.HRGN
-_gdi32.CreateRectRgn.argtypes = [ctypes.c_int] * 4
-_gdi32.SetRectRgn.restype = ctypes.c_int
-_gdi32.SetRectRgn.argtypes = [wt.HRGN] + [ctypes.c_int] * 4
-_gdi32.CombineRgn.restype = ctypes.c_int
-_gdi32.CombineRgn.argtypes = [wt.HRGN, wt.HRGN, wt.HRGN, ctypes.c_int]
-_user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-_user32.GetMonitorInfoW.restype = ctypes.c_int
-_MONENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
-                                  ctypes.POINTER(wt.RECT), ctypes.c_void_p)
-_user32.EnumDisplayMonitors.argtypes = [ctypes.c_void_p, ctypes.c_void_p, _MONENUMPROC, ctypes.c_void_p]
-_user32.EnumDisplayMonitors.restype = ctypes.c_int
-_user32.SetWindowDisplayAffinity.argtypes = [wt.HWND, ctypes.c_uint]
-_user32.SetWindowDisplayAffinity.restype = ctypes.c_int
-_user32.GetForegroundWindow.restype = wt.HWND
-_user32.IsClipboardFormatAvailable.argtypes = [ctypes.c_uint]
-_user32.IsClipboardFormatAvailable.restype = ctypes.c_int
-# Standard clipboard format ids — used for a cheap, non-blocking "is there an image?" probe
-# on the UI thread, so we only spin up the (potentially slow) ImageGrab.grabclipboard() read
-# on a background thread when there's actually image/file content.
-CF_BITMAP, CF_DIB, CF_HDROP, CF_DIBV5 = 2, 8, 15, 17
-
-# Exclude the overlay from screen captures at the OS level (DWM): the window stays
-# visible to the user but is omitted from PIL ImageGrab / PrintWindow, so the
-# screenshots we send Claude never contain the overlay obscuring the content — and
-# we no longer have to withdraw() + sleep() on every capture. Verified on this
-# machine (returns the content behind the window, not black).
-WDA_EXCLUDEFROMCAPTURE = 0x11
-
-
-class _MONITORINFO(ctypes.Structure):
-    _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT),
-                ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
-
-
-def enumerate_monitors():
-    """Return [{'rect': (l, t, r, b), 'primary': bool}, ...], primary first."""
-    mons = []
-
-    def _cb(hmon, hdc, lprc, lparam):
-        mi = _MONITORINFO()
-        mi.cbSize = ctypes.sizeof(_MONITORINFO)
-        if _user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
-            r = mi.rcMonitor
-            mons.append({"rect": (r.left, r.top, r.right, r.bottom),
-                         "primary": bool(mi.dwFlags & 1)})   # MONITORINFOF_PRIMARY
-        return 1
-
-    try:
-        proc = _MONENUMPROC(_cb)
-        _user32.EnumDisplayMonitors(None, None, proc, 0)
-    except Exception:
-        pass
-    mons.sort(key=lambda m: (not m["primary"], m["rect"][0], m["rect"][1]))  # primary, then L→R
-    return mons
-
-
-# ───────────────────────── background Claude worker ───────────────────────
-class ClaudeWorker(threading.Thread):
-    def __init__(self, ui_queue: "queue.Queue"):
-        super().__init__(daemon=True)
-        # Tap the UI channel so the debug log captures every worker→UI event (no-op when
-        # DEBUG_LOG is ""). The UI side keeps reading the raw queue.
-        self.ui = _UIQueueTap(ui_queue) if DEBUG_LOG else ui_queue
-        self.req: "queue.Queue" = queue.Queue()
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._client: ClaudeSDKClient | None = None
-        self._running = True
-        self._saw_stream = False
-        self._lifecycle_task = None   # the in-flight connect()/disconnect() task, if any
-
-    def ask(self, text: str, image_paths=None):
-        self.req.put(("ask", (text, list(image_paths or []))))
-    def reset(self):                  self.req.put(("reset", None))
-    def shutdown(self):
-        self._running = False
-        # If the worker is currently AWAITING a lifecycle call (connect/disconnect), the
-        # queued "stop" can't be read until that await returns (up to CONNECT_TIMEOUT).
-        # Cancel the in-flight lifecycle task so the worker can wind down promptly instead
-        # of leaving a daemon thread + orphaned `claude` CLI child after the UI is gone.
-        loop, task = self._loop, self._lifecycle_task
-        if loop and task and not loop.is_closed():
-            try:
-                loop.call_soon_threadsafe(task.cancel)
-            except Exception:
-                pass
-        self.req.put(("stop", None))
-
-    def interrupt(self):
-        loop, client = self._loop, self._client
-        # The loop may be closed (worker finished / between restarts) — calling
-        # run_coroutine_threadsafe on a closed loop raises RuntimeError straight into the
-        # Tk callback (reset()/Stop don't guard it) and leaks the coroutine object.
-        if not (loop and client) or loop.is_closed():
-            return
-        coro = self._safe_interrupt(client)
-        try:
-            asyncio.run_coroutine_threadsafe(coro, loop)
-        except RuntimeError:
-            try:
-                coro.close()
-            except Exception:
-                pass
-
-    async def _safe_interrupt(self, client):
-        try:
-            await client.interrupt()
-        except Exception:
-            pass
-
-    def set_model(self, model):
-        # Go through the request queue (not run_coroutine_threadsafe) so a model switch is
-        # serialized behind any queued reset/ask and can't interleave with _close() tearing
-        # down the same client — which could leave a half-disconnected client or a status
-        # line stuck on "switching model…".
-        self.req.put(("set_model", model))
-
-    async def _do_set_model(self, client, model):
-        try:
-            await client.set_model(model)
-            await self._emit_usage()
-            self.ui.put(("status", ""))   # clear the "switching model…" notice
-        except Exception as e:
-            self.ui.put(("error", f"set_model failed: {type(e).__name__}: {e}"))
-
-    async def _allow_tool(self, tool_name, input_data, context):
-        # Auto-approve every tool. permission_mode="bypassPermissions" already does
-        # this on most machines, but managed/enterprise installs can DISABLE bypass
-        # mode (managed-settings.json: disableBypassPermissionsMode), which makes the
-        # CLI fall back to "default" and emit a permission prompt. The overlay is a
-        # GUI with no TTY, so an unanswered prompt would just hang the turn forever
-        # ("nowhere to approve"). This callback answers those prompts so the overlay
-        # works regardless of the host's permission policy. The tool call still shows
-        # up as a chip in the chat via the normal streaming path, so it isn't silent.
-        return PermissionResultAllow()
-
-    def _make_options(self) -> ClaudeAgentOptions:
-        opts = dict(
-            permission_mode=PERMISSION_MODE, cwd=WORKING_DIR, model=MODEL,
-            can_use_tool=self._allow_tool,
-            include_partial_messages=True,
-            # exclude_dynamic_sections strips the per-turn-changing bits (cwd, git
-            # status, auto-memory) out of the preset system prompt so the big static
-            # prefix stays byte-stable → prompt-cache hits survive across turns.
-            system_prompt={"type": "preset", "preset": "claude_code",
-                           "append": SYSTEM_APPEND, "exclude_dynamic_sections": True},
-        )
-        opts["max_buffer_size"] = MAX_BUFFER_SIZE
-        if STRICT_MCP_CONFIG:
-            # Use ONLY the (empty) MCP servers defined here, ignoring the user's filesystem
-            # config. Without this the spawned CLI loads every MCP server from ~/.claude.json
-            # and injects all their tool schemas — measured at 72K tokens (36% of Haiku's
-            # 200K window) on one machine with many MCP servers, gone before the first
-            # message. setting_sources
-            # alone does NOT stop this; the CLI loads MCP servers via a separate path.
-            opts["strict_mcp_config"] = True
-        # Some kwargs (max_buffer_size, can_use_tool, strict_mcp_config) only exist on newer
-        # SDKs. Strip any the installed SDK rejects, one at a time, so an older install still
-        # loads (with reduced features) instead of failing to construct options at all.
-        droppable = ["strict_mcp_config", "max_buffer_size", "can_use_tool",
-                     "include_partial_messages"]
-        while True:
-            try:
-                return ClaudeAgentOptions(**opts)
-            except TypeError as e:
-                victim = next((k for k in droppable if k in opts and k in str(e)), None)
-                if victim is None:
-                    victim = next((k for k in droppable if k in opts), None)
-                if victim is None:
-                    raise
-                opts.pop(victim, None)
-
-    def run(self):
-        # Bounded auto-restart: even if _amain falls over entirely (e.g. the event loop
-        # dies), bring it back so the overlay self-heals instead of becoming a zombie
-        # window that never answers again.
-        dbg("worker_start")
-        attempts = 0
-        last_start = 0.0
-        while self._running and attempts < 5:
-            now = time.monotonic()
-            if last_start and now - last_start > 180:
-                attempts = 0           # survived a stable stretch → forget old failures, so
-                                       # rare crashes spread over a long session don't add up
-                                       # to a permanent "stopped" state (storm-based, not lifetime)
-            last_start = now
-            attempts += 1
-            try:
-                asyncio.run(self._amain())
-                return                      # _amain returned cleanly (stop requested)
-            except BaseException as e:  # pragma: no cover  (BaseException: e.g. CancelledError)
-                self.ui.put(("error", f"worker restarting after: {type(e).__name__}: {e}"))
-                self._client = None
-                time.sleep(0.5)
-            finally:
-                # asyncio.run() closed this loop; null it so interrupt()/set_model() don't
-                # schedule onto a dead loop before the next iteration sets a fresh one.
-                self._loop = None
-        if self._running:
-            self.ui.put(("error", "Claude worker stopped after repeated failures — "
-                                  "please restart the overlay."))
-
-    async def _amain(self):
-        self._loop = asyncio.get_running_loop()
-        await self._open()
-        while self._running:
-            try:
-                kind, payload = await self._loop.run_in_executor(None, self.req.get)
-            except Exception:
-                continue
-            if kind == "stop":
-                break
-            # Each request is fully guarded: a failure here must never break the loop
-            # (that would leave the UI waiting on a worker that's gone). Worst case we
-            # reconnect and keep serving.
-            try:
-                if kind == "reset":
-                    await self._close()
-                    self._saw_stream = False
-                    await self._open()
-                    self.ui.put(("reset_done", None))
-                elif kind == "ask":
-                    await self._run_turn(payload)
-                elif kind == "set_model":
-                    if self._client is None:
-                        self.ui.put(("error", "Not connected to Claude yet — can't switch model."))
-                        self.ui.put(("status", ""))
-                    else:
-                        await self._do_set_model(self._client, payload)
-            except asyncio.CancelledError:
-                # a cancel (Stop / transport teardown) must not break the loop or be
-                # mistaken for a fatal error — CancelledError is BaseException, not
-                # Exception, so it would otherwise escape and kill the worker.
-                self.ui.put(("turn_done", None))
-            except BaseException as e:
-                self.ui.put(("error", f"{type(e).__name__}: {e}"))
-                self.ui.put(("turn_done", None))
-                await self._reconnect()
-        await self._close()
-
-    async def _reconnect(self):
-        """Tear down a broken client and stand up a fresh one so the next turn works.
-        The conversation context is lost (new session), but the app stays alive instead
-        of freezing on a dead transport."""
-        self.ui.put(("system", "↻ Connection hiccup — reconnected with a fresh session."))
-        try:
-            await self._close()
-        except Exception:
-            pass
-        self._saw_stream = False
-        await self._open()
-
-    async def _open(self):
-        try:
-            self._client = ClaudeSDKClient(options=self._make_options())
-            # Bound the connect: a wedged transport (TLS MITM, half-open socket, CLI stuck on
-            # a prompt) would otherwise hang the worker here forever, where no reconnect/restart
-            # guard can reach it. A timeout degrades to the normal "couldn't start" path.
-            # Run it as a tracked task so shutdown() can cancel it (see shutdown/_lifecycle_task).
-            self._lifecycle_task = asyncio.ensure_future(self._client.connect())
-            try:
-                await asyncio.wait_for(self._lifecycle_task, CONNECT_TIMEOUT)
-            finally:
-                self._lifecycle_task = None
-            self.ui.put(("ready", None))
-            await self._emit_usage()
-        except BaseException as e:   # incl. CancelledError — _open must never propagate
-            self._client = None
-            if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
-                self.ui.put(("error",
-                    f"Connecting to Claude timed out after {CONNECT_TIMEOUT}s. The next "
-                    "message will try again. (Check your network / `claude --version`.)"))
-            elif isinstance(e, TypeError):   # ClaudeAgentOptions rejected a kwarg → SDK too old
-                self.ui.put(("error",
-                    f"Your claude-agent-sdk looks too old ({type(e).__name__}: {e}). "
-                    "Update it:  pip install --upgrade claude-agent-sdk  (or run update.cmd)."))
-            else:
-                self.ui.put(("error",
-                    f"Could not start Claude: {type(e).__name__}: {e}\n"
-                    "Is the `claude` CLI installed and logged in? Run `claude --version` "
-                    "in a terminal; if it's missing, run setup.cmd (or `irm "
-                    "https://claude.ai/install.ps1 | iex`), then `claude` to /login."))
-
-    async def _emit_usage(self):
-        """Push current model + context-window usage % to the UI statusline."""
-        # Capture the client we're measuring. A turn's finally schedules this against the
-        # *current* client; if a Clear/reconnect swaps the client out while the (slow,
-        # round-trips to the CLI) get_context_usage() is in flight, the result describes a
-        # session that no longer exists. Emitting it would overwrite the fresh post-reset
-        # baseline with the OLD conversation's high % — the "Clear didn't drop context" bug.
-        client = self._client
-        if client is None:
-            return
-        try:
-            u = await asyncio.wait_for(client.get_context_usage(), timeout=6)
-            if client is not self._client:   # reset/reconnect happened mid-flight → stale
-                return
-            if isinstance(u, dict):
-                if u.get("model"):
-                    self.ui.put(("model", u["model"]))
-                if u.get("percentage") is not None:
-                    self.ui.put(("ctx", u["percentage"]))
-        except Exception:
-            pass
-
-    async def _close(self):
-        # Null the handle FIRST so a disconnect that hangs (bounded below) can't leave the
-        # rest of the worker pointing at a half-dead client.
-        client, self._client = self._client, None
-        if client is not None:
-            self._lifecycle_task = asyncio.ensure_future(client.disconnect())
-            try:
-                await asyncio.wait_for(self._lifecycle_task, DISCONNECT_TIMEOUT)
-            except Exception:
-                pass
-            finally:
-                self._lifecycle_task = None
-
-    async def _run_turn(self, payload):
-        text, image_paths = payload if isinstance(payload, tuple) else (payload, [])
-        dbg("turn_start", f"imgs={len(image_paths or [])} | {str(text)[:120]}")
-        _dbg_stream_last[0] = 0.0   # force this turn's FIRST delta to log → measures time-to-first-token
-        _dbg_think_last[0] = 0.0    # and its first thinking token → time-to-first-thinking
-        # ── Debug-only test hook, gated by CLAUDE_OVERLAY_DEBUG_LOG so it's inert in normal use
-        #    (without the env var, `/simerror` is just sent to Claude as ordinary text). It emits a
-        #    synthetic errored ResultMessage so the "last turn ended with an error (<reason>)" UI
-        #    can be exercised without a real API failure. Presets: (none)=overloaded, max, exec,
-        #    rate; any other word is used verbatim as the subtype.
-        ts = text.strip() if isinstance(text, str) else ""
-        if DEBUG_LOG and (ts == "/simerror" or ts.startswith("/simerror ")):
-            arg = ts[len("/simerror"):].strip()
-            presets = {
-                "":     ("overloaded_error", "The model was overloaded (HTTP 529). Transient — the next turn retries."),
-                "max":  ("error_max_turns", None),
-                "exec": ("error_during_execution", "A tool call failed during execution."),
-                "rate": ("rate_limit_error", "Rate limited (HTTP 429)."),
-            }
-            sub, detail = presets.get(arg, (arg, None))
-            self.ui.put(("system", f"(test: simulating an errored result — subtype={sub})"))
-            self.ui.put(("result", {"is_error": True, "subtype": sub, "result": detail,
-                                    "stop_reason": None, "cost": None}))
-            self.ui.put(("turn_done", None))
-            return
-        if self._client is None:        # initial connect failed earlier — try once more
-            await self._open()
-        if self._client is None:
-            self.ui.put(("error", "Not connected to Claude. Check `claude --version`."))
-            self.ui.put(("turn_done", None))
-            return
-        agen = None
-        try:
-            await asyncio.wait_for(
-                self._client.query(self._build_query(text, image_paths)), QUERY_TIMEOUT)
-            blocks: dict = {}
-            tool_active = False
-            # Iterate the stream item-by-item under an idle timeout instead of a bare
-            # `async for`: if the transport goes silent forever (dead CLI, wedged socket)
-            # the turn would otherwise hold "thinking…" indefinitely. A gap longer than the
-            # idle budget is treated as a broken transport → reconnect. Once a tool call is in
-            # flight we switch to a much longer budget so a legitimately silent long-running
-            # tool (a big build/test that streams nothing for minutes) isn't mistaken for dead.
-            agen = self._client.receive_response()
-            while True:
-                budget = TOOL_IDLE_TIMEOUT if tool_active else RECV_IDLE_TIMEOUT
-                try:
-                    msg = await asyncio.wait_for(agen.__anext__(), budget)
-                except StopAsyncIteration:
-                    break
-                if not tool_active and self._msg_has_tool(msg):
-                    tool_active = True
-                self._dispatch(msg, blocks)
-        except asyncio.CancelledError:
-            # Stop button / interrupt() / transport cancel — end this turn cleanly.
-            # (BaseException, so it'd otherwise escape every `except Exception` and the
-            # worker thread would die permanently.) Don't reconnect; shutdown is queue-driven.
-            self.ui.put(("system", "⏹ stopped."))
-        except (asyncio.TimeoutError, TimeoutError):
-            # query() wedged or the stream went silent past the idle budget → the transport
-            # is effectively dead; rebuild it so the next turn works instead of hanging here.
-            self.ui.put(("error", "Claude stopped responding — reconnecting with a fresh session."))
-            await self._reconnect()
-        except BaseException as e:
-            self.ui.put(("error", f"{type(e).__name__}: {e}"))
-            # a decode/connection/process error means the transport is dead — the client
-            # is unusable now, so rebuild it before the next turn instead of erroring
-            # forever (the classic "it crashed and won't respond anymore" symptom).
-            if isinstance(e, (CLIJSONDecodeError, CLIConnectionError, ProcessError, ClaudeSDKError)):
-                await self._reconnect()
-        finally:
-            # Finalize the response stream. wait_for cancelling __anext__() does NOT close the
-            # async generator, so without this the SDK's reader task / stdout pipe can be left
-            # half-open (a leak, or a later disconnect() that hangs). Bounded so a broken close
-            # can't reintroduce a hang.
-            if agen is not None:
-                aclose = getattr(agen, "aclose", None)
-                if aclose is not None:
-                    try:
-                        await asyncio.wait_for(aclose(), DISCONNECT_TIMEOUT)
-                    except BaseException:
-                        pass
-            self.ui.put(("turn_done", None))
-            # Refresh context% off the critical path: schedule it rather than
-            # awaiting, so the UI leaves "thinking…" the instant the reply ends
-            # instead of after an extra round-trip.
-            try:
-                self._loop.create_task(self._emit_usage())
-            except Exception:
-                pass
-
-    def _build_query(self, text: str, image_paths: list):
-        """Return the prompt for client.query(). With inline images we yield a
-        structured user message (text + base64 image blocks) so the model sees
-        the screen directly — no per-turn Read round-trip. Otherwise a plain
-        string (the legacy "Read the PNG path" flow builds its own text upstream)."""
-        if IMAGE_INPUT != "inline" or not image_paths:
-            return text
-        content: list = []
-        if text:
-            content.append({"type": "text", "text": text})
-        failed = 0
-        total = 0
-        seen = set()
-        for p in image_paths:
-            if p in seen:           # dedupe repeated paths (same screenshot/paste twice)
-                continue
-            seen.add(p)
-            if len(seen) > MAX_INLINE_IMAGES:   # cap count per turn
-                failed += 1
-                continue
-            try:
-                # Cap before reading: per-file AND aggregate, so a huge non-image file (per
-                # file) or many accumulated attachments (aggregate) can't be read whole into
-                # RAM and base64-expanded into one query.
-                size = Path(p).stat().st_size
-                if size > MAX_INLINE_IMAGE_BYTES or (total + size) > MAX_INLINE_TOTAL_BYTES:
-                    failed += 1
-                    continue
-                data = Path(p).read_bytes()
-            except Exception:
-                failed += 1
-                continue
-            if not data:            # 0-byte / unreadable-as-empty → don't send a blank block
-                failed += 1
-                continue
-            total += size
-            ext = Path(p).suffix.lower()
-            mt = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
-                  ".gif": "image/gif"}.get(ext, "image/png")
-            content.append({"type": "image", "source": {
-                "type": "base64", "media_type": mt,
-                "data": base64.b64encode(data).decode()}})
-        if failed:   # tell the user their screen/image didn't actually attach
-            self.ui.put(("error", f"{failed} image(s) couldn't be read and were not sent."))
-        if not content:
-            return text
-        msg = {"type": "user",
-               "message": {"role": "user", "content": content},
-               "parent_tool_use_id": None}
-
-        async def _one():
-            yield msg
-
-        return _one()
-
-    @staticmethod
-    def _msg_has_tool(msg):
-        """True if this stream message starts/contains a tool_use — used to extend the
-        receive idle budget so a long, silent tool isn't mistaken for a dead transport."""
-        try:
-            if isinstance(msg, StreamEvent):
-                ev = msg.event or {}
-                if ev.get("type") == "content_block_start":
-                    return ((ev.get("content_block") or {}).get("type") == "tool_use")
-            elif isinstance(msg, AssistantMessage):
-                return any(isinstance(b, ToolUseBlock)
-                           for b in (getattr(msg, "content", None) or []))
-        except Exception:
-            pass
-        return False
-
-    def _dispatch(self, msg, blocks: dict):
-        # The contents are untrusted CLI stream-json — a single malformed frame
-        # (non-dict block value, unhashable index, content=None, …) must never abort
-        # the turn (which would also skip the reconnect logic). Skip the bad frame and
-        # keep streaming.
-        try:
-            self._dispatch_inner(msg, blocks)
-        except Exception:
-            pass
-
-    def _dispatch_inner(self, msg, blocks: dict):
-        if isinstance(msg, StreamEvent):
-            self._saw_stream = True
-            ev = msg.event or {}
-            t = ev.get("type")
-            if t == "content_block_start":
-                idx = ev.get("index")
-                cb = ev.get("content_block", {}) or {}
-                blocks[idx] = {"type": cb.get("type"), "name": cb.get("name"), "buf": ""}
-            elif t == "content_block_delta":
-                idx = ev.get("index")
-                d = ev.get("delta", {}) or {}
-                dt = d.get("type")
-                if dt == "text_delta":
-                    self.ui.put(("delta", d.get("text", "")))
-                elif dt == "thinking_delta":   # extended-thinking tokens (stream them so the
-                    self.ui.put(("think", d.get("thinking", "")))   # pre-answer wait looks alive
-                elif dt == "input_json_delta":
-                    b = blocks.get(idx)
-                    if not isinstance(b, dict):   # corrupted/missing → reset to a fresh buf
-                        b = {"type": "tool_use", "name": None, "buf": ""}
-                        blocks[idx] = b
-                    b["buf"] = (b.get("buf") or "") + (d.get("partial_json") or "")
-            elif t == "content_block_stop":
-                idx = ev.get("index")
-                b = blocks.get(idx)
-                if isinstance(b, dict) and b.get("type") == "tool_use":
-                    try:
-                        inp = json.loads(b.get("buf") or "{}")
-                    except Exception:
-                        inp = {}
-                    self.ui.put(("tool", (b.get("name") or "tool", inp)))
-        elif isinstance(msg, AssistantMessage):
-            if getattr(msg, "model", None):
-                self.ui.put(("model", msg.model))
-            if not self._saw_stream:
-                for blk in (getattr(msg, "content", None) or []):
-                    if isinstance(blk, TextBlock):
-                        self.ui.put(("delta", blk.text))
-                    elif isinstance(blk, ToolUseBlock):
-                        self.ui.put(("tool", (blk.name, blk.input)))
-        elif isinstance(msg, ResultMessage):
-            is_err = getattr(msg, "is_error", False)
-            subtype = getattr(msg, "subtype", None)
-            detail = getattr(msg, "result", None)
-            stop_reason = getattr(msg, "stop_reason", None)
-            if is_err:   # log the REAL reason (error detail, not reply text) so a past
-                         # occurrence is diagnosable from the activity log
-                dbg("result_error", "subtype=%s stop=%s detail=%s"
-                    % (subtype, stop_reason, str(detail)[:300]))
-            self.ui.put(("result", {"cost": getattr(msg, "total_cost_usd", None),
-                                    "is_error": is_err, "subtype": subtype,
-                                    "result": detail, "stop_reason": stop_reason}))
-
+from config import *
+from config import __version__
+from debuglog import dbg, DEBUG_LOG
+from win32utils import *
+from win32utils import _user32, _gdi32
+from worker import ClaudeWorker
 
 # ───────────────────────────── the overlay UI ─────────────────────────────
 PLACEHOLDER = "Reply to Claude…"
@@ -898,6 +79,7 @@ class Overlay:
         self.worker.start()
 
         self.auto_shot = AUTO_SCREENSHOT_DEFAULT
+        self.share_visible = SHOW_IN_SCREEN_SHARE_DEFAULT   # True → overlay shows in screen shares
         self.pending_shot = None
         self.pending_images: list = []
         self._precaptured = None        # (shots, monotonic_ts) grabbed while typing
@@ -936,6 +118,32 @@ class Overlay:
         self._last_cfg_size = None   # last (w,h) we re-applied the window region for
         self._capture_excluded = False   # set once WDA_EXCLUDEFROMCAPTURE is applied
         self._update_available = None     # set to the newer version string if one exists
+        self._cli_update_shown = False    # show the "CLI is out of date" notice at most once/session
+        self._cli_update_btn_ref = None   # the in-chat Update button, so its result can restyle it
+        self._restarting = False          # guard: one self-restart (relaunch + quit) at a time
+        self._mapping = False             # re-entrancy guard for the <Map> taskbar re-assert
+        self._fronting = False            # re-entrancy guard for _raise_to_front (focus churn)
+        self._vscreen_sig = None          # last virtual-desktop bounding box (display-topology sig)
+        self._vscreen_checked = 0.0       # throttle the topology watchdog to ~1.5s in _poll
+        # Per-overlay custom name (session-only, set by clicking the titlebar "Claude"). Shown
+        # in the titlebar + window title when expanded, and as a small pill UNDER the orb when
+        # collapsed — so several overlays open at once (one per task) are tellable apart at a
+        # glance while collapsed. Empty → the default "Claude" everywhere (original behaviour).
+        self.overlay_name = ""
+        self._rename_entry = None         # the in-place rename Entry while editing, else None
+        self._collapsed_mask = None       # PIL 'L' silhouette (orb ∪ name-pill ∪ done-badge) for the
+                                          # clipped collapsed window; None → plain orb sprite/ellipse
+        self._task_done_badge = False     # show a "stage complete" badge on the collapsed orb after
+                                          # a reply finishes while collapsed; cleared on expand/new turn
+        # /compact: a context-summarization pass driven by sending the CLI's `/compact` command.
+        # While it runs we animate a one-line banner in the chat (mirrors the CLI's compaction
+        # spinner) — REAL Text content rewritten in place, so it wraps + zooms — then rewrite
+        # that same line as the result.
+        self._compacting = False
+        self._compact_line = False        # True while the animated/result line exists in the chat
+        self._compact_anim_after = None   # pending animation timer id
+        self._compact_t0 = 0.0            # monotonic start (for the elapsed-seconds counter)
+        self._compact_frame = 0
 
         self._build()
         self._register_hotkey()
@@ -950,6 +158,7 @@ class Overlay:
         self.root.title("Claude")
         self.s = max(1.0, self.root.winfo_fpixels("1i") / 96.0)   # DPI scale factor
         self.root.overrideredirect(True)
+        self._apply_app_icon()                 # Clawd icon for the taskbar button / alt-tab
         self.root.configure(bg=T["bg"])
         self.root.attributes("-topmost", True)
         if WINDOW_ALPHA < 1.0:   # avoid WS_EX_LAYERED, which ignores SetWindowRgn rounding
@@ -990,6 +199,9 @@ class Overlay:
         self.f_h1    = mk(self.sans, 19, weight="bold")
         self.f_h2    = mk(self.sans, 17, weight="bold")
         self.f_h3    = mk(self.sans, 15, weight="bold")
+        # Collapsed-orb name pill: a fixed-size label (NOT registered for zoom — it only shows
+        # while collapsed, where the chat-text zoom is irrelevant). Kept as a ref so Tk won't GC it.
+        self.f_pill  = tkfont.Font(family=self.sans, size=-self.px(13), weight="bold")
 
         self._build_titlebar()
         self.hairline = tk.Frame(self.root, bg=T["border"], height=1)
@@ -1005,9 +217,13 @@ class Overlay:
 
         self.root.after(130, lambda: (self.root.focus_force(), self.entry.focus_set()))
         self.root.bind("<Configure>", self._on_configure)
+        self.root.bind("<Map>", self._on_map, add="+")   # restore (incl. from taskbar) re-asserts the frameless look
+        self.root.bind("<FocusIn>", self._on_focus_in, add="+")  # taskbar-click / alt-tab activation → raise above topmost peers
         self.root.after(170, self._apply_region)
-        self.root.after(180, self._exclude_from_capture)
+        self.root.after(180, self._apply_share_visibility)
+        self.root.after(220, self._install_taskbar_button)
         self.root.after(1200, self._check_for_update)
+        self.root.after(1500, self._check_cli_update)
         self._start_hang_watchdog()    # diagnostic: dumps all-thread stacks if the UI pump stalls
 
     def _start_hang_watchdog(self):
@@ -1077,17 +293,238 @@ class Overlay:
                 pass
         threading.Thread(target=work, daemon=True).start()
 
-    def _exclude_from_capture(self):
-        """Ask DWM to omit the overlay from screen captures so our own window never
-        appears in the screenshots we send Claude. If it succeeds, capture() can skip
-        the withdraw()+sleep() dance entirely (no flicker, no UI freeze)."""
+    def _check_cli_update(self):
+        """Best-effort, background: if the installed `claude` CLI is behind the latest npm
+        release, surface a one-click update notice (see cliupdate.py). The overlay and the CLI
+        update independently — a current overlay still drives whatever CLI is installed, and an
+        old CLI silently runs an older model. Silent on any failure (no npm, offline, corporate
+        proxy) so it never blocks or nags; the check is throttled to once/day inside cliupdate."""
+        if not CLI_UPDATE_CHECK:
+            return
+        def work():
+            try:
+                from cliupdate import check_update
+                info = check_update()
+                if info and info.get("behind"):
+                    self.ui_q.put(("cli_update", info))
+            except Exception:
+                pass
+        threading.Thread(target=work, name="cli-update-check", daemon=True).start()
+
+    def _apply_share_visibility(self):
+        """Apply the current screen-share visibility to the window's DWM display affinity.
+        share_visible=False (default) → WDA_EXCLUDEFROMCAPTURE: the overlay is omitted from
+        ALL screen captures (Teams/Zoom/OBS share, PrintScreen, our own screenshots) while
+        staying visible to the user — and capture() can then skip the withdraw()+sleep()
+        dance (no flicker, no UI freeze). share_visible=True → WDA_NONE: the overlay shows up
+        in screen shares again, and capture() falls back to a brief withdraw during its own
+        grabs so Claude's screenshots still never contain the overlay. The affinity is bound
+        to the HWND and persists across show/hide (verified: the +180ms exclusion survives the
+        +220ms taskbar withdraw→deiconify), so this only needs re-applying when the toggle flips."""
         try:
             self.root.update_idletasks()
             hwnd = _user32.GetAncestor(self.root.winfo_id(), 2) or self.root.winfo_id()
-            if _user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE):
-                self._capture_excluded = True
+            want_excluded = not self.share_visible
+            affinity = WDA_EXCLUDEFROMCAPTURE if want_excluded else WDA_NONE
+            ok = bool(_user32.SetWindowDisplayAffinity(hwnd, affinity))
+            # Only claim exclusion when we asked for it AND the call succeeded. If anything
+            # failed, treat the window as capturable so capture() still hides it via withdraw()
+            # — never leak the overlay into the screenshots we send Claude.
+            self._capture_excluded = want_excluded and ok
         except Exception:
             self._capture_excluded = False
+
+    # ── taskbar button (frameless windows get none by default) ──
+    def _hwnd(self):
+        """The top-level window handle (GA_ROOT), not the Tk child."""
+        return _user32.GetAncestor(self.root.winfo_id(), 2) or self.root.winfo_id()
+
+    def _apply_app_icon(self):
+        """Give the window (hence the taskbar button + alt-tab) the Clawd icon."""
+        if not APP_ICON:
+            return
+        try:
+            p = Path(APP_ICON)
+            if not p.is_absolute():
+                p = Path(__file__).with_name(APP_ICON)
+            if p.exists():
+                self.root.iconbitmap(default=str(p))
+        except Exception:
+            pass
+
+    def _set_taskbar_button(self):
+        """Force a taskbar button onto the frameless (overrideredirect) window by setting
+        WS_EX_APPWINDOW / clearing WS_EX_TOOLWINDOW on its top-level handle. Idempotent —
+        only writes when the bits actually need changing, so it's cheap to re-assert on
+        every show/restore. No window-region / <Configure> work, so it's clear of the
+        v1.1.9 freeze class."""
+        if not TASKBAR_BUTTON:
+            return
+        try:
+            hwnd = self._hwnd()
+            # Stamp our full taskbar identity onto the window BEFORE the app-window style flip so
+            # the button is born under our id: PKEY_AppUserModel_ID (fixes MSIX/Store-Python,
+            # where the process-wide id is ignored) PLUS RelaunchCommand + RelaunchIconResource so
+            # a pin made from it stays correct — right icon AND relaunches the overlay — even with
+            # NO Start Menu shortcut (a locked-down box where the shortcut builder is blocked).
+            # Re-stamped on EVERY call: toggling overrideredirect / a withdraw→deiconify recreates
+            # the top-level HWND, so it must be re-applied to whatever handle is current.
+            set_window_app_id(hwnd, script_path=os.path.abspath(__file__))
+            style = _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            new = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+            if new != style:
+                _user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new)
+            # Belt-and-suspenders for the RUNNING button: stamp the Clawd icon straight onto the
+            # window (WM_SETICON) so it's right even when no shortcut / relaunch icon resolves.
+            set_window_icon(hwnd)
+        except Exception:
+            pass
+
+    def _install_taskbar_button(self):
+        """One-time at startup: set the app-window style, then nudge the shell with a
+        single withdraw→deiconify so it actually materializes the button (Windows only
+        (re)evaluates taskbar membership when a window is shown). The brief hide/show is a
+        one-shot at launch, not on the streaming path."""
+        if not TASKBAR_BUTTON:
+            return
+        self._set_taskbar_button()
+        try:
+            geo = self.root.geometry()
+            self.root.withdraw()
+            self.root.after(10, lambda: self._after_taskbar_show(geo))
+        except Exception:
+            pass
+
+    def _after_taskbar_show(self, geo=None):
+        try:
+            self.root.deiconify()
+            self.root.overrideredirect(True)        # deiconify can re-add decorations → strip them
+            if geo:
+                self.root.geometry(geo)
+            self.root.attributes("-topmost", True)
+            self._set_taskbar_button()
+            self.root.after(20, self._apply_region)  # restore rounded corners
+        except Exception:
+            pass
+
+    def _on_map(self, e):
+        """Fires on the initial show and on every restore — including a restore from a
+        taskbar-button click that had minimized us. Re-assert the frameless look + topmost
+        + rounded region + app-window style so a taskbar restore can't bring back the title
+        bar / square corners. Guarded against the recursion our own deiconify triggers, and
+        ignores child-widget <Map> events."""
+        if e.widget is not self.root or not TASKBAR_BUTTON or self._mapping:
+            return
+        self._mapping = True
+        try:
+            self.root.overrideredirect(True)
+            self.root.attributes("-topmost", True)
+            self._set_taskbar_button()
+            self.root.after(20, self._apply_region)
+            self.root.after(40, lambda: self._raise_to_front(focus=True))  # restore-from-minimize → come forward + focus
+        except Exception:
+            pass
+        finally:
+            self.root.after(150, lambda: setattr(self, "_mapping", False))
+
+    def _safe_focus_entry(self):
+        try:
+            if getattr(self, "entry", None) and self.entry.winfo_exists():
+                self.entry.focus_set()
+        except Exception:
+            pass
+
+    def _raise_to_front(self, focus=False):
+        """Bring the overlay above ALL windows — including other always-on-top windows — and
+        optionally focus the input. The OS activates us on a taskbar-button click / alt-tab /
+        restore but does NOT re-order us above topmost peers, so the click could leave us
+        buried under another always-on-top window (or just unfocused). This does the z-order
+        raise the activation skips. Pure z-order (no SetWindowRgn / <Configure>), so it's
+        idempotent, flicker-free when already on top, and clear of the v1.1.9 freeze class.
+        Guarded against the focus churn it can itself trigger."""
+        if self._fronting:
+            return
+        self._fronting = True
+        try:
+            hwnd = self._hwnd()
+            self._ensure_on_screen()   # a raise is z-order only; if the window was stranded off a
+                                       # now-unplugged monitor, first bring it back into view
+            self.root.lift()
+            _user32.BringWindowToTop(hwnd)
+            # re-insert at the top of the topmost band → above other always-on-top windows;
+            # NOACTIVATE because the OS has already handed us activation (or _force_foreground did).
+            _user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+            if focus:
+                self.root.after(30, self._safe_focus_entry)
+        except Exception:
+            pass
+        finally:
+            self.root.after(150, lambda: setattr(self, "_fronting", False))
+
+    def _force_foreground(self):
+        """Steal the foreground to us even when another process owns the current foreground
+        window (the hotkey path — there WE initiate activation, so the OS hasn't handed us
+        foreground yet). The AttachThreadInput trick gets past Windows' foreground lock."""
+        try:
+            hwnd = self._hwnd()
+            fg = _user32.GetForegroundWindow()
+            cur = _user32.GetWindowThreadProcessId(fg, None) if fg else 0
+            me = _user32.GetWindowThreadProcessId(hwnd, None)
+            attached = bool(cur and cur != me and _user32.AttachThreadInput(cur, me, True))
+            _user32.SetForegroundWindow(hwnd)
+            if attached:
+                _user32.AttachThreadInput(cur, me, False)
+        except Exception:
+            pass
+
+    def _ensure_on_screen(self):
+        """If the window has drifted off EVERY connected monitor — e.g. a secondary monitor it
+        was sitting on got unplugged — move it back onto a visible monitor's work area. Without
+        this, a taskbar-button click / hotkey / restore correctly raises the window's z-order but
+        leaves it at coordinates that no longer exist, so it never appears (the "can't bring it to
+        the front after unplugging a screen" bug). A no-op when the window is already reachable, so
+        it's safe on every bring-to-front path. Move-only geometry (never resizes) → can't trigger
+        a SetWindowRgn size change, so it's clear of the v1.1.9 freeze class. Returns the applied
+        (x, y) when it moved, else None."""
+        try:
+            x, y = self.root.winfo_x(), self.root.winfo_y()
+            w, h = self.root.winfo_width(), self.root.winfo_height()
+        except Exception:
+            return None
+        if w <= 1 or h <= 1:
+            return None
+        try:
+            mons = enumerate_monitors()
+        except Exception:
+            return None
+        move = compute_onscreen_move((x, y, w, h), mons,
+                                     min_vis_w=self.px(48), min_vis_h=self.px(32))
+        if move is None:
+            return None
+        nx, ny = move
+        try:
+            self.root.geometry(f"+{nx}+{ny}")   # move-only; keeps size, so no region churn
+        except Exception:
+            return None
+        if DEBUG_LOG:
+            try:
+                dbg("onscreen", "stranded window pulled back: (%d,%d %dx%d)->(%d,%d)"
+                    % (x, y, w, h, nx, ny))
+            except Exception:
+                pass
+        return (nx, ny)
+
+    def _on_focus_in(self, e):
+        """The OS activated our top-level window — a taskbar-button click while we're visible-
+        but-behind, an alt-tab to us, or a restore all fire <FocusIn> on the root window. Raise
+        above any topmost peers so the activation actually brings us forward. Child-widget focus
+        (entry, chat) fires <FocusIn> on the CHILD, not the root, so this only runs on real
+        window activation. focus=False so we don't yank input focus from e.g. a chat-text
+        selection — the OS already gave the window focus; we only need to raise it."""
+        if e.widget is not self.root or not TASKBAR_BUTTON:
+            return
+        self._raise_to_front(focus=False)
 
     def _build_titlebar(self):
         bar = tk.Frame(self.root, bg=T["bg"], height=self.px(44))
@@ -1100,11 +537,114 @@ class Overlay:
         mark.pack(side="left", padx=(self.px(14), self.px(7)))
         self._draw_spark(mark, sz / 2, sz / 2, self.px(9))
         self._bind_drag(mark)
-        name = tk.Label(bar, text="Claude", bg=T["bg"], fg=T["text"], font=self.f_title)
-        name.pack(side="left")
-        self._bind_drag(name)
+        # The title doubles as the rename target: click it (without dragging) to edit this
+        # overlay's name; dragging it still moves the window (moved-detection, like the orb).
+        self.title_lbl = tk.Label(bar, text=self.overlay_name or "Claude", bg=T["bg"],
+                                  fg=T["text"], font=self.f_title, cursor="hand2")
+        self.title_lbl.pack(side="left")
+        self.title_lbl.bind("<ButtonPress-1>", self._title_press)
+        self.title_lbl.bind("<B1-Motion>", self._title_drag)
+        self.title_lbl.bind("<ButtonRelease-1>", self._title_release)
+        # Faint hint to the right of the title, shown ONLY before this overlay is named (and not
+        # while editing) — invites the user to click and name the session. Clicking it starts the
+        # rename too. Hidden the moment a name exists.
+        self.title_hint = tk.Label(bar, text="Click to name this session",
+                                   bg=T["bg"], fg=T["faint"], font=self.f_small, cursor="hand2")
+        self.title_hint.bind("<Button-1>", lambda e: self._begin_rename())
         self._title_btn(bar, "✕", self.quit)
         self._title_btn(bar, "—", self.toggle_collapse)
+        self._update_title_hint()
+
+    def _update_title_hint(self):
+        """Show the 'type to name this session' hint only before the overlay is named and while
+        not editing; hide it once it has a name (or during an edit)."""
+        hint = getattr(self, "title_hint", None)
+        if hint is None:
+            return
+        show = not (self.overlay_name or "").strip() and getattr(self, "_rename_entry", None) is None
+        try:
+            if show and not hint.winfo_ismapped():
+                hint.pack(side="left", padx=(self.px(8), 0))
+            elif not show:
+                hint.pack_forget()
+        except Exception:
+            pass
+
+    # ── rename this overlay (click the titlebar "Claude") ──
+    def _title_press(self, e):
+        self._title_moved = False
+        self._drag_start(e)
+
+    def _title_drag(self, e):
+        self._title_moved = True
+        self._drag_move(e)
+
+    def _title_release(self, e):
+        # A click (no drag) on the title opens the inline rename editor; a drag just moved
+        # the window (handled in _title_drag) and must NOT also trigger a rename.
+        if not self._title_moved:
+            self._begin_rename()
+
+    def _begin_rename(self):
+        if getattr(self, "_rename_entry", None) is not None:
+            return                                  # already editing
+        lbl = self.title_lbl
+        ent = tk.Entry(self.titlebar, font=self.f_title, bg=T["field"], fg=T["text"],
+                       insertbackground=T["text"], relief="flat", highlightthickness=1,
+                       highlightbackground=T["border"], highlightcolor=T["accent"])
+        ent.insert(0, self.overlay_name)
+        ent.select_range(0, "end")
+        ent.icursor("end")
+        # Overlay it on the titlebar (place, so the pack layout is untouched), spanning from the
+        # title text to just before the —/✕ buttons.
+        x = max(self.px(40), lbl.winfo_x())
+        w = max(self.px(140), self.titlebar.winfo_width() - x - self.px(78))
+        ent.place(x=x, y=self.px(8), width=w, height=self.px(28))
+        ent.focus_set()
+        ent.bind("<Return>", lambda ev: self._commit_rename())
+        ent.bind("<KP_Enter>", lambda ev: self._commit_rename())
+        ent.bind("<Escape>", lambda ev: self._cancel_rename())
+        ent.bind("<FocusOut>", lambda ev: self._commit_rename())
+        self._rename_entry = ent
+        self._update_title_hint()          # hide the hint while editing
+
+    def _commit_rename(self):
+        ent = getattr(self, "_rename_entry", None)
+        if ent is None:
+            return
+        try:
+            name = ent.get().strip()
+        except Exception:
+            name = ""
+        self._rename_entry = None          # null FIRST so the destroy-triggered <FocusOut> no-ops
+        try:
+            ent.destroy()
+        except Exception:
+            pass
+        self._apply_name(name)
+
+    def _cancel_rename(self):
+        ent = getattr(self, "_rename_entry", None)
+        self._rename_entry = None
+        if ent is not None:
+            try:
+                ent.destroy()
+            except Exception:
+                pass
+        self._update_title_hint()          # re-show the hint if still unnamed
+
+    def _apply_name(self, name):
+        self.overlay_name = name or ""
+        shown = self.overlay_name or "Claude"
+        try:
+            self.title_lbl.configure(text=shown)
+        except Exception:
+            pass
+        try:
+            self.root.title(shown)         # also updates the taskbar tooltip / alt-tab label
+        except Exception:
+            pass
+        self._update_title_hint()          # named → hide hint; cleared → show it again
 
     def _build_chat(self):
         wrap = tk.Frame(self.root, bg=T["bg"])
@@ -1275,7 +815,11 @@ class Overlay:
         self.toggle_screen.pack(side="left", padx=(self.px(16), self.px(2)), pady=pad)
         self.toggle_screen.bind("<Button-1>", lambda e: self.toggle_auto())
         self._paint_screen_toggle()
-        self._chip(st, "Snap", self.snap_now)
+        self.toggle_share = tk.Label(st, bg=T["bg"], font=self.f_small, cursor="hand2")
+        self.toggle_share.pack(side="left", padx=(self.px(8), self.px(2)), pady=pad)
+        self.toggle_share.bind("<Button-1>", lambda e: self.toggle_screen_share())
+        self._paint_share_toggle()
+        self._chip(st, "Compact", self.compact_now)
         self._chip(st, "Clear", self.reset)
         self.attach_lbl = tk.Label(st, text="", bg=T["bg"], fg=T["accent"],
                                    font=self.f_small, cursor="hand2")
@@ -1310,12 +854,138 @@ class Overlay:
         self.orb.bind("<ButtonRelease-1>", self._orb_release)
         self.orb.bind("<Enter>", lambda e: self._draw_orb(hover=True))
         self.orb.bind("<Leave>", lambda e: self._draw_orb(hover=False))
+        # Name pill shown UNDER the orb while collapsed (only when this overlay has a custom
+        # name). The whole collapsed cluster (orb + pill) shares the orb's click=expand /
+        # drag=move handlers, so clicking the name expands too. Hidden until collapse.
+        self.orb_name = tk.Canvas(self.root, highlightthickness=0, bg=T["accent"], cursor="hand2")
+        self.orb_name.bind("<ButtonPress-1>", self._orb_press)
+        self.orb_name.bind("<B1-Motion>", self._orb_drag)
+        self.orb_name.bind("<ButtonRelease-1>", self._orb_release)
+
+    def _pill_ttf(self, px_size):
+        """A PIL TrueType font for the collapsed name (PIL needs an actual font FILE to render
+        CJK). Prefer Traditional-Chinese-capable faces, fall back to Latin. Cached per size."""
+        cache = self.__dict__.setdefault("_pill_ttf_cache", {})
+        if px_size in cache:
+            return cache[px_size]
+        from PIL import ImageFont
+        font = None
+        for path in (r"C:\Windows\Fonts\msjhbd.ttc",   # Microsoft JhengHei Bold (TC)
+                     r"C:\Windows\Fonts\msjh.ttc",     # Microsoft JhengHei
+                     r"C:\Windows\Fonts\msyhbd.ttc",   # MS YaHei Bold (SC fallback)
+                     r"C:\Windows\Fonts\segoeuib.ttf", # Segoe UI Bold (Latin)
+                     r"C:\Windows\Fonts\arialbd.ttf"):
+            try:
+                font = ImageFont.truetype(path, px_size)
+                break
+            except Exception:
+                continue
+        if font is None:
+            try:
+                font = ImageFont.load_default()
+            except Exception:
+                font = None
+        cache[px_size] = font
+        return font
+
+    @staticmethod
+    def _truncate_pil(font, text, budget_px, stroke):
+        """Longest prefix of `text` whose rendered width (incl. the halo stroke) fits `budget_px`,
+        with a trailing … if cut. Measured with the PIL font so it matches the actual render."""
+        if not text or font is None:
+            return text or ""
+        def width(s):
+            try:
+                box = font.getbbox(s, stroke_width=stroke)
+            except TypeError:
+                box = font.getbbox(s)
+            return box[2] - box[0]
+        if width(text) <= budget_px:
+            return text
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if width(text[:mid] + "…") <= budget_px:
+                lo = mid
+            else:
+                hi = mid - 1
+        return (text[:lo] + "…") if lo > 0 else "…"
+
+    def _draw_name_pill(self):
+        """Render the collapsed name as BLACK text with a WHITE halo that hugs the glyph shapes —
+        no box, no border. Done by drawing the text with a thick white PIL stroke; the white sits
+        only around the letters, and the window region (built from this image's alpha in
+        _build_collapsed_mask) clips the window to that halo silhouette, so it floats like a
+        captioned label rather than a rectangle. Returns (w, h) in logical px."""
+        name = (self.overlay_name or "").strip()
+        SS = 4                                   # supersample for crisp edges at any DPI
+        fpx = self.px(14) * SS                   # caption font size
+        grow = max(2 * SS, self.px(3) * SS)      # white halo thickness (supersampled)
+        font = self._pill_ttf(fpx)
+        shown = self._truncate_pil(font, name, self.px(230) * SS, grow) or " "
+
+        probe = ImageDraw.Draw(Image.new("RGBA", (8, 8), (0, 0, 0, 0)))
+        try:
+            l, t, r, b = probe.textbbox((0, 0), shown, font=font, stroke_width=grow)
+            has_stroke = True
+        except TypeError:                        # very old Pillow: no stroke param
+            l, t, r, b = probe.textbbox((0, 0), shown, font=font)
+            has_stroke = False
+        pad = grow + SS                          # margin so anti-aliased halo isn't clipped
+        Wn, Hn = (r - l) + 2 * pad, (b - t) + 2 * pad
+        img = Image.new("RGBA", (max(1, Wn), max(1, Hn)), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        ox, oy = pad - l, pad - t
+        white, black = (255, 255, 255, 255), (0, 0, 0, 255)
+        if has_stroke:
+            d.text((ox, oy), shown, font=font, fill=black, stroke_width=grow, stroke_fill=white)
+        else:                                    # emulate the halo: white at offsets, black centre
+            g = max(1, grow)
+            for dx in range(-g, g + 1):
+                for dy in range(-g, g + 1):
+                    if dx * dx + dy * dy <= g * g:
+                        d.text((ox + dx, oy + dy), shown, font=font, fill=white)
+            d.text((ox, oy), shown, font=font, fill=black)
+
+        lw, lh = max(1, round(Wn / SS)), max(1, round(Hn / SS))
+        out = img.resize((lw, lh), Image.LANCZOS)
+        self._orb_name_photo = ImageTk.PhotoImage(out)   # keep a ref so Tk won't GC it
+        c = self.orb_name
+        c.delete("all")
+        c.configure(width=lw, height=lh, bg="#FFFFFF")   # bg = white → any AA edge blends into halo
+        c.create_image(lw // 2, lh // 2, image=self._orb_name_photo)
+        self._name_label_mask = out.split()[3]           # alpha silhouette → the window region
+        self._name_pill_size = (lw, lh)
+        return lw, lh
 
     def _draw_orb(self, hover=False):
         s = self.orb_size
         self.orb.delete("all")
         self._orb_photo = self._orb_image(s, hover)   # keep a ref so Tk won't GC it
         self.orb.create_image(s // 2, s // 2, image=self._orb_photo)
+        if getattr(self, "_task_done_badge", False):
+            self._draw_orb_badge()
+
+    def _badge_geom(self, x_off=0):
+        """(centre_x, centre_y, radius) of the done-badge, relative to a collapsed-window origin
+        with the orb's left edge at x_off (0 when drawing on the orb canvas itself). Tucked high in
+        the orb's top-right corner so it sits on the sprite's body but clears its eyes; sized to fit
+        inside the s x s orb box (centre_y >= radius keeps the top from clipping the window edge)."""
+        s = self.orb_size
+        br = max(self.px(5), int(s * 0.15))
+        return x_off + int(s * 0.78), int(s * 0.16), br
+
+    def _draw_orb_badge(self):
+        """A small green check at the orb's top-right — signals the last reply finished while the
+        overlay was collapsed. Drawn on the orb canvas; the clip region (rebuilt in
+        _rebuild_collapsed_mask) includes this circle so the floating sprite doesn't clip it away."""
+        bx, by, br = self._badge_geom(0)
+        self.orb.create_oval(bx - br, by - br, bx + br, by + br,
+                             fill="#3FB950", outline="#FFFFFF", width=max(1, self.px(1.5)))
+        w = max(2, self.px(2))
+        self.orb.create_line(bx - br * 0.42, by + br * 0.04, bx - br * 0.08, by + br * 0.40,
+                             bx + br * 0.46, by - br * 0.42,
+                             fill="#FFFFFF", width=w, capstyle="round", joinstyle="round")
 
     # ── glossy 3-D orb (rendered with Pillow, cached per size+state) ──
     @staticmethod
@@ -1532,8 +1202,14 @@ class Overlay:
 
     def _paint_screen_toggle(self):
         on = self.auto_shot
-        self.toggle_screen.configure(text=("◉  auto-screenshot" if on else "○  auto-screenshot"),
+        self.toggle_screen.configure(text=("◉  Auto-shot" if on else "○  Auto-shot"),
                                      fg=(T["accent"] if on else T["muted"]))
+
+    def _paint_share_toggle(self):
+        # ON (◉, accent) = the overlay shows up in screen shares; OFF (○, muted) = hidden/private.
+        on = self.share_visible
+        self.toggle_share.configure(text=("◉  Shareable" if on else "○  Shareable"),
+                                    fg=(T["accent"] if on else T["muted"]))
 
     # ── rounded input layout ──
     def _layout_input(self, e=None):
@@ -1639,10 +1315,14 @@ class Overlay:
         return "" if self._ph_active else self.entry.get("1.0", "end").strip()
 
     def _clipboard_has_image(self):
-        """Cheap, non-blocking probe (no OLE render): is there image/file content on the
-        clipboard? Lets the UI thread decide whether to spin up the (possibly slow)
-        grabclipboard() read without blocking on it first."""
+        """Cheap, non-blocking probe (no OLE render): should this paste be treated as an image?
+        TEXT WINS: if the clipboard carries text, paste it as text — many apps (browsers, Office,
+        screenshot tools) ALSO put a bitmap/DIB on the clipboard next to copied text, which used to
+        make a plain text copy paste as an image. Only treat it as image when there's image/file
+        content AND no text."""
         try:
+            if any(_user32.IsClipboardFormatAvailable(f) for f in (CF_UNICODETEXT, CF_TEXT)):
+                return False
             return any(_user32.IsClipboardFormatAvailable(f)
                        for f in (CF_DIB, CF_DIBV5, CF_BITMAP, CF_HDROP))
         except Exception:
@@ -1927,7 +1607,12 @@ class Overlay:
                 rgn = _gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, r, r)
             else:
                 rgn = None
-                if ORB_FLOAT and getattr(self, "_orb_mask", None) is not None \
+                # Named-collapse: clip to the composite silhouette (orb sprite ∪ name pill) so the
+                # pill floats as its own rounded tag under the free-floating orb.
+                cm = getattr(self, "_collapsed_mask", None)
+                if cm is not None and cm.size == (w, h):
+                    rgn = self._build_alpha_region(cm)
+                if rgn is None and ORB_FLOAT and getattr(self, "_orb_mask", None) is not None \
                         and self._orb_mask_size == (w, h):
                     rgn = self._build_alpha_region(self._orb_mask)   # float as the raw sprite
                 if not rgn:
@@ -1972,6 +1657,73 @@ class Overlay:
             return full
         except Exception:
             return None
+
+    def _rebuild_collapsed_mask(self):
+        """Compose the alpha silhouette for the collapsed window from current state: the orb sprite
+        at the top, the name label's halo below it (if named), and the done-badge circle (if set).
+        Fed to _build_alpha_region in _apply_region so the window floats as sprite [+ haloed name]
+        [+ badge] with no surrounding box. None when neither extra is present (the plain orb
+        sprite/ellipse fast path handles that). Built only on collapse / badge-or-name change — never
+        in a <Configure> loop, so it stays off the v1.1.9 freeze path. None on failure too."""
+        if self.expanded:
+            self._collapsed_mask = None
+            return
+        s = self.orb_size
+        named = bool((self.overlay_name or "").strip())
+        badge = bool(getattr(self, "_task_done_badge", False))
+        if not named and not badge:
+            self._collapsed_mask = None       # fast path: plain sprite/ellipse region
+            return
+        try:
+            if named:
+                pw, ph = self._name_pill_size
+                gap = self.px(5)
+                W, H = max(s, pw), s + gap + ph
+            else:
+                pw = ph = gap = 0
+                W, H = s, s
+            x_orb = (W - s) // 2
+            mask = Image.new("L", (W, H), 0)
+            om = getattr(self, "_orb_mask", None)
+            if ORB_FLOAT and om is not None and om.size == (s, s):
+                mask.paste(om, (x_orb, 0))                       # the raw sprite silhouette
+            else:
+                ImageDraw.Draw(mask).ellipse([x_orb, 0, x_orb + s - 1, s - 1], fill=255)  # circular orb
+            if named:
+                x_pill, y_pill = (W - pw) // 2, s + gap
+                lm = getattr(self, "_name_label_mask", None)
+                if lm is not None and lm.size == (pw, ph):
+                    mask.paste(lm, (x_pill, y_pill))             # the text-halo silhouette
+                else:                                            # fallback: a plain filled box
+                    ImageDraw.Draw(mask).rectangle(
+                        [x_pill, y_pill, x_pill + pw - 1, y_pill + ph - 1], fill=255)
+            if badge:
+                bx, by, br = self._badge_geom(x_orb)
+                ImageDraw.Draw(mask).ellipse([bx - br, by - br, bx + br, by + br], fill=255)
+            self._collapsed_mask = mask
+        except Exception:
+            self._collapsed_mask = None
+
+    def _set_task_badge(self, on):
+        """Toggle the collapsed-orb done-badge. Redraws the orb + the clip region only when
+        collapsed (the badge is invisible while expanded; the flag is just cleared)."""
+        on = bool(on)
+        if on == getattr(self, "_task_done_badge", False):
+            return
+        self._task_done_badge = on
+        if not self.expanded:
+            self._draw_orb()                 # draw (or remove) the badge dot
+            self._rebuild_collapsed_mask()   # include/exclude the badge circle in the clip region
+            self.root.after(10, self._apply_region)
+
+    def _maybe_flag_done(self):
+        """A reply just finished — flag the orb as 'done' if it actually produced text. The badge
+        means "last turn complete, awaiting your next message": it PERSISTS across expand/collapse
+        and is only cleared when the next turn starts (add_user) or the chat is reset. It's shown
+        only while collapsed; setting it while expanded just records the state so the next collapse
+        shows it."""
+        if (self._turn_raw or "").strip():
+            self._set_task_badge(True)
 
     # ── chat rendering (main thread only) ──
     def _readonly_keys(self, e):
@@ -2024,6 +1776,7 @@ class Overlay:
         self._md_finalize()              # commit the previous turn's last line before a new bubble
         self._turn_raw = ""              # a new turn starts → fresh assistant-answer buffer
         self._turn_copy_added = False
+        self._set_task_badge(False)      # a new task → clear any stale "done" badge on the orb
         at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", "\n")
         self.chat.window_create("end", window=self._user_bubble(text), pady=self.px(3))
@@ -2654,6 +2407,137 @@ class Overlay:
         self._md_finalize()
         self._ins("\n⚠  " + ("" if text is None else str(text)) + "\n", "err")
 
+    # ── "your CLI is out of date" notice + one-click update (see cliupdate.py) ──────────
+    def _show_cli_update_notice(self, info):
+        """Render the 'CLI is behind' notice + a one-click Update button in the chat. Shown at
+        most once per session (guarded), and only reached when cliupdate found the CLI behind."""
+        if getattr(self, "_cli_update_shown", False) or not isinstance(info, dict):
+            return
+        self._cli_update_shown = True
+        inst, latest = info.get("installed", "?"), info.get("latest", "?")
+        self.add_sys(f"🔔 Your Claude CLI is out of date (v{inst} → v{latest}). The overlay is "
+                     "current, but the CLI it drives isn't — and the newest models need the "
+                     "latest CLI. Update it in one click:")
+        at_bottom = self.chat.yview()[1] > 0.999
+        self.chat.insert("end", "\n")
+        self.chat.window_create("end", window=self._cli_update_btn(latest),
+                                padx=self.px(16), pady=self.px(2))
+        self.chat.insert("end", "\n")
+        if at_bottom:
+            self.chat.see("end")
+        self._prune_chat()
+
+    def _cli_update_btn(self, latest):
+        """One-click 'Update CLI' button embedded in the chat (same embedded-canvas pattern as the
+        Copy button). Click runs `npm install -g @anthropic-ai/claude-code@latest` in a background
+        thread; the button shows 'Updating…' meanwhile and the outcome arrives as a
+        ('cli_update_result', ...) event that restyles it. Forwards the wheel so it can't swallow
+        scrolling (the v1.4.1 embedded-widget trap)."""
+        latest = str(latest)
+        c = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0, cursor="hand2", takefocus=0)
+        c._ustate = "idle"                              # idle | working | done | error
+        st = {"f": None, "w": 0, "h": 0, "rad": 0}      # current-zoom font + box, set by render()
+        labels = {"idle": f"⬆  Update CLI to v{latest}",
+                  "working": "Updating…  (≈1 min)",
+                  "done": "✓  Updated — click to restart",
+                  "error": "⚠  Update failed — click to retry"}
+
+        def draw(hover=False):
+            c.delete("all")
+            state = c._ustate
+            if state in ("idle", "done"):
+                bg = T["accent_hi"] if (hover and state in ("idle", "done")) else T["accent"]
+                fg = T["on_accent"]
+            elif state == "error":                      # clickable (retry) → hover-lit
+                bg, fg = (T["hover"] if hover else T["tool_bg"]), T["err"]
+            else:                                       # working
+                bg, fg = T["tool_bg"], T["muted"]
+            round_rect(c, 1, 1, st["w"] - 1, st["h"] - 1, st["rad"], fill=bg, outline="")
+            c.create_text(st["w"] / 2, st["h"] / 2, text=labels[c._ustate], fill=fg,
+                          font=st["f"], anchor="center")
+
+        def render():
+            f = tkfont.Font(root=self.root, font=self.f_small)   # current zoom
+            c._overlay_fonts = [f]                               # keep a ref so Tk won't GC it
+            pad = self.px(11)
+            widest = max(f.measure(v) for v in labels.values())  # widest state → no reflow
+            st.update(f=f, h=self.px(24), rad=self.px(7), w=pad + widest + pad)
+            c.configure(width=st["w"], height=st["h"])
+            draw()
+
+        def set_state(s):
+            c._ustate = s
+            try:
+                c.configure(cursor="hand2" if s in ("idle", "done", "error") else "arrow")
+                draw()
+            except Exception:
+                pass
+        c._set_ustate = set_state    # let the result handler restyle this exact button
+
+        def on_click(_e):
+            if c._ustate in ("idle", "error"):          # first click, or retry after a failure
+                set_state("working")
+                self._cli_update_btn_ref = c
+                def work():
+                    try:
+                        from cliupdate import run_update
+                        ok, msg = run_update()
+                    except Exception as e:
+                        ok, msg = False, type(e).__name__
+                    self.ui_q.put(("cli_update_result", (bool(ok), str(msg))))
+                threading.Thread(target=work, name="cli-update", daemon=True).start()
+            elif c._ustate == "done":                   # after a successful update → restart now
+                self._restart_overlay()
+            return "break"                              # working → inert
+        c._click = on_click    # a named handle so the routing is directly testable
+
+        render()
+        c.bind("<Enter>", lambda e: draw(hover=True))
+        c.bind("<Leave>", lambda e: draw(hover=False))
+        c.bind("<Button-1>", on_click)
+        c.bind("<MouseWheel>", self._fwd_wheel)          # embedded widget must not swallow scroll
+        self._register_zoomable(c, render)
+        return c
+
+    def _show_cli_update_result(self, payload):
+        """Restyle the Update button to its final state and print a follow-up line: success →
+        'restart to use it'; failure → the reason + the manual npm command as a fallback."""
+        try:
+            ok, msg = payload
+        except Exception:
+            ok, msg = False, str(payload)
+        c = getattr(self, "_cli_update_btn_ref", None)
+        if c is not None:
+            try:
+                c._set_ustate("done" if ok else "error")
+            except Exception:
+                pass
+        if ok:
+            self.add_sys(f"✅ Claude CLI updated to v{msg}. Click the button above to restart the "
+                         "overlay now and load the newest models (or restart it yourself later).")
+        else:
+            self.add_err(f"CLI update didn't complete — {msg}. You can also update from a terminal: "
+                         " npm install -g @anthropic-ai/claude-code@latest")
+
+    def _restart_overlay(self):
+        """Relaunch a fresh overlay instance, then close this one — the 'click to restart' action
+        on the Update button (and reusable for any future restart affordance). Launches the new
+        instance DETACHED (see win32utils.relaunch_overlay) so quitting this one can't take it
+        down, then tears this one down after a short beat so the two barely overlap. If the
+        relaunch can't even start, DON'T quit — leave the user with a working window + a note."""
+        if getattr(self, "_restarting", False):
+            return
+        self._restarting = True
+        try:
+            relaunch_overlay(os.path.abspath(__file__))
+        except Exception as e:
+            self._restarting = False
+            dbg("restart", f"relaunch failed: {type(e).__name__}: {e}")
+            self.add_err("Couldn't relaunch automatically — please close and reopen the overlay.")
+            return
+        self.add_sys("↻ Restarting the overlay…")
+        self.root.after(500, self.quit)
+
     def _format_turn_error(self, payload):
         """Turn the CLI's errored ResultMessage (subtype / result / stop_reason) into a one-line
         reason, so the chat says WHY the turn errored instead of a generic message. The leading ⚠
@@ -2803,6 +2687,52 @@ class Overlay:
                      "Look at the attached image(s)/screen(s) and tell me what's there / what I might want help with.")
         return "\n\n".join(parts)
 
+    def _save_shot(self, img, stem: Path) -> Path:
+        """Save a captured screen with the smallest practical inline payload."""
+        fmt = SHOT_FORMAT if SHOT_FORMAT in {"auto", "png", "jpeg", "jpg"} else "auto"
+
+        def save_png() -> Path:
+            p = stem.with_suffix(".png")
+            img.save(p)
+            return p
+
+        def save_jpeg() -> Path:
+            p = stem.with_suffix(".jpg")
+            rgb = img.convert("RGB") if img.mode != "RGB" else img
+            rgb.save(p, format="JPEG", quality=SHOT_JPEG_QUALITY,
+                     optimize=False, progressive=False, subsampling=1)
+            return p
+
+        if fmt == "png":
+            return save_png()
+        if fmt in {"jpeg", "jpg"}:
+            return save_jpeg()
+
+        png_path = jpg_path = None
+        try:
+            png_path = save_png()
+        except Exception:
+            png_path = None
+        try:
+            jpg_path = save_jpeg()
+        except Exception:
+            jpg_path = None
+        if png_path is None and jpg_path is None:
+            raise OSError("could not save screenshot")
+        if png_path is None:
+            return jpg_path
+        if jpg_path is None:
+            return png_path
+        if jpg_path.stat().st_size < png_path.stat().st_size:
+            keep, drop = jpg_path, png_path
+        else:
+            keep, drop = png_path, jpg_path
+        try:
+            drop.unlink()
+        except Exception:
+            pass
+        return keep
+
     def _grab_shots(self, mons):
         """Pure capture: one screenshot per monitor → downscale → save. Touches NO Tk, so
         it is safe to run on a background thread (used by the precapture path). Returns
@@ -2816,8 +2746,7 @@ class Overlay:
                     img = ImageGrab.grab(bbox=bbox, all_screens=True) if bbox else ImageGrab.grab()
                     if SHOT_MAX_EDGE and max(img.size) > SHOT_MAX_EDGE:
                         img.thumbnail((SHOT_MAX_EDGE, SHOT_MAX_EDGE), Image.LANCZOS)
-                    p = SHOT_DIR / f"shot_{ts}_m{i}.png"
-                    img.save(p)
+                    p = self._save_shot(img, SHOT_DIR / f"shot_{ts}_m{i}")
                     shots.append({"path": str(p), "primary": m["primary"], "index": i})
                 except Exception as ex:
                     err = ex
@@ -2852,6 +2781,7 @@ class Overlay:
                 self.root.overrideredirect(True)
                 self.root.geometry(geo)
                 self.root.attributes("-topmost", True)
+                self._set_taskbar_button()   # withdraw→deiconify dropped the button; bring it back
                 self.root.lift()
                 self.root.after(20, self._apply_region)
         if not shots and not quiet:   # total failure — don't silently send no image
@@ -2873,7 +2803,7 @@ class Overlay:
         # making paste silently fall back to the original path.
         try:
             files = []
-            for p in SHOT_DIR.glob("shot_*.png"):
+            for p in list(SHOT_DIR.glob("shot_*.png")) + list(SHOT_DIR.glob("shot_*.jpg")):
                 try:
                     files.append((p.stat().st_mtime, p))
                 except Exception:
@@ -2890,6 +2820,18 @@ class Overlay:
         self.auto_shot = not self.auto_shot
         self._paint_screen_toggle()
 
+    def toggle_screen_share(self):
+        """Flip whether the overlay is visible in screen shares (Teams/Zoom/OBS). The change
+        is invisible on your OWN screen — the window looks identical either way; it only
+        affects what others see — so confirm it in-chat so you know the toggle took."""
+        self.share_visible = not self.share_visible
+        self._apply_share_visibility()
+        self._paint_share_toggle()
+        if self.share_visible:
+            self.add_sys("📺 Overlay will now appear in screen shares (Teams / Zoom / OBS).")
+        else:
+            self.add_sys("🙈 Overlay hidden from screen shares again — private (only you can see it).")
+
     def reset(self):
         # Interrupt any in-flight turn FIRST. Otherwise the worker is blocked in
         # receive_response() and the reset just queues behind it — meanwhile the tail
@@ -2900,6 +2842,7 @@ class Overlay:
         self._zoomables = []             # all embedded canvases were just destroyed with the text
         self._turn_raw = ""              # drop the assistant-answer buffer + its Copy-button guard
         self._turn_copy_added = False
+        self._set_task_badge(False)      # fresh conversation → drop any "task done" badge
         self._claude_header = False
         self._thinking_active = False    # don't carry a half-open thinking block into the new turn
         # Clear the shown % immediately so the OLD conversation's usage can't linger while the
@@ -2909,9 +2852,39 @@ class Overlay:
         self._refresh_statusline()
         self.worker.reset()
         self._set_status("resetting…")
+        # Chat was just wiped — drop the compaction banner/timer so a stray result line
+        # can't land in the fresh conversation (the worker's interrupt above ends the turn).
+        if self._compacting:
+            self._compacting = False
+            self.busy = False
+            self._refresh_send()
+            if self._compact_anim_after is not None:
+                try:
+                    self.root.after_cancel(self._compact_anim_after)
+                except Exception:
+                    pass
+                self._compact_anim_after = None
+            self._compact_line = False
+            try:
+                self.chat.mark_unset("compact_ln")   # chat was wiped; drop the dangling mark
+            except Exception:
+                pass
+
+    def compact_now(self):
+        """Summarize the conversation so far to free up context (the CLI's /compact)."""
+        if self._compacting:
+            return
+        if self.busy:
+            self.add_sys("⏳ Finish (or Stop) the current reply before compacting.")
+            return
+        self.worker.compact()
+        self._set_status("compacting…")   # instant feedback; the animation starts on ("compacting")
 
     def toggle_collapse(self):
         if self.expanded:
+            # editing the name when the — / double-click collapses → commit it first
+            if getattr(self, "_rename_entry", None) is not None:
+                self._commit_rename()
             self._geo_before = self.root.geometry()
             gx, gy, gw = self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width()
             for w in (self.titlebar, self.hairline, self.chat_wrap, self.input_wrap,
@@ -2919,12 +2892,32 @@ class Overlay:
                 w.pack_forget()
             self._hide_edges()
             s = self.orb_size
-            self.orb.pack(fill="both", expand=True)
-            self.root.minsize(s, s)
-            self.root.geometry(f"{s}x{s}+{gx + gw - s}+{gy}")   # stay at top-right corner
+            name = (self.overlay_name or "").strip()
+            if name:
+                # Named: orb on top, name pill below — both placed at exact coords so the window
+                # region (orb silhouette ∪ pill rounded-rect) lines up pixel-for-pixel.
+                pw, ph = self._draw_name_pill()
+                gap = self.px(5)
+                W, H = max(s, pw), s + gap + ph
+                x_orb, x_pill, y_pill = (W - s) // 2, (W - pw) // 2, s + gap
+                self.orb.place(x=x_orb, y=0, width=s, height=s)
+                self.orb_name.place(x=x_pill, y=y_pill, width=pw, height=ph)
+                self.root.minsize(W, H)
+                self.root.geometry(f"{W}x{H}+{gx + gw - W}+{gy}")   # right edge stays put
+            else:
+                self.orb_name.place_forget()
+                self.orb.place(x=0, y=0, width=s, height=s)
+                self.root.minsize(s, s)
+                self.root.geometry(f"{s}x{s}+{gx + gw - s}+{gy}")   # stay at top-right corner
             self.expanded = False
+            self._draw_orb()                  # ensure the badge (if any) is drawn for this collapse
+            self._rebuild_collapsed_mask()    # silhouette = sprite [+ name] [+ badge]
         else:
-            self.orb.pack_forget()
+            self._collapsed_mask = None
+            # Do NOT clear the done-badge on expand: it must survive expand→collapse and only go
+            # away when the next turn starts (add_user) or on reset. Re-collapsing redraws it.
+            self.orb.place_forget()
+            self.orb_name.place_forget()
             self.root.minsize(self.px(330), self.px(300))
             self.titlebar.pack(fill="x", side="top")
             self.hairline.pack(fill="x")
@@ -2934,9 +2927,10 @@ class Overlay:
             self.chat_wrap.pack(fill="both", expand=True, side="top")
             self._show_edges()
             if hasattr(self, "_geo_before"):
-                self.root.geometry(self._geo_before)
+                self.root.geometry(self._geo_before)   # may be a now-unplugged monitor's coords
             self.expanded = True
         self.root.after(30, self._apply_region)
+        self.root.after(35, self._ensure_on_screen)   # keep the restored geometry on a live monitor
 
     # ── visibility (hotkey) ──
     def _register_hotkey(self):
@@ -2955,8 +2949,9 @@ class Overlay:
         self.root.deiconify()
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.lift()
-        self.root.after(40, lambda: (self.root.focus_force(), self.entry.focus_set()))
+        self._set_taskbar_button()   # re-assert the taskbar button after a hotkey-hide → show
+        self._force_foreground()     # hotkey path: WE initiate activation, push past the fg lock
+        self._raise_to_front(focus=True)   # lift above topmost peers + focus the input
         self.root.after(60, self._apply_region)
         self.visible = True
 
@@ -2994,6 +2989,116 @@ class Overlay:
         ver = f"v{__version__}" + ("  ⬆" if self._update_available else "")
         self.statusline.configure(
             text=f"{self._model or 'Claude'} ▾   ·   context {p}   ·   {ver}", fg=T["muted"])
+
+    # ── compaction animation (mirrors the Claude Code CLI's /compact spinner) ──
+    def _start_compact_anim(self):
+        """Animate a one-line banner in the chat and pulse it until compaction finishes,
+        then rewrite that same line as the result. It's REAL Text content (not an embedded
+        widget), so it word-wraps with the window width and zooms with Ctrl +/−. The line is
+        rewritten in place via the left-gravity mark `compact_ln`."""
+        self._compacting = True
+        self.busy = True                  # send button → Stop, so the user can cancel compaction
+        self._refresh_send()
+        self._md_finalize()               # seal any prior streamed line before the banner
+        # dedicated wrapping tag for the live animation line (recoloured each frame to pulse)
+        self.chat.tag_configure("compact", foreground=T["accent"], font=self.f_chip,
+                                lmargin1=self.px(18), lmargin2=self.px(18), rmargin=self.px(14),
+                                spacing1=self.px(6), spacing3=self.px(4))
+        at_bottom = self.chat.yview()[1] > 0.999
+        self.chat.insert("end", "\n")
+        start = self.chat.index("end-1c")           # start of our (about-to-be-written) line
+        self.chat.insert("end", " \n", "compact")
+        self.chat.mark_set("compact_ln", start)
+        self.chat.mark_gravity("compact_ln", "left")  # stays at the line start across rewrites
+        self._compact_line = True
+        self._compact_t0 = time.monotonic()
+        self._compact_frame = 0
+        self._set_status("compacting…")
+        if at_bottom:
+            self.chat.see("end")
+        self._compact_tick()
+
+    def _compact_tick(self):
+        if not self._compacting or not self._compact_line:
+            return
+        frames = "✶✷✸✹✺✹✸✷"             # a sparkle that pulses (same ✦/✻ family as the rest of the UI)
+        i = self._compact_frame
+        spark = frames[i % len(frames)]
+        dots = "." * (i % 4)
+        el = int(time.monotonic() - self._compact_t0)
+        try:
+            self.chat.delete("compact_ln", "compact_ln lineend")
+            self.chat.insert("compact_ln", f"{spark}  Compacting conversation{dots}   ({el}s)",
+                             "compact")
+            self.chat.tag_configure(
+                "compact", foreground=(T["accent"] if (i // 2) % 2 == 0 else T["accent_hi"]))
+        except tk.TclError:
+            return                        # line/mark gone (chat cleared) → stop quietly
+        self._compact_frame = i + 1
+        self._compact_anim_after = self.root.after(110, self._compact_tick)
+
+    def _stop_compact_anim(self, payload):
+        self._compacting = False
+        self.busy = False
+        self._refresh_send()
+        if self._compact_anim_after is not None:
+            try:
+                self.root.after_cancel(self._compact_anim_after)
+            except Exception:
+                pass
+            self._compact_anim_after = None
+        if isinstance(payload, dict):
+            status = payload.get("status", "ok")
+            meta = payload.get("meta")
+            detail = payload.get("detail")
+        else:
+            status, meta, detail = "ok", payload, None
+        if status == "ok":
+            final = self._format_compact_result(meta)
+        elif status == "unconfirmed":
+            final = "⚠ Compaction finished, but success couldn't be confirmed — context may be unchanged."
+            if detail:
+                final += f"  ({detail})"
+        elif status == "cancelled":
+            final = "⏹ Compaction stopped — conversation unchanged."
+        elif status == "timeout":
+            final = "⚠ Compaction timed out — conversation unchanged."
+        else:
+            final = "⚠ Compaction failed — conversation unchanged."
+            if detail:
+                final += f"  ({detail})"
+        # Retag the result with a PERMANENT style tag (not the mutated "compact" tag) so a later
+        # compaction recolouring "compact" can't repaint this finished line. ok → faint "sys"
+        # line; everything else → "err". Both wrap + zoom like every other chat line.
+        tag = "sys" if status in ("ok", "cancelled") else "err"
+        active = self._compact_line
+        self._compact_line = False
+        self._set_status("")
+        if active:
+            try:
+                self.chat.delete("compact_ln", "compact_ln lineend")
+                self.chat.insert("compact_ln", final, tag)   # animation line → result line, in place
+                self.chat.mark_unset("compact_ln")
+                self._refresh_statusline()
+                return
+            except tk.TclError:
+                pass
+        # the banner line is gone (a Clear wiped the chat mid-compaction): a cancelled run needs
+        # no trailing line (reset prints "new conversation"); other outcomes still report.
+        if status != "cancelled":
+            self.add_sys(final)
+        self._refresh_statusline()
+
+    def _format_compact_result(self, meta):
+        if isinstance(meta, dict) and meta.get("pre_tokens") and meta.get("post_tokens"):
+            try:
+                pre, post = int(meta["pre_tokens"]), int(meta["post_tokens"])
+                saved = (1 - post / pre) * 100 if pre else 0
+                return (f"✦ Compacted — {pre:,} → {post:,} tokens "
+                        f"(saved {saved:.0f}%). History summarized; keep going.")
+            except Exception:
+                pass
+        return "✦ Compacted — conversation history summarized; keep going."
 
     def _model_menu(self, e):
         m = tk.Menu(self.root, tearoff=0, bg=T["field"], fg=T["text"],
@@ -3039,6 +3144,20 @@ class Overlay:
         # guarantees the next tick; per-message guarding keeps one bad render from
         # dropping the rest of the queue.
         self._last_pump = time.monotonic()    # hang-watchdog heartbeat (see _start_hang_watchdog)
+        # Display-topology watchdog: if a monitor was just plugged/unplugged (the virtual-desktop
+        # box changed), the frameless window may have been stranded off-screen — pull it back so it
+        # comes forward on its own, without waiting for a taskbar click. Cheap (4 GetSystemMetrics)
+        # and throttled to ~1.5s, so it's off the streaming/scroll path (no v1.1.9-class cost).
+        if self._last_pump - self._vscreen_checked > 1.5:
+            self._vscreen_checked = self._last_pump
+            try:
+                sig = virtual_screen_metrics()
+                if sig is not None:
+                    if self._vscreen_sig is not None and sig != self._vscreen_sig:
+                        self._ensure_on_screen()
+                    self._vscreen_sig = sig
+            except Exception:
+                pass
         if DEBUG_LOG and (self._last_pump - getattr(self, "_pump_logged", 0.0)) > 10.0:
             self._pump_logged = self._last_pump
             try:
@@ -3131,6 +3250,11 @@ class Overlay:
             self._md_finalize()          # the turn ended → give the last line full block styling
             self._finish_turn_copy()     # then a Copy button under the reply
             self._set_busy(False)
+            self._maybe_flag_done()      # badge the orb if this finished while collapsed
+        elif kind == "compacting":
+            self._start_compact_anim()
+        elif kind == "compact_done":
+            self._stop_compact_anim(payload)
         elif kind == "error":
             self.add_err(str(payload))
             self._set_busy(False)
@@ -3166,6 +3290,10 @@ class Overlay:
             self.add_sys(f"🔔 Update available: v{payload} (you have v{__version__}). "
                          "Close the overlay and run update.cmd (or: git pull) to upgrade.")
             self._refresh_statusline()
+        elif kind == "cli_update":
+            self._show_cli_update_notice(payload)
+        elif kind == "cli_update_result":
+            self._show_cli_update_result(payload)
 
     def _intro(self):
         self._ins("\n✦ Claude\n", "ah")
@@ -3219,8 +3347,24 @@ class Overlay:
         self.root.mainloop()
 
 
+def _selfheal_taskbar_shortcut():
+    """Make sure the Start Menu shortcut (matching AppUserModelID) exists so the overlay
+    pins to the taskbar correctly — relaunches when closed and shows the Clawd icon, not
+    pythonw's. Runs off the UI thread: the common case is a cheap file-read no-op, and only
+    the first launch (or a moved folder) pays a one-time ~1s builder spawn."""
+    try:
+        threading.Thread(
+            target=lambda: dbg("shortcut",
+                               ensure_taskbar_shortcut(os.path.abspath(__file__))),
+            daemon=True).start()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     set_dpi_awareness()
+    set_app_user_model_id()   # before any window, so the taskbar uses our icon
+    _selfheal_taskbar_shortcut()
     try:
         Overlay().run()
     except KeyboardInterrupt:
