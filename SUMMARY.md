@@ -4,11 +4,11 @@ _Auto-updated daily. GitHub's Traffic API only retains the last 14 days; this br
 
 | metric | value |
 |---|---|
-| **Unique cloners, last 14 days** (rolling, as of 2026-07-11) | **147** |
+| **Unique cloners, last 14 days** (rolling, as of 2026-07-12) | **150** |
 | Peak 14-day unique cloners on record | 234 |
-| Total clone events, all-time (sum of daily counts) | **1342** |
-| Days of clone data on record | 40 |
-| Unique visitors, last 14 days (rolling) | 31 |
-| Total page views, all-time | 730 |
+| Total clone events, all-time (sum of daily counts) | **1366** |
+| Days of clone data on record | 41 |
+| Unique visitors, last 14 days (rolling) | 25 |
+| Total page views, all-time | 739 |
 
-> **On unique counts.** A true *all-time* unique-cloner number is not obtainable: GitHub exposes no cloner identity, only pre-aggregated counts, so per-day uniques cannot be de-duplicated across days. "Unique cloners, last 14 days" is GitHub's own window-level figure (the best unique metric available); its history is in `rolling_14d.csv`. For reference, the naive sum of daily unique cloners is 642, which *over*-counts (a person who clones on two days is two daily-uniques) and is only an upper bound. Raw daily series: `clones.csv`.
+> **On unique counts.** A true *all-time* unique-cloner number is not obtainable: GitHub exposes no cloner identity, only pre-aggregated counts, so per-day uniques cannot be de-duplicated across days. "Unique cloners, last 14 days" is GitHub's own window-level figure (the best unique metric available); its history is in `rolling_14d.csv`. For reference, the naive sum of daily unique cloners is 656, which *over*-counts (a person who clones on two days is two daily-uniques) and is only an upper bound. Raw daily series: `clones.csv`.
