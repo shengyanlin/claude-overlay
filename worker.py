@@ -7,6 +7,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -144,6 +145,9 @@ class ClaudeWorker(threading.Thread):
                     resolved = model
             except Exception:
                 resolved = model
+            # Remember what we switched TO so the statusline reflects the current model
+            # (get_context_usage lags the version for [1m] sessions — see _display_model).
+            self._resolved_model = resolved
             await client.set_model(resolved)
             await self._emit_usage()
             self.ui.put(("status", ""))   # clear the "switching model…" notice
@@ -355,6 +359,33 @@ class ClaudeWorker(threading.Thread):
                     "in a terminal; if it's missing, run setup.cmd (or `irm "
                     "https://claude.ai/install.ps1 | iex`), then `claude` to /login."))
 
+    @staticmethod
+    def _model_family(m):
+        """The bare family ('opus'/'sonnet'/'haiku') of a model id or alias, else the
+        lowercased string. Lets us tell 'same family, the version just lags' apart from a
+        genuine cross-family override."""
+        m = (m or "").lower()
+        for fam in ("opus", "sonnet", "haiku"):
+            if fam in m:
+                return fam
+        return m
+
+    def _display_model(self, served=None):
+        """The model id to show in the statusline.
+
+        Prefer self._resolved_model — the concrete id the overlay requested and, per
+        verification, actually runs (e.g. 'claude-opus-4-8[1m]'): it carries the right
+        VERSION *and* the [1m] context badge. Deliberately do NOT trust
+        get_context_usage()['model']: on a 1M session it lags the version — it reports
+        'claude-opus-4-7[1m]' while 'claude-opus-4-8' is really serving the turn (confirmed
+        via AssistantMessage.model). Only defer to a `served` id from a DIFFERENT family
+        (a managed-settings override, or a resolution that fell back to the raw alias and
+        genuinely ran the older model) so we never hide a real override."""
+        want = self._resolved_model
+        if served and want and self._model_family(served) != self._model_family(want):
+            return served
+        return want or served
+
     async def _emit_usage(self):
         """Push current model + context-window usage % to the UI statusline."""
         # Capture the client we're measuring. A turn's finally schedules this against the
@@ -369,11 +400,15 @@ class ClaudeWorker(threading.Thread):
             u = await asyncio.wait_for(client.get_context_usage(), timeout=6)
             if client is not self._client:   # reset/reconnect happened mid-flight → stale
                 return
-            if isinstance(u, dict):
-                if u.get("model"):
-                    self.ui.put(("model", u["model"]))
-                if u.get("percentage") is not None:
-                    self.ui.put(("ctx", u["percentage"]))
+            served = u.get("model") if isinstance(u, dict) else None
+            # Show the model we actually run, not get_context_usage's version-lagging field
+            # (it reports 4-7[1m] on a 4-8 [1m] session — see _display_model). `served` is
+            # passed only so a real cross-family override still surfaces.
+            dm = self._display_model(served=served)
+            if dm:
+                self.ui.put(("model", dm))
+            if isinstance(u, dict) and u.get("percentage") is not None:
+                self.ui.put(("ctx", u["percentage"]))
         except Exception:
             pass
 
@@ -695,7 +730,10 @@ class ClaudeWorker(threading.Thread):
                     self.ui.put(("tool", (b.get("name") or "tool", inp)))
         elif isinstance(msg, AssistantMessage):
             if getattr(msg, "model", None):
-                self.ui.put(("model", msg.model))
+                # msg.model is the authoritative served model but drops the [1m] suffix, so
+                # reconcile it with the id we requested (keeps the [1m] badge, and still shows
+                # a real cross-family override). See _display_model.
+                self.ui.put(("model", self._display_model(served=msg.model)))
             if not self._saw_stream:
                 for blk in (getattr(msg, "content", None) or []):
                     if isinstance(blk, TextBlock):

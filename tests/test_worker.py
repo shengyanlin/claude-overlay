@@ -421,3 +421,109 @@ class TestMsgHasTool:
         tb = TextBlock(text="hello")
         msg = AssistantMessage(content=[tb], model="claude-opus-4-8")
         assert ClaudeWorker._msg_has_tool(msg) is False
+
+
+# ---------------------------------------------------------------------------
+# 7. _model_family / _display_model  (statusline model label)
+# ---------------------------------------------------------------------------
+
+class TestModelFamily:
+
+    def test_extracts_family_from_concrete_ids(self):
+        assert ClaudeWorker._model_family("claude-opus-4-8[1m]") == "opus"
+        assert ClaudeWorker._model_family("claude-opus-4-7") == "opus"
+        assert ClaudeWorker._model_family("claude-sonnet-4-6") == "sonnet"
+        assert ClaudeWorker._model_family("claude-haiku-4-5-20251001") == "haiku"
+
+    def test_extracts_family_from_aliases(self):
+        assert ClaudeWorker._model_family("opus[1m]") == "opus"
+        assert ClaudeWorker._model_family("sonnet") == "sonnet"
+
+    def test_none_and_unknown(self):
+        assert ClaudeWorker._model_family(None) == ""
+        assert ClaudeWorker._model_family("gpt-9") == "gpt-9"
+
+
+class TestDisplayModel:
+
+    def test_prefers_resolved_when_served_lags_same_family(self):
+        # The core fix: get_context_usage reports a version-lagging 4-7[1m] on a session we
+        # asked to run as 4-8[1m]; both are the Opus family, so keep our resolved id.
+        w = make_worker()
+        w._resolved_model = "claude-opus-4-8[1m]"
+        assert w._display_model(served="claude-opus-4-7[1m]") == "claude-opus-4-8[1m]"
+
+    def test_reattaches_1m_badge_over_assistant_model(self):
+        # AssistantMessage.model is authoritative for the version but drops the [1m] suffix;
+        # reconciling keeps the badge.
+        w = make_worker()
+        w._resolved_model = "claude-opus-4-8[1m]"
+        assert w._display_model(served="claude-opus-4-8") == "claude-opus-4-8[1m]"
+
+    def test_defers_to_served_on_cross_family_override(self):
+        # A genuine override (e.g. managed settings forcing Sonnet) must still surface.
+        w = make_worker()
+        w._resolved_model = "claude-opus-4-8[1m]"
+        assert w._display_model(served="claude-sonnet-4-6") == "claude-sonnet-4-6"
+
+    def test_no_served_returns_resolved(self):
+        w = make_worker()
+        w._resolved_model = "claude-opus-4-8"
+        assert w._display_model() == "claude-opus-4-8"
+
+
+# ---------------------------------------------------------------------------
+# 8. _do_set_model stores the switched-to model; _emit_usage shows it
+# ---------------------------------------------------------------------------
+
+class TestDoSetModelUpdatesResolved:
+
+    def test_stores_resolved_model(self, monkeypatch):
+        # Switching model must update _resolved_model so the statusline (and _make_options on
+        # any later reconnect) reflect the model we switched TO — not the startup default.
+        w = make_worker()
+        monkeypatch.setattr(worker_module, "resolve_model", lambda m: "claude-opus-4-8[1m]")
+
+        class FakeClient:
+            async def set_model(self, m):
+                self.m = m
+        fc = FakeClient()
+
+        async def drive():
+            w._loop = asyncio.get_running_loop()
+            async def _noop():
+                return None
+            w._emit_usage = _noop           # avoid needing a real client
+            await w._do_set_model(fc, "opus[1m]")
+
+        asyncio.run(drive())
+        assert w._resolved_model == "claude-opus-4-8[1m]"
+        assert fc.m == "claude-opus-4-8[1m]"
+
+
+class TestEmitUsageModel:
+
+    def test_emits_display_model_not_lagging_field(self):
+        # _emit_usage must publish the model we run (4-8[1m]), NOT get_context_usage's
+        # lagging 4-7[1m]; context % still comes from get_context_usage.
+        ui_q = queue.Queue()
+        w = ClaudeWorker(ui_q)
+        w._resolved_model = "claude-opus-4-8[1m]"
+
+        class FakeClient:
+            async def get_context_usage(self):
+                return {"model": "claude-opus-4-7[1m]", "percentage": 12}
+        fc = FakeClient()
+
+        async def drive():
+            w._client = fc
+            await w._emit_usage()
+
+        asyncio.run(drive())
+        items = []
+        while not ui_q.empty():
+            items.append(ui_q.get_nowait())
+        models = [v for (k, v) in items if k == "model"]
+        ctxs = [v for (k, v) in items if k == "ctx"]
+        assert models == ["claude-opus-4-8[1m]"]
+        assert ctxs == [12]

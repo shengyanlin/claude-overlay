@@ -3,6 +3,17 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.11.3] — 2026-07-13
+
+### Fixed
+- **The model shown in the status line is now correct for the 1M-context option.** When you
+  picked "Opus (1M)", the status line displayed the *previous* Opus version (e.g. "4.7")
+  even though your messages were actually being answered by the latest Opus at a 1M-token
+  window. The overlay was reading the model name from a Claude CLI field that reports the
+  wrong version for 1M sessions; it now shows the model it actually runs, so the label
+  matches reality. (A genuine cross-model override — e.g. one forced by managed settings —
+  still shows through.) No change to which model runs; this is a display fix only.
+
 ## [1.11.2] — 2026-07-10
 
 ### Fixed
