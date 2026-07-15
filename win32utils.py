@@ -424,6 +424,134 @@ def virtual_screen_metrics():
         return None
 
 
+# ── active-window capture (SHOT_SCOPE="window") ────────────────────────────────
+# Everything needed to answer "which window is the user actually working in, and what
+# rectangle of the screen does it cover?" — used when screenshots are scoped to the
+# active window instead of every monitor.
+_user32.IsWindow.argtypes = [wt.HWND]
+_user32.IsWindow.restype = wt.BOOL
+_user32.IsWindowVisible.argtypes = [wt.HWND]
+_user32.IsWindowVisible.restype = wt.BOOL
+_user32.IsIconic.argtypes = [wt.HWND]
+_user32.IsIconic.restype = wt.BOOL
+_user32.GetWindowRect.argtypes = [wt.HWND, ctypes.c_void_p]
+_user32.GetWindowRect.restype = wt.BOOL
+_user32.GetWindowTextLengthW.argtypes = [wt.HWND]
+_user32.GetWindowTextLengthW.restype = ctypes.c_int
+_user32.GetWindowTextW.argtypes = [wt.HWND, ctypes.c_wchar_p, ctypes.c_int]
+_user32.GetWindowTextW.restype = ctypes.c_int
+_user32.GetShellWindow.restype = wt.HWND
+_user32.GetDesktopWindow.restype = wt.HWND
+_kernel32 = ctypes.windll.kernel32
+_kernel32.GetCurrentProcessId.restype = wt.DWORD
+GA_ROOT = 2
+# DWMWA_EXTENDED_FRAME_BOUNDS is the window's VISIBLE frame — unlike GetWindowRect it
+# excludes the drop shadow and the invisible resize borders, so the capture doesn't
+# include a strip of whatever sits behind the window. dwmapi guarded: it exists on
+# every supported Windows, but a load failure must degrade to GetWindowRect, not crash.
+DWMWA_EXTENDED_FRAME_BOUNDS = 9
+try:
+    _dwmapi = ctypes.windll.dwmapi
+    _dwmapi.DwmGetWindowAttribute.argtypes = [wt.HWND, wt.DWORD, ctypes.c_void_p, wt.DWORD]
+    _dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+except Exception:
+    _dwmapi = None
+
+
+def window_is_own(hwnd):
+    """True when the window belongs to THIS process (the overlay itself — including the
+    collapsed orb): never a capture target, we want what the user is working in."""
+    try:
+        pid = wt.DWORD(0)
+        tid = _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)) if hwnd else 0
+        if not tid or not pid.value:
+            return True   # lookup failed → can't tell whose window this is
+        return pid.value == _kernel32.GetCurrentProcessId()
+    except Exception:
+        return True     # can't tell → treat as our own so it's never captured by mistake
+
+
+def window_capturable(hwnd):
+    """A window that still makes sense to screenshot: exists, visible, not minimized
+    (a minimized window's rect is a meaningless off-screen stub)."""
+    try:
+        return bool(hwnd and _user32.IsWindow(hwnd) and _user32.IsWindowVisible(hwnd)
+                    and not _user32.IsIconic(hwnd))
+    except Exception:
+        return False
+
+
+def foreground_capture_window():
+    """The top-level foreground window as a capture target, or None when the foreground
+    is unusable: this process (the user is typing in the overlay), the desktop/shell
+    (nothing focused), or a window that's gone/minimized. The caller falls back to the
+    last tracked external window, then to full-screen capture."""
+    try:
+        fg = _user32.GetForegroundWindow()
+        if not fg:
+            return None
+        fg = _user32.GetAncestor(fg, GA_ROOT) or fg
+        if fg in (_user32.GetShellWindow(), _user32.GetDesktopWindow()):
+            return None
+        if window_is_own(fg) or not window_capturable(fg):
+            return None
+        return fg
+    except Exception:
+        return None
+
+
+def window_title(hwnd):
+    """The window's title bar text ('' on failure) — labels the shot for the model."""
+    try:
+        n = _user32.GetWindowTextLengthW(hwnd)
+        if n <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(n + 1)
+        _user32.GetWindowTextW(hwnd, buf, n + 1)
+        return buf.value
+    except Exception:
+        return ""
+
+
+def clamp_bbox(rect, vbox):
+    """Intersect a window rect (l,t,r,b) with the virtual-desktop box (x,y,w,h) so a
+    half-dragged-offscreen window grabs only its visible part; None when the visible
+    overlap is degenerate (<8px a side — nothing worth sending). Pure math, no Win32."""
+    if not rect:
+        return None
+    l, t, r, b = rect
+    if vbox:
+        x, y, w, h = vbox
+        l, t = max(l, x), max(t, y)
+        r, b = min(r, x + w), min(b, y + h)
+    if r - l < 8 or b - t < 8:
+        return None
+    return (l, t, r, b)
+
+
+def window_bbox(hwnd):
+    """Screen-space (l,t,r,b) of a window suitable for ImageGrab(all_screens=True):
+    DWM extended frame bounds (visible frame, no shadow) with GetWindowRect as the
+    fallback, clipped to the virtual desktop. None when it can't be determined."""
+    rect = None
+    if _dwmapi is not None:
+        rc = wt.RECT()
+        try:
+            if _dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                             ctypes.byref(rc), ctypes.sizeof(rc)) == 0:
+                rect = (rc.left, rc.top, rc.right, rc.bottom)
+        except Exception:
+            rect = None
+    if rect is None:
+        rc = wt.RECT()
+        try:
+            if _user32.GetWindowRect(hwnd, ctypes.byref(rc)):
+                rect = (rc.left, rc.top, rc.right, rc.bottom)
+        except Exception:
+            rect = None
+    return clamp_bbox(rect, virtual_screen_metrics())
+
+
 def _mon_rect(m):
     """The usable rectangle of a monitor dict: prefer the work area, fall back to the full rect."""
     return m.get("work") or m.get("rect")

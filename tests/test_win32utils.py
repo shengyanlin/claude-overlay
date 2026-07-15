@@ -321,3 +321,71 @@ def test_set_window_icon_caches_handles_no_leak(monkeypatch):
     r2 = win32utils.set_window_icon(0x1)               # must reuse, not grow
     assert isinstance(r1, bool) and isinstance(r2, bool)   # never raised
     assert win32utils._icon_handle_cache == snapshot       # no new handles loaded
+
+
+# ── active-window capture helpers (SHOT_SCOPE="window") ─────────────────────────────
+
+# clamp_bbox is pure math (no Win32), so it gets exact assertions.
+
+def test_clamp_bbox_inside_virtual_screen_unchanged():
+    assert win32utils.clamp_bbox((100, 100, 900, 700), (0, 0, 1920, 1080)) == (100, 100, 900, 700)
+
+
+def test_clamp_bbox_clips_offscreen_overhang():
+    # Window dragged half off the left edge and past the bottom → only the visible part.
+    assert win32utils.clamp_bbox((-300, 900, 500, 1300), (0, 0, 1920, 1080)) == (0, 900, 500, 1080)
+
+
+def test_clamp_bbox_degenerate_overlap_is_none():
+    # Fully outside the virtual screen (e.g. stranded on an unplugged monitor) → nothing to grab.
+    assert win32utils.clamp_bbox((5000, 100, 5800, 700), (0, 0, 1920, 1080)) is None
+
+
+def test_clamp_bbox_sliver_is_none():
+    # A <8px visible sliver isn't worth sending as a "screenshot of the window".
+    assert win32utils.clamp_bbox((-795, 100, 5, 700), (0, 0, 1920, 1080)) is None
+
+
+def test_clamp_bbox_none_rect_is_none():
+    assert win32utils.clamp_bbox(None, (0, 0, 1920, 1080)) is None
+
+
+def test_clamp_bbox_without_vbox_passes_rect_through():
+    # virtual_screen_metrics() can return None (headless); the rect must survive unclipped.
+    assert win32utils.clamp_bbox((10, 10, 400, 300), None) == (10, 10, 400, 300)
+
+
+def test_clamp_bbox_negative_coords_legit_secondary():
+    # A monitor left of the primary means legitimate negative coords — must NOT be clipped
+    # when the virtual screen extends there.
+    assert win32utils.clamp_bbox((-1800, 50, -600, 900),
+                                 (-1920, 0, 3840, 1080)) == (-1800, 50, -600, 900)
+
+
+# The hwnd-taking helpers call the real Win32 API; assertions stay at the contract level
+# (type / no-raise), which holds even on a headless runner with no foreground window.
+
+def test_window_capturable_rejects_null_and_bogus():
+    assert win32utils.window_capturable(None) is False
+    assert win32utils.window_capturable(0) is False
+    assert win32utils.window_capturable(0xDEAD) is False   # not a real window
+
+
+def test_foreground_capture_window_never_raises():
+    hw = win32utils.foreground_capture_window()
+    assert hw is None or int(hw) != 0
+    if hw:
+        # Whatever it returned must be a live, visible, non-minimized, non-own window.
+        assert win32utils.window_capturable(hw)
+        assert win32utils.window_is_own(hw) is False
+
+
+def test_window_bbox_and_title_on_bogus_hwnd():
+    # Must degrade to None / "" rather than raise.
+    assert win32utils.window_bbox(0xDEAD) is None
+    assert win32utils.window_title(0xDEAD) == ""
+
+
+def test_window_is_own_unknown_defaults_true():
+    # "Can't tell" must fail SAFE (treated as our own window → never captured).
+    assert win32utils.window_is_own(None) is True

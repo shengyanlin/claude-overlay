@@ -110,6 +110,7 @@ def _clean_overlay(ov):
         pass
     # View / per-turn state reset() doesn't cover:
     ov.auto_shot = co.AUTO_SCREENSHOT_DEFAULT
+    ov.window_shot = (co.SHOT_SCOPE == "window")
     ov.share_visible = co.SHOW_IN_SCREEN_SHARE_DEFAULT
     ov.overlay_name = ""
     ov._model = None

@@ -272,6 +272,7 @@ Double-click **`Create Desktop Shortcut.cmd`** to drop a **Claude Overlay** shor
 | Stop a running reply | click **Stop** (the ↑ becomes ■ while busy) |
 | Paste an image | **Ctrl+V** (click **📎** to clear) |
 | Toggle auto-screenshot | **◉ / ○ Auto-shot** (orange = on) |
+| Capture only the active window | **◉ / ○ Window-only** (orange = window-only; off = every monitor) |
 | Show / hide in screen shares | **◉ / ○ Shareable** (orange = visible to Teams/Zoom/OBS; off = private, the default) |
 | Switch model | click the **statusline** (`model ▾`) |
 | Zoom text in / out | **Ctrl +** / **Ctrl −** (or **Ctrl + mouse-wheel**); **Ctrl 0** resets |
@@ -310,6 +311,14 @@ All settings are constants at the top of `claude_overlay.py`:
 - `SHOT_FORMAT` / `SHOT_JPEG_QUALITY` (or the `CLAUDE_OVERLAY_SHOT_FORMAT` /
   `CLAUDE_OVERLAY_SHOT_JPEG_QUALITY` env vars) — screenshot payload: `"auto"` keeps
   the smaller of PNG/JPEG per capture; `"png"`/`"jpeg"` force one; JPEG quality 50–95.
+- `SHOT_SCOPE` (or the `CLAUDE_OVERLAY_SHOT_SCOPE` env var) — what a screenshot covers:
+  `"screens"` (default) captures every monitor, one image each; `"window"` captures
+  **only the active window** — more private and cheaper in vision tokens, but Claude
+  can't see anything outside it. This is just the startup default; flip it live with
+  the **◉ / ○ Window-only** status-bar toggle. While you're typing *in* the overlay,
+  "active" means the window you were working in before it (tracked automatically), and
+  when no usable window exists (fresh launch, desktop focused, window minimized) it
+  falls back to full-screen capture rather than sending nothing.
 - `AUTO_SCREENSHOT_DEFAULT`, `FONT_SANS/SERIF/MONO`, `CORNER_RADIUS`, `ORB_SIZE`,
   `HIDE_SCREENSHOT_TOOL`, `WINDOW_ALPHA` — see inline comments.
 

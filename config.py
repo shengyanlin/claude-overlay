@@ -132,6 +132,17 @@ SHOT_FORMAT = os.environ.get("CLAUDE_OVERLAY_SHOT_FORMAT", "auto").strip().lower
 SHOT_JPEG_QUALITY = _env_int("CLAUDE_OVERLAY_SHOT_JPEG_QUALITY", 82, 50, 95)
                                  # Claude downsamples larger images internally anyway, so
                                  # bigger files only cost upload time + vision tokens.
+SHOT_SCOPE = os.environ.get("CLAUDE_OVERLAY_SHOT_SCOPE", "screens").strip().lower()
+                                 # what a screenshot covers — the STARTUP default; flip it live
+                                 # via the status-bar "Window-only" toggle. "screens" (default):
+                                 # one image per monitor, Claude sees everything you see.
+                                 # "window": ONLY the active (foreground) window — more private
+                                 # and far cheaper in vision tokens, but Claude can't see other
+                                 # windows/monitors. When you're typing IN the overlay, "active"
+                                 # means the last window you worked in before it (tracked live);
+                                 # when no usable window exists (fresh launch, desktop focused,
+                                 # window minimized) it falls back to full-screen capture rather
+                                 # than sending nothing. Any other value → "screens".
 IMAGE_INPUT = "inline"           # "inline" → attach screenshots as base64 image blocks
                                  # (no per-turn Read round-trip); "read" → legacy path:
                                  # save PNG + ask Claude to Read it. Flip to "read" if a

@@ -346,3 +346,39 @@ def test_format_turn_error_returns_string(overlay):
     msg = overlay._format_turn_error(payload)
     assert isinstance(msg, str)
     assert len(msg) > 0
+
+
+# ── Window-only (active-window capture) toggle ────────────────────────────────
+
+def test_toggle_window_shot_flips_state(overlay):
+    before = overlay.window_shot
+    overlay.toggle_window_shot()
+    assert overlay.window_shot is not before
+    overlay.toggle_window_shot()  # restore
+
+
+def test_toggle_window_shot_label_reflects_state(overlay):
+    import claude_overlay as co
+    overlay.window_shot = (co.SHOT_SCOPE == "window")
+    overlay._paint_window_toggle()
+    overlay.toggle_window_shot()
+    overlay.root.update_idletasks()
+    txt = overlay.toggle_window.cget("text")
+    assert "Window-only" in txt
+    assert ("◉" in txt) if overlay.window_shot else ("○" in txt)
+    overlay.toggle_window_shot()  # restore
+
+
+def test_toggle_window_shot_adds_confirmation_line(overlay):
+    overlay.toggle_window_shot()
+    txt = chat_text(overlay).lower()
+    assert "window" in txt or "screen" in txt
+    overlay.toggle_window_shot()  # restore
+
+
+def test_toggle_window_shot_drops_stale_precapture(overlay):
+    # A frame grabbed under the OLD scope must not be sent after the scope changes.
+    overlay._precaptured = ([{"path": "x.png", "primary": True, "index": 1}], 0.0)
+    overlay.toggle_window_shot()
+    assert overlay._precaptured is None
+    overlay.toggle_window_shot()  # restore

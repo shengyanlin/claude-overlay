@@ -79,6 +79,7 @@ class Overlay:
         self.worker.start()
 
         self.auto_shot = AUTO_SCREENSHOT_DEFAULT
+        self.window_shot = (SHOT_SCOPE == "window")   # True → capture only the active window
         self.share_visible = SHOW_IN_SCREEN_SHARE_DEFAULT   # True → overlay shows in screen shares
         self.pending_shot = None
         self.pending_images: list = []
@@ -125,6 +126,10 @@ class Overlay:
         self._fronting = False            # re-entrancy guard for _raise_to_front (focus churn)
         self._vscreen_sig = None          # last virtual-desktop bounding box (display-topology sig)
         self._vscreen_checked = 0.0       # throttle the topology watchdog to ~1.5s in _poll
+        self._last_ext_fg = None          # last EXTERNAL foreground hwnd — the window the user was
+                                          # working in before focusing the overlay; the "window"
+                                          # capture scope targets it whenever the overlay has focus
+        self._fg_checked = 0.0            # throttle that tracking to ~0.5s in _poll
         # Per-overlay custom name (session-only, set by clicking the titlebar "Claude"). Shown
         # in the titlebar + window title when expanded, and as a small pill UNDER the orb when
         # collapsed — so several overlays open at once (one per task) are tellable apart at a
@@ -469,6 +474,12 @@ class Overlay:
         try:
             hwnd = self._hwnd()
             fg = _user32.GetForegroundWindow()
+            try:                              # the hotkey moment is the freshest possible
+                hw = foreground_capture_window()   # answer to "which window was the user in?"
+                if hw:                             # — record it before we steal the foreground
+                    self._last_ext_fg = hw
+            except Exception:
+                pass
             cur = _user32.GetWindowThreadProcessId(fg, None) if fg else 0
             me = _user32.GetWindowThreadProcessId(hwnd, None)
             attached = bool(cur and cur != me and _user32.AttachThreadInput(cur, me, True))
@@ -815,6 +826,10 @@ class Overlay:
         self.toggle_screen.pack(side="left", padx=(self.px(16), self.px(2)), pady=pad)
         self.toggle_screen.bind("<Button-1>", lambda e: self.toggle_auto())
         self._paint_screen_toggle()
+        self.toggle_window = tk.Label(st, bg=T["bg"], font=self.f_small, cursor="hand2")
+        self.toggle_window.pack(side="left", padx=(self.px(8), self.px(2)), pady=pad)
+        self.toggle_window.bind("<Button-1>", lambda e: self.toggle_window_shot())
+        self._paint_window_toggle()
         self.toggle_share = tk.Label(st, bg=T["bg"], font=self.f_small, cursor="hand2")
         self.toggle_share.pack(side="left", padx=(self.px(8), self.px(2)), pady=pad)
         self.toggle_share.bind("<Button-1>", lambda e: self.toggle_screen_share())
@@ -1203,6 +1218,12 @@ class Overlay:
     def _paint_screen_toggle(self):
         on = self.auto_shot
         self.toggle_screen.configure(text=("◉  Auto-shot" if on else "○  Auto-shot"),
+                                     fg=(T["accent"] if on else T["muted"]))
+
+    def _paint_window_toggle(self):
+        # ON (◉, accent) = screenshots capture only the active window; OFF = all screens.
+        on = self.window_shot
+        self.toggle_window.configure(text=("◉  Window-only" if on else "○  Window-only"),
                                      fg=(T["accent"] if on else T["muted"]))
 
     def _paint_share_toggle(self):
@@ -2619,7 +2640,11 @@ class Overlay:
         """Short text companion for inline-image turns: the model sees the images
         directly, so we only add a one-line note about what's attached."""
         note = []
-        if shots:
+        if shots and shots[0].get("window") is not None:
+            note.append(f"[Attached: a live screenshot of my ACTIVE WINDOW only — "
+                        f"“{shots[0]['window']}” — not the full screen; other "
+                        f"windows and monitors are not visible to you.]")
+        elif shots:
             tags = ", ".join(f"monitor {s['index']}" + (" (primary)" if s["primary"] else "")
                              for s in shots)
             note.append(f"[Attached: a live screenshot of my screen — {tags}.]")
@@ -2664,7 +2689,7 @@ class Overlay:
         shots = None
         try:
             mons = enumerate_monitors() or [{"rect": None, "primary": True}]
-            shots, _ = self._grab_shots(mons)
+            shots, _ = self._grab_shots_scoped(mons)
         except BaseException:
             shots = None
         finally:
@@ -2673,7 +2698,11 @@ class Overlay:
     def _build_prompt(self, text, shots, images=None):
         parts = []
         lines = []
-        if shots:
+        if shots and shots[0].get("window") is not None:
+            lines.append("My ACTIVE WINDOW was just captured — window only, NOT the full "
+                         "screen (other windows/monitors are not visible to you):")
+            lines.append(f"- Active window “{shots[0]['window']}”: {shots[0]['path']}")
+        elif shots:
             lines.append("My current display was just captured — one image per monitor:")
             for s in shots:
                 tag = "PRIMARY screen" if s["primary"] else "secondary screen"
@@ -2733,6 +2762,48 @@ class Overlay:
             pass
         return keep
 
+    def _capture_target_hwnd(self):
+        """The window a 'window'-scope capture should shoot: the current foreground
+        window when it's a usable external one, else the last external foreground
+        window _poll tracked (the app the user was in before focusing the overlay).
+        None → no usable window; the caller falls back to full-screen capture."""
+        hw = foreground_capture_window()
+        if hw:
+            return hw
+        hw = self._last_ext_fg
+        return hw if window_capturable(hw) else None
+
+    def _grab_window_shot(self):
+        """Capture ONLY the active window → ([shot], None), or (None, err) when there is
+        no usable window / the grab failed — the caller falls back to _grab_shots so a
+        capture is never silently dropped. Win32 + Pillow only, no Tk: safe on the
+        background precapture thread, like _grab_shots."""
+        try:
+            hwnd = self._capture_target_hwnd()
+            if not hwnd:
+                return None, None
+            bbox = window_bbox(hwnd)
+            if not bbox:
+                return None, None
+            img = ImageGrab.grab(bbox=bbox, all_screens=True)
+            if SHOT_MAX_EDGE and max(img.size) > SHOT_MAX_EDGE:
+                img.thumbnail((SHOT_MAX_EDGE, SHOT_MAX_EDGE), Image.LANCZOS)
+            p = self._save_shot(img, SHOT_DIR / f"shot_{int(time.time() * 1000)}_w")
+            self._prune_shots()
+            return [{"path": str(p), "primary": True, "index": 1,
+                     "window": window_title(hwnd) or "untitled window"}], None
+        except Exception as ex:
+            return None, ex
+
+    def _grab_shots_scoped(self, mons):
+        """Scope dispatcher used by both the send-time and precapture paths: the active
+        window when that scope is on AND a usable window exists, else every monitor."""
+        if self.window_shot:
+            shots, err = self._grab_window_shot()
+            if shots:
+                return shots, err
+        return self._grab_shots(mons)
+
     def _grab_shots(self, mons):
         """Pure capture: one screenshot per monitor → downscale → save. Touches NO Tk, so
         it is safe to run on a background thread (used by the precapture path). Returns
@@ -2774,7 +2845,7 @@ class Overlay:
             self.root.update()
             time.sleep(0.15)
         try:
-            shots, err = self._grab_shots(mons)
+            shots, err = self._grab_shots_scoped(mons)
         finally:
             if do_hide:
                 self.root.deiconify()
@@ -2819,6 +2890,18 @@ class Overlay:
     def toggle_auto(self):
         self.auto_shot = not self.auto_shot
         self._paint_screen_toggle()
+
+    def toggle_window_shot(self):
+        """Flip the capture scope between the active window and all screens. Like the
+        share toggle, the change is invisible on screen, so confirm it in-chat."""
+        self.window_shot = not self.window_shot
+        self._precaptured = None   # a frame grabbed under the OLD scope must not be sent
+        self._paint_window_toggle()
+        if self.window_shot:
+            self.add_sys("🎯 Screenshots now capture the ACTIVE WINDOW only "
+                         "(falls back to full screen when no window is in focus).")
+        else:
+            self.add_sys("🖥 Screenshots capture all screens again (one image per monitor).")
 
     def toggle_screen_share(self):
         """Flip whether the overlay is visible in screen shares (Teams/Zoom/OBS). The change
@@ -3156,6 +3239,19 @@ class Overlay:
                     if self._vscreen_sig is not None and sig != self._vscreen_sig:
                         self._ensure_on_screen()
                     self._vscreen_sig = sig
+            except Exception:
+                pass
+        # Track the most recent EXTERNAL foreground window (throttled, one cheap Win32
+        # call): when a "window"-scope capture happens while the overlay itself has
+        # focus — which is ALWAYS the case at send time, the user just typed here —
+        # this remembered hwnd is the window the user was actually working in. Tracked
+        # even while the toggle is off, so flipping it on works on the very next send.
+        if self._last_pump - self._fg_checked > 0.5:
+            self._fg_checked = self._last_pump
+            try:
+                hw = foreground_capture_window()
+                if hw:
+                    self._last_ext_fg = hw
             except Exception:
                 pass
         if DEBUG_LOG and (self._last_pump - getattr(self, "_pump_logged", 0.0)) > 10.0:

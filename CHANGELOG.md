@@ -3,6 +3,20 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Screenshots can now capture just the active window instead of every monitor.** A new
+  **◉ / ○ Window-only** status-bar toggle (startup default via `SHOT_SCOPE` /
+  `CLAUDE_OVERLAY_SHOT_SCOPE`) scopes each capture to the window you're working in —
+  more private (Claude sees nothing outside that window) and much cheaper in vision
+  tokens on multi-monitor setups. Because the overlay itself has focus while you type,
+  it remembers the window you were in before summoning it and captures that one; the
+  window's title is passed to Claude so it knows what it's looking at, and the visible
+  frame is captured without the drop shadow. When no usable window exists (fresh
+  launch, desktop focused, window minimized) it falls back to the normal full-screen
+  capture rather than sending nothing.
+
 ## [1.11.4] — 2026-07-15
 
 ### Fixed
