@@ -341,6 +341,10 @@ the **◉ / ○ Read-only** status-bar toggle: it switches the live session into
 mode (Claude looks, reads, and answers — but edits and runs nothing), and while it's
 on the overlay **denies every permission escalation the agent asks for** (including
 `ExitPlanMode`), so read-only can't be talked out of; flip it back for full access.
+(One nuance: the CLI refuses to elevate a session to `bypassPermissions` unless it was
+*launched* in it — so when the overlay started read-only, flipping the toggle off lands
+on `acceptEdits` instead, which the overlay's auto-approval makes effectively full
+access; the in-chat notice always names the mode you actually got.)
 To *start* locked, set `PERMISSION_MODE = "plan"`. (`"acceptEdits"` / `"default"` are
 of limited use here: a GUI with no terminal has nowhere to show a permission prompt,
 so the overlay auto-answers them — see `worker._allow_tool`.)

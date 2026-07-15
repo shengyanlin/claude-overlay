@@ -13,7 +13,9 @@ This project follows [Semantic Versioning](https://semver.org/).
   every permission escalation the agent requests (including `ExitPlanMode`, which the
   overlay's blanket auto-approval would otherwise grant — silently lifting read-only).
   Set `PERMISSION_MODE = "plan"` to start locked; the mode also survives the overlay's
-  automatic reconnects.
+  automatic reconnects. When the session wasn't *launched* in `bypassPermissions` the
+  CLI forbids elevating to it at run time, so unlocking lands on `acceptEdits` instead —
+  effectively full access here, and the in-chat notice names the mode you actually got.
 - **Screenshots can now capture just the active window instead of every monitor.** A new
   **◉ / ○ Window-only** status-bar toggle (startup default via `SHOT_SCOPE` /
   `CLAUDE_OVERLAY_SHOT_SCOPE`) scopes each capture to the window you're working in —

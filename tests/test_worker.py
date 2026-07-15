@@ -588,3 +588,70 @@ class TestEmitUsageModel:
         ctxs = [v for (k, v) in items if k == "ctx"]
         assert models == ["claude-opus-4-8[1m]"]
         assert ctxs == [12]
+
+
+# ---------------------------------------------------------------------------
+# 5d. bypassPermissions runtime-elevation fallback
+# ---------------------------------------------------------------------------
+
+class _FakeModeClient:
+    def __init__(self, fail=False):
+        self.calls, self.fail = [], fail
+
+    async def set_permission_mode(self, mode):
+        if self.fail:
+            raise RuntimeError("nope")
+        self.calls.append(mode)
+
+
+def _drain(q):
+    out = []
+    while True:
+        try:
+            out.append(q.get_nowait())
+        except queue.Empty:
+            return out
+
+
+class TestBypassElevationFallback:
+
+    def test_substitutes_accept_edits_when_not_launch_capable(self):
+        # A session NOT launched with --dangerously-skip-permissions can never be
+        # elevated to bypassPermissions (the CLI refuses) — the worker must switch to
+        # acceptEdits instead and confirm THAT mode to the UI, not the requested one.
+        w = make_worker()
+        w._bypass_capable = False
+        c = _FakeModeClient()
+        asyncio.run(w._do_set_permission_mode(c, "bypassPermissions"))
+        assert c.calls == ["acceptEdits"]
+        assert w._permission_mode == "acceptEdits"
+        assert ("permission_mode", "acceptEdits") in _drain(w.ui)
+
+    def test_passes_bypass_through_when_launch_capable(self):
+        w = make_worker()
+        w._bypass_capable = True
+        c = _FakeModeClient()
+        asyncio.run(w._do_set_permission_mode(c, "bypassPermissions"))
+        assert c.calls == ["bypassPermissions"]
+        assert w._permission_mode == "bypassPermissions"
+
+    def test_plan_never_substituted(self):
+        # The fallback must only affect ELEVATION to bypass — locking to plan is
+        # always allowed and must go through untouched.
+        w = make_worker()
+        w._bypass_capable = False
+        c = _FakeModeClient()
+        asyncio.run(w._do_set_permission_mode(c, "plan"))
+        assert c.calls == ["plan"]
+
+    def test_failure_keeps_mode_and_resyncs_ui(self):
+        # On a CLI refusal the active mode must NOT change, and the UI must get the
+        # UNCHANGED mode back so the toggle repaints truthfully (plus an error line).
+        w = make_worker()
+        w._bypass_capable = True
+        before = w._permission_mode
+        asyncio.run(w._do_set_permission_mode(_FakeModeClient(fail=True), "plan"))
+        assert w._permission_mode == before
+        events = _drain(w.ui)
+        assert ("permission_mode", before) in events
+        assert any(k == "error" for k, _ in events)

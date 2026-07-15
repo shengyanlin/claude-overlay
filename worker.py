@@ -90,6 +90,12 @@ class ClaudeWorker(threading.Thread):
         # reconnect with the CURRENT mode, not the startup one, and (b) _allow_tool
         # must know when it's read-only (see the plan guard there).
         self._permission_mode = PERMISSION_MODE
+        # Whether THIS session may ever be switched to bypassPermissions at run time:
+        # the CLI refuses to ELEVATE a running session to bypass unless it was launched
+        # with --dangerously-skip-permissions, and the SDK only adds that flag when the
+        # session STARTS in bypass mode. Re-derived on every _open() (a reconnect that
+        # happens while read-only relaunches without the flag).
+        self._bypass_capable = (PERMISSION_MODE == "bypassPermissions")
 
     def ask(self, text: str, image_paths=None):
         self.req.put(("ask", (text, list(image_paths or []))))
@@ -145,6 +151,13 @@ class ClaudeWorker(threading.Thread):
         self.req.put(("set_permission_mode", mode))
 
     async def _do_set_permission_mode(self, client, mode):
+        if mode == "bypassPermissions" and not self._bypass_capable:
+            # This session can't be elevated to bypass (see _bypass_capable). acceptEdits
+            # is the runtime-reachable full-access equivalent HERE: anything else that
+            # would prompt is auto-approved by _allow_tool once we're out of plan mode,
+            # so the only practical difference is the label. The substituted mode is what
+            # gets confirmed to the UI, so the in-chat notice reflects reality.
+            mode = "acceptEdits"
         try:
             fn = getattr(client, "set_permission_mode", None)
             if fn is None:   # pre-0.1 SDKs: no runtime switching — keep the mode truthful
@@ -371,6 +384,7 @@ class ClaudeWorker(threading.Thread):
     async def _open(self):
         try:
             self._client = ClaudeSDKClient(options=self._make_options())
+            self._bypass_capable = (self._permission_mode == "bypassPermissions")
             # Bound the connect: a wedged transport (TLS MITM, half-open socket, CLI stuck on
             # a prompt) would otherwise hang the worker here forever, where no reconnect/restart
             # guard can reach it. A timeout degrades to the normal "couldn't start" path.
