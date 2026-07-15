@@ -5,6 +5,7 @@ pure decision/parsing/caching logic (the streaming-alias-lag workaround, see the
 docstring). Cross-platform: the module is stdlib-only and the Windows console flag is 0
 off-Windows."""
 import json
+import time
 
 import modelresolve as mr
 
@@ -73,12 +74,13 @@ def test_no_cli_returns_original_alias(monkeypatch):
     assert mr.resolve_model("opus") == "opus"
 
 
-# ── cache: keyed by the CLI launcher's file signature; a hit skips the probe (and any
-#    subprocess), a changed CLI (new signature) re-probes ──
+# ── cache: keyed by the CLI launcher's file signature + a probe timestamp; a fresh hit
+#    (matching signature, within the TTL) skips the probe, while a changed CLI, an aged-out
+#    entry, or a pre-TTL entry (no timestamp) re-probes ──
 
 def test_cache_hit_skips_probe(monkeypatch, tmp_path):
     cache = tmp_path / "c.json"
-    cache.write_text(json.dumps({"signature": "claude|100|111",
+    cache.write_text(json.dumps({"signature": "claude|100|111", "probed_at": time.time(),
                                  "aliases": {"opus": "claude-opus-4-8"}}), "utf-8")
     monkeypatch.setattr(mr, "_CACHE_PATH", cache)
     monkeypatch.setattr(mr, "_find_cli", lambda: "claude")
@@ -111,9 +113,66 @@ def test_cache_miss_writes_result(monkeypatch, tmp_path):
     monkeypatch.setattr(mr, "_find_cli", lambda: "claude")
     monkeypatch.setattr(mr, "cli_signature", lambda cli: "claude|100|111")
     monkeypatch.setattr(mr, "_probe_concrete", lambda cli, base: "claude-sonnet-4-6")
+    before = time.time()
     assert mr.resolve_model("sonnet") == "claude-sonnet-4-6"
     saved = json.loads(cache.read_text("utf-8"))
-    assert saved == {"signature": "claude|100|111", "aliases": {"sonnet": "claude-sonnet-4-6"}}
+    assert saved["signature"] == "claude|100|111"
+    assert saved["aliases"] == {"sonnet": "claude-sonnet-4-6"}
+    assert before <= saved["probed_at"] <= time.time()   # stamped now for the TTL
+
+
+def test_expired_cache_reprobes_and_restamps(monkeypatch, tmp_path):
+    # Same CLI signature, but the probe is older than the TTL -> re-probe. This is the
+    # "org enabled a newer Sonnet with no CLI upgrade" case: the signature is unchanged, so
+    # only the TTL rescues us. The classic symptom was 'sonnet' stuck on the previous id.
+    cache = tmp_path / "c.json"
+    stale = time.time() - (mr._CACHE_TTL_S + 100)
+    cache.write_text(json.dumps({"signature": "claude|100|111", "probed_at": stale,
+                                 "aliases": {"sonnet": "claude-sonnet-4-6"}}), "utf-8")
+    monkeypatch.setattr(mr, "_CACHE_PATH", cache)
+    monkeypatch.setattr(mr, "_find_cli", lambda: "claude")
+    monkeypatch.setattr(mr, "cli_signature", lambda cli: "claude|100|111")
+    probed = []
+    monkeypatch.setattr(mr, "_probe_concrete",
+                        lambda cli, base: probed.append(base) or "claude-sonnet-5")
+    assert mr.resolve_model("sonnet") == "claude-sonnet-5"   # fresh id, not the stale one
+    assert probed == ["sonnet"]                              # the TTL forced a re-probe
+    saved = json.loads(cache.read_text("utf-8"))
+    assert saved["aliases"]["sonnet"] == "claude-sonnet-5"
+    assert saved["probed_at"] > stale                        # restamped
+
+
+def test_pre_ttl_cache_without_timestamp_reprobes(monkeypatch, tmp_path):
+    # A cache written by a pre-TTL overlay has a matching signature but NO 'probed_at'.
+    # It must be treated as stale so upgrading the overlay self-heals a stuck alias.
+    cache = tmp_path / "c.json"
+    cache.write_text(json.dumps({"signature": "claude|100|111",
+                                 "aliases": {"sonnet": "claude-sonnet-4-6"}}), "utf-8")
+    monkeypatch.setattr(mr, "_CACHE_PATH", cache)
+    monkeypatch.setattr(mr, "_find_cli", lambda: "claude")
+    monkeypatch.setattr(mr, "cli_signature", lambda cli: "claude|100|111")
+    probed = []
+    monkeypatch.setattr(mr, "_probe_concrete",
+                        lambda cli, base: probed.append(base) or "claude-sonnet-5")
+    assert mr.resolve_model("sonnet") == "claude-sonnet-5"
+    assert probed == ["sonnet"]
+
+
+def test_new_alias_in_fresh_generation_keeps_timestamp(monkeypatch, tmp_path):
+    # Resolving a second alias within a still-fresh generation must add it WITHOUT resetting
+    # 'probed_at' — otherwise switching models on every launch would extend the TTL forever.
+    cache = tmp_path / "c.json"
+    stamp = time.time() - 60
+    cache.write_text(json.dumps({"signature": "claude|100|111", "probed_at": stamp,
+                                 "aliases": {"opus": "claude-opus-4-8"}}), "utf-8")
+    monkeypatch.setattr(mr, "_CACHE_PATH", cache)
+    monkeypatch.setattr(mr, "_find_cli", lambda: "claude")
+    monkeypatch.setattr(mr, "cli_signature", lambda cli: "claude|100|111")
+    monkeypatch.setattr(mr, "_probe_concrete", lambda cli, base: "claude-sonnet-5")
+    assert mr.resolve_model("sonnet") == "claude-sonnet-5"   # not cached yet -> probed
+    saved = json.loads(cache.read_text("utf-8"))
+    assert saved["aliases"] == {"opus": "claude-opus-4-8", "sonnet": "claude-sonnet-5"}
+    assert saved["probed_at"] == stamp                       # generation timestamp preserved
 
 
 def test_use_cache_false_always_probes_and_never_writes(monkeypatch, tmp_path):

@@ -3,6 +3,21 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.11.4] — 2026-07-15
+
+### Fixed
+- **The model menu now picks up a newer model the day it becomes available, instead of
+  staying stuck on the previous one.** The overlay ships model *families* ("Opus",
+  "Sonnet", "Haiku") and asks the Claude CLI which concrete version each family currently
+  means, caching the answer so most launches are instant. That cache was only refreshed
+  when the CLI itself was upgraded — but which version a family points to can also change
+  with no CLI upgrade at all (for example when your account or organization is granted a
+  newer model mid-week). When that happened, the overlay kept resolving the family to the
+  older version indefinitely, so choosing "Sonnet" still ran the previous Sonnet even after
+  a newer one went live. The cache now also expires on a timer (re-checking at least every
+  few hours) and a cache written by an older overlay is refreshed on first launch, so a
+  newly available model shows up on its own without reinstalling or clearing anything.
+
 ## [1.11.3] — 2026-07-13
 
 ### Fixed
