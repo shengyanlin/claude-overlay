@@ -6,7 +6,7 @@ so anything may import it without a circular-import risk."""
 import os
 from pathlib import Path
 
-__version__ = "1.11.4"
+__version__ = "1.12.0"
 
 def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     try:

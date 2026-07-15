@@ -3,7 +3,7 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.12.0] — 2026-07-16
 
 ### Added
 - **A Read-only status-bar toggle (◉ / ○ Read-only).** Switches the live session between
@@ -32,6 +32,9 @@ This project follows [Semantic Versioning](https://semver.org/).
   capture rather than sending nothing. The toggle remembers your choice across launches
   (a tiny per-machine `state.json` under `%LOCALAPPDATA%\claude-overlay`); an explicitly
   set `CLAUDE_OVERLAY_SHOT_SCOPE` env var overrides the memory for that launch.
+
+Both features were contributed by [@l8w8](https://github.com/l8w8) in
+[#3](https://github.com/shengyanlin/claude-overlay/pull/3).
 
 ## [1.11.4] — 2026-07-15
 
@@ -721,6 +724,9 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.12.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.12.0
+[1.11.4]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.4
+[1.11.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.3
 [1.11.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.2
 [1.11.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.1
 [1.11.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.0
