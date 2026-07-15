@@ -382,3 +382,41 @@ def test_toggle_window_shot_drops_stale_precapture(overlay):
     overlay.toggle_window_shot()
     assert overlay._precaptured is None
     overlay.toggle_window_shot()  # restore
+
+
+# ── Read-only (permission mode) toggle ────────────────────────────────────────
+
+def test_toggle_read_only_asks_worker_does_not_flip_yet(overlay):
+    # Unlike the other toggles, state must NOT change until the worker confirms —
+    # the label must never claim a safety state the CLI isn't in.
+    before = overlay.read_only
+    overlay.toggle_read_only()
+    assert overlay.read_only == before
+    calls = [c for c in overlay.worker.calls if c[0] == "set_permission_mode"]
+    assert calls, "toggle must enqueue a set_permission_mode request"
+    target = calls[-1][1][0]
+    assert target == ("plan" if not before else overlay._full_mode)
+
+
+def test_apply_permission_mode_flips_paints_and_confirms(overlay):
+    overlay.read_only = False
+    overlay._paint_ro_toggle()
+    overlay._apply_permission_mode("plan")
+    overlay.root.update_idletasks()
+    assert overlay.read_only is True
+    txt = overlay.toggle_ro.cget("text")
+    assert "◉" in txt and "Read-only" in txt
+    assert "read-only" in chat_text(overlay).lower()
+    overlay._apply_permission_mode(overlay._full_mode)   # back to full access
+    assert overlay.read_only is False
+    assert "○" in overlay.toggle_ro.cget("text")
+
+
+def test_apply_permission_mode_unchanged_mode_is_quiet(overlay):
+    # Re-confirming the mode we're already in (e.g. after a failed switch re-sync)
+    # must not spam the chat.
+    overlay.read_only = False
+    overlay._paint_ro_toggle()
+    before = chat_text(overlay)
+    overlay._apply_permission_mode(overlay._full_mode)
+    assert chat_text(overlay) == before

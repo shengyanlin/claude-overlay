@@ -6,6 +6,14 @@ This project follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **A Read-only status-bar toggle (◉ / ○ Read-only).** Switches the live session between
+  `"plan"` — Claude can see your screen, read files, and answer, but not edit anything or
+  run commands — and the configured `PERMISSION_MODE`, with no restart. The toggle only
+  flips once the CLI confirms the switch, and while read-only is on the overlay denies
+  every permission escalation the agent requests (including `ExitPlanMode`, which the
+  overlay's blanket auto-approval would otherwise grant — silently lifting read-only).
+  Set `PERMISSION_MODE = "plan"` to start locked; the mode also survives the overlay's
+  automatic reconnects.
 - **Screenshots can now capture just the active window instead of every monitor.** A new
   **◉ / ○ Window-only** status-bar toggle (startup default via `SHOT_SCOPE` /
   `CLAUDE_OVERLAY_SHOT_SCOPE`) scopes each capture to the window you're working in —

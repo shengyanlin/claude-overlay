@@ -84,6 +84,12 @@ class ClaudeWorker(threading.Thread):
         # before the event loop starts; defaults to the raw alias so nothing breaks if
         # resolution is skipped or fails. See modelresolve for WHY (streaming alias lag).
         self._resolved_model = MODEL
+        # The ACTIVE permission mode. Starts at the config constant; the status-bar
+        # "Read-only" toggle switches it at run time ("plan" ⇄ the configured mode).
+        # Kept here (not just CLI-side) because (a) _make_options must rebuild any
+        # reconnect with the CURRENT mode, not the startup one, and (b) _allow_tool
+        # must know when it's read-only (see the plan guard there).
+        self._permission_mode = PERMISSION_MODE
 
     def ask(self, text: str, image_paths=None):
         self.req.put(("ask", (text, list(image_paths or []))))
@@ -132,6 +138,27 @@ class ClaudeWorker(threading.Thread):
         # line stuck on "switching model…".
         self.req.put(("set_model", model))
 
+    def set_permission_mode(self, mode):
+        # Queued like set_model, and for the same serialization reasons. The UI does NOT
+        # flip its toggle when it calls this — it waits for the ("permission_mode", mode)
+        # confirmation event, so the toggle never claims a safety state the CLI isn't in.
+        self.req.put(("set_permission_mode", mode))
+
+    async def _do_set_permission_mode(self, client, mode):
+        try:
+            fn = getattr(client, "set_permission_mode", None)
+            if fn is None:   # pre-0.1 SDKs: no runtime switching — keep the mode truthful
+                raise RuntimeError("this claude-agent-sdk can't switch permission modes "
+                                   "at run time — update it (pip install -U claude-agent-sdk)")
+            await fn(mode)
+            self._permission_mode = mode   # AFTER success only; also survives reconnects
+            self.ui.put(("permission_mode", mode))
+        except Exception as e:
+            self.ui.put(("error", f"permission switch failed: {type(e).__name__}: {e}"))
+            self.ui.put(("permission_mode", self._permission_mode))   # re-sync the toggle
+        finally:
+            self.ui.put(("status", ""))
+
     async def _do_set_model(self, client, model):
         try:
             # Switching also goes through the streaming transport, which lags the alias the
@@ -167,6 +194,18 @@ class ClaudeWorker(threading.Thread):
             return PermissionResultDeny(
                 message="This overlay has no interactive question UI. Ask the user your "
                         "question inline as plain text and wait for their typed reply.")
+        # Read-only guard: while the active mode is "plan", DENY everything this callback
+        # is consulted about. Plan mode lets read-only tools run without asking, so any
+        # call that reaches here is a request for MORE power — including ExitPlanMode,
+        # the tool plan mode uses to ask for write access. The blanket auto-approve
+        # below would grant that and silently lift read-only out from under the user;
+        # denying keeps the "Read-only" toggle honest until the user flips it off.
+        if self._permission_mode == "plan" and PermissionResultDeny is not None:
+            return PermissionResultDeny(
+                message="The user has locked this overlay READ-ONLY (plan mode). Don't "
+                        "retry the call or try to exit plan mode — present your findings "
+                        "as text, and mention that the user can flip the Read-only "
+                        "status-bar toggle off if they want you to make the change.")
         # Auto-approve every other tool. permission_mode="bypassPermissions" already does
         # this on most machines, but managed/enterprise installs can DISABLE bypass
         # mode (managed-settings.json: disableBypassPermissionsMode), which makes the
@@ -179,7 +218,7 @@ class ClaudeWorker(threading.Thread):
 
     def _make_options(self) -> ClaudeAgentOptions:
         opts = dict(
-            permission_mode=PERMISSION_MODE, cwd=WORKING_DIR, model=self._resolved_model,
+            permission_mode=self._permission_mode, cwd=WORKING_DIR, model=self._resolved_model,
             can_use_tool=self._allow_tool,
             include_partial_messages=True,
             # exclude_dynamic_sections strips the per-turn-changing bits (cwd, git
@@ -300,6 +339,12 @@ class ClaudeWorker(threading.Thread):
                         self.ui.put(("status", ""))
                     else:
                         await self._do_set_model(self._client, payload)
+                elif kind == "set_permission_mode":
+                    if self._client is None:
+                        self.ui.put(("error", "Not connected to Claude yet — can't switch permissions."))
+                        self.ui.put(("status", ""))
+                    else:
+                        await self._do_set_permission_mode(self._client, payload)
             except asyncio.CancelledError:
                 # a cancel (Stop / transport teardown) must not break the loop or be
                 # mistaken for a fatal error — CancelledError is BaseException, not

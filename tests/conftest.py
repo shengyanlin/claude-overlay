@@ -47,6 +47,7 @@ class FakeWorker:
     def reset(self):            self._rec("reset")
     def compact(self):          self._rec("compact")
     def set_model(self, *a):    self._rec("set_model", *a)
+    def set_permission_mode(self, *a):  self._rec("set_permission_mode", *a)
     def interrupt(self):        self._rec("interrupt")
     def shutdown(self):         self._rec("shutdown")
     def join(self, *a, **k):    self._rec("join")
@@ -112,6 +113,7 @@ def _clean_overlay(ov):
     ov.auto_shot = co.AUTO_SCREENSHOT_DEFAULT
     ov.window_shot = (co.SHOT_SCOPE == "window")
     ov.share_visible = co.SHOW_IN_SCREEN_SHARE_DEFAULT
+    ov.read_only = (co.PERMISSION_MODE == "plan")
     ov.overlay_name = ""
     ov._model = None
     ov._ctx_pct = None

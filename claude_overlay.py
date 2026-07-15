@@ -81,6 +81,12 @@ class Overlay:
         self.auto_shot = AUTO_SCREENSHOT_DEFAULT
         self.window_shot = (SHOT_SCOPE == "window")   # True → capture only the active window
         self.share_visible = SHOW_IN_SCREEN_SHARE_DEFAULT   # True → overlay shows in screen shares
+        self.read_only = (PERMISSION_MODE == "plan")  # True → agent may look, not act; the toggle
+                                                      # flips it via the worker (confirmed async)
+        self._full_mode = (PERMISSION_MODE if PERMISSION_MODE != "plan"
+                           else "bypassPermissions")  # what Read-only OFF returns to: the
+                                                      # configured mode — unless that IS plan,
+                                                      # then the CLI default full-access mode
         self.pending_shot = None
         self.pending_images: list = []
         self._precaptured = None        # (shots, monotonic_ts) grabbed while typing
@@ -834,6 +840,10 @@ class Overlay:
         self.toggle_share.pack(side="left", padx=(self.px(8), self.px(2)), pady=pad)
         self.toggle_share.bind("<Button-1>", lambda e: self.toggle_screen_share())
         self._paint_share_toggle()
+        self.toggle_ro = tk.Label(st, bg=T["bg"], font=self.f_small, cursor="hand2")
+        self.toggle_ro.pack(side="left", padx=(self.px(8), self.px(2)), pady=pad)
+        self.toggle_ro.bind("<Button-1>", lambda e: self.toggle_read_only())
+        self._paint_ro_toggle()
         self._chip(st, "Compact", self.compact_now)
         self._chip(st, "Clear", self.reset)
         self.attach_lbl = tk.Label(st, text="", bg=T["bg"], fg=T["accent"],
@@ -1231,6 +1241,13 @@ class Overlay:
         on = self.share_visible
         self.toggle_share.configure(text=("◉  Shareable" if on else "○  Shareable"),
                                     fg=(T["accent"] if on else T["muted"]))
+
+    def _paint_ro_toggle(self):
+        # ON (◉, accent) = read-only ("plan"): Claude may look and answer, but not change
+        # anything; OFF (○, muted) = the configured full-access mode.
+        on = self.read_only
+        self.toggle_ro.configure(text=("◉  Read-only" if on else "○  Read-only"),
+                                 fg=(T["accent"] if on else T["muted"]))
 
     # ── rounded input layout ──
     def _layout_input(self, e=None):
@@ -2903,6 +2920,30 @@ class Overlay:
         else:
             self.add_sys("🖥 Screenshots capture all screens again (one image per monitor).")
 
+    def toggle_read_only(self):
+        """Ask the worker to flip between read-only ("plan") and the configured
+        full-access mode. Unlike the other toggles the state does NOT flip
+        optimistically: it only changes when the worker confirms the CLI accepted
+        the switch (the "permission_mode" event → _apply_permission_mode), so the
+        label never claims a safety state the agent isn't actually in."""
+        target = self._full_mode if self.read_only else "plan"
+        self._set_status("switching permissions…")
+        self.worker.set_permission_mode(target)
+
+    def _apply_permission_mode(self, mode):
+        """Worker confirmed the active permission mode: sync the toggle and, when it
+        actually changed, say so in-chat (the switch itself is invisible on screen)."""
+        ro = (mode == "plan")
+        changed = (ro != self.read_only)
+        self.read_only = ro
+        self._paint_ro_toggle()
+        if changed and ro:
+            self.add_sys("🔒 Read-only: Claude can see your screen, read files, and "
+                         "answer — but won't edit anything or run commands.")
+        elif changed:
+            self.add_sys(f"⚡ Full access ({mode}): Claude can now edit files and run "
+                         "commands without asking. Flip Read-only back on any time.")
+
     def toggle_screen_share(self):
         """Flip whether the overlay is visible in screen shares (Teams/Zoom/OBS). The change
         is invisible on your OWN screen — the window looks identical either way; it only
@@ -3379,6 +3420,8 @@ class Overlay:
                 self._precaptured = (payload, time.monotonic())
         elif kind == "status":
             self._set_status(str(payload))
+        elif kind == "permission_mode":
+            self._apply_permission_mode(str(payload))
         elif kind == "system":
             self.add_sys(str(payload))
         elif kind == "update":

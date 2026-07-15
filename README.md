@@ -274,6 +274,7 @@ Double-click **`Create Desktop Shortcut.cmd`** to drop a **Claude Overlay** shor
 | Toggle auto-screenshot | **◉ / ○ Auto-shot** (orange = on) |
 | Capture only the active window | **◉ / ○ Window-only** (orange = window-only; off = every monitor) |
 | Show / hide in screen shares | **◉ / ○ Shareable** (orange = visible to Teams/Zoom/OBS; off = private, the default) |
+| Lock Claude read-only | **◉ / ○ Read-only** (orange = "plan" mode: looks and answers, changes nothing; off = the configured `PERMISSION_MODE`) |
 | Switch model | click the **statusline** (`model ▾`) |
 | Zoom text in / out | **Ctrl +** / **Ctrl −** (or **Ctrl + mouse-wheel**); **Ctrl 0** resets |
 | New conversation | **Clear** |
@@ -298,8 +299,10 @@ All settings are constants at the top of `claude_overlay.py`:
   in-app switcher lists them all (the statusline shows the concrete version each alias
   resolved to, e.g. `claude-opus-4-8`). Don't use `None`: the Agent SDK resolves `None`
   to an older model, not the CLI's interactive default.
-- `PERMISSION_MODE` — `"bypassPermissions"` by default (see security note below).
-  Use `"acceptEdits"`, `"default"`, or `"plan"` to add confirmation / read-only.
+- `PERMISSION_MODE` — `"bypassPermissions"` by default (see security note below); this
+  is just the **startup** mode — the **◉ / ○ Read-only** status-bar toggle switches the
+  live session between `"plan"` (read-only) and this mode at any time. Set `"plan"` to
+  start locked read-only.
 - `WORKING_DIR` — folder Claude operates in (default: your home directory).
 - `THEME` — `"light"` (warm paper) or `"dark"`.
 - `TASKBAR_BUTTON` — `True` (default) gives the frameless window a real, clickable
@@ -331,9 +334,14 @@ also lets it **act on the app you have open** — e.g. edit the document or slid
 deck on your screen via Windows/COM automation, and (with autosave on) persist
 those edits straight to the original file. That's the magic, but it also means it
 can change important documents without a confirmation step — double-check before
-you let it loose on anything you can't afford to lose. If you don't want that, set
-`PERMISSION_MODE` to `"acceptEdits"` (asks before edits), `"default"` (asks before
-most actions), or `"plan"` (read-only) before running.
+you let it loose on anything you can't afford to lose. If you don't want that, flip
+the **◉ / ○ Read-only** status-bar toggle: it switches the live session into `"plan"`
+mode (Claude looks, reads, and answers — but edits and runs nothing), and while it's
+on the overlay **denies every permission escalation the agent asks for** (including
+`ExitPlanMode`), so read-only can't be talked out of; flip it back for full access.
+To *start* locked, set `PERMISSION_MODE = "plan"`. (`"acceptEdits"` / `"default"` are
+of limited use here: a GUI with no terminal has nowhere to show a permission prompt,
+so the overlay auto-answers them — see `worker._allow_tool`.)
 
 ## Contributing
 

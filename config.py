@@ -51,6 +51,11 @@ MODEL = "opus"   # startup default: the latest Opus family
 MODELS = [("Opus", "opus"), ("Opus (1M)", "opus[1m]"),
           ("Sonnet", "sonnet"), ("Haiku", "haiku")]  # click the statusline to switch
 PERMISSION_MODE = "bypassPermissions"
+                                 # the STARTUP permission mode; flip it at run time with the
+                                 # status-bar "Read-only" toggle (◉ = "plan", a read-only agent
+                                 # that can look and answer but not edit/run anything; ○ = back
+                                 # to this configured mode). "plan" here starts the overlay
+                                 # locked read-only. See the security note in README.md.
 # Tools the overlay must NEVER let the model call, because they need an interactive UI
 # this app can't provide. AskUserQuestion (Claude Code's structured multiple-choice
 # question tool) is the one that bites: when the model calls it, the CLI blocks waiting
