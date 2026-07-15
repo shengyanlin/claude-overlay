@@ -272,9 +272,10 @@ Double-click **`Create Desktop Shortcut.cmd`** to drop a **Claude Overlay** shor
 | Stop a running reply | click **Stop** (the ↑ becomes ■ while busy) |
 | Paste an image | **Ctrl+V** (click **📎** to clear) |
 | Toggle auto-screenshot | **◉ / ○ Auto-shot** (orange = on) |
-| Capture only the active window | **◉ / ○ Window-only** (orange = window-only; off = every monitor) |
-| Show / hide in screen shares | **◉ / ○ Shareable** (orange = visible to Teams/Zoom/OBS; off = private, the default) |
-| Lock Claude read-only | **◉ / ○ Read-only** (orange = "plan" mode: looks and answers, changes nothing; off = the configured `PERMISSION_MODE`) |
+| Settings menu | click **⚙** — Window-only, Shareable, Read-only (✓ = on); the gear turns orange while Read-only is on |
+| &nbsp;&nbsp;• Capture only the active window | **⚙ → Window-only** (window only; off = every monitor) |
+| &nbsp;&nbsp;• Show / hide in screen shares | **⚙ → Shareable** (visible to Teams/Zoom/OBS; off = private, the default) |
+| &nbsp;&nbsp;• Lock Claude read-only | **⚙ → Read-only** ("plan" mode: looks and answers, changes nothing; off = the configured `PERMISSION_MODE`) |
 | Switch model | click the **statusline** (`model ▾`) |
 | Zoom text in / out | **Ctrl +** / **Ctrl −** (or **Ctrl + mouse-wheel**); **Ctrl 0** resets |
 | New conversation | **Clear** |
@@ -300,7 +301,7 @@ All settings are constants at the top of `claude_overlay.py`:
   resolved to, e.g. `claude-opus-4-8`). Don't use `None`: the Agent SDK resolves `None`
   to an older model, not the CLI's interactive default.
 - `PERMISSION_MODE` — `"bypassPermissions"` by default (see security note below); this
-  is just the **first-launch** mode — the **◉ / ○ Read-only** status-bar toggle switches
+  is just the **first-launch** mode — the **⚙ → Read-only** menu item switches
   the live session between `"plan"` (read-only) and this mode at any time, and the
   toggle **remembers your last choice across launches** (announced in-chat at startup
   whenever the remembered state differs from this default). Set `"plan"` to start
@@ -320,7 +321,7 @@ All settings are constants at the top of `claude_overlay.py`:
   `"screens"` (default) captures every monitor, one image each; `"window"` captures
   **only the active window** — more private and cheaper in vision tokens, but Claude
   can't see anything outside it. This is just the startup default; flip it live with
-  the **◉ / ○ Window-only** status-bar toggle — and the toggle **remembers your choice
+  the **⚙ → Window-only** menu item — and the choice **is remembered
   across launches** (stored per-machine in `%LOCALAPPDATA%\claude-overlay\state.json`;
   setting the env var explicitly overrides it for that launch). While you're typing *in* the overlay,
   "active" means the window you were working in before it (tracked automatically), and
@@ -338,8 +339,8 @@ also lets it **act on the app you have open** — e.g. edit the document or slid
 deck on your screen via Windows/COM automation, and (with autosave on) persist
 those edits straight to the original file. That's the magic, but it also means it
 can change important documents without a confirmation step — double-check before
-you let it loose on anything you can't afford to lose. If you don't want that, flip
-the **◉ / ○ Read-only** status-bar toggle: it switches the live session into `"plan"`
+you let it loose on anything you can't afford to lose. If you don't want that, open
+the **⚙** menu and turn on **Read-only**: it switches the live session into `"plan"`
 mode (Claude looks, reads, and answers — but edits and runs nothing), and while it's
 on the overlay **denies every permission escalation the agent asks for** (including
 `ExitPlanMode`), so read-only can't be talked out of; flip it back for full access.

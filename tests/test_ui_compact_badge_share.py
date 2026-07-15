@@ -238,18 +238,15 @@ def test_toggle_screen_share_flips_state(overlay):
     overlay.toggle_screen_share()
 
 
-def test_toggle_screen_share_label_text_reflects_state(overlay):
-    # Force a known state first
+def test_toggle_screen_share_reflected_in_gear_menu(overlay):
+    # Shareable moved into the ⚙ settings menu; its row shows a ✓ exactly when it's on.
     import claude_overlay as co
     overlay.share_visible = co.SHOW_IN_SCREEN_SHARE_DEFAULT
     overlay._paint_share_toggle()
     overlay.toggle_screen_share()
     overlay.root.update_idletasks()
-    txt = overlay.toggle_share.cget("text")
-    if overlay.share_visible:
-        assert "◉" in txt and "Shareable" in txt
-    else:
-        assert "○" in txt and "Shareable" in txt
+    row = next(lbl for lbl, _ in overlay._gear_items() if "Shareable" in lbl)
+    assert ("✓" in row) if overlay.share_visible else ("✓" not in row)
     # Restore
     overlay.toggle_screen_share()
 
@@ -357,15 +354,14 @@ def test_toggle_window_shot_flips_state(overlay):
     overlay.toggle_window_shot()  # restore
 
 
-def test_toggle_window_shot_label_reflects_state(overlay):
+def test_toggle_window_shot_reflected_in_gear_menu(overlay):
     import claude_overlay as co
     overlay.window_shot = (co.SHOT_SCOPE == "window")
     overlay._paint_window_toggle()
     overlay.toggle_window_shot()
     overlay.root.update_idletasks()
-    txt = overlay.toggle_window.cget("text")
-    assert "Window-only" in txt
-    assert ("◉" in txt) if overlay.window_shot else ("○" in txt)
+    row = next(lbl for lbl, _ in overlay._gear_items() if "Window-only" in lbl)
+    assert ("✓" in row) if overlay.window_shot else ("✓" not in row)
     overlay.toggle_window_shot()  # restore
 
 
@@ -399,17 +395,22 @@ def test_toggle_read_only_asks_worker_does_not_flip_yet(overlay):
 
 
 def test_apply_permission_mode_flips_paints_and_confirms(overlay):
+    import claude_overlay as co
     overlay.read_only = False
     overlay._paint_ro_toggle()
     overlay._apply_permission_mode("plan")
     overlay.root.update_idletasks()
     assert overlay.read_only is True
-    txt = overlay.toggle_ro.cget("text")
-    assert "◉" in txt and "Read-only" in txt
+    # Read-only now lives in the ⚙ menu (✓ row) and tints the gear the accent color.
+    row = next(lbl for lbl, _ in overlay._gear_items() if "Read-only" in lbl)
+    assert "✓" in row
+    assert overlay.gear.cget("fg") == co.T["accent"]
     assert "read-only" in chat_text(overlay).lower()
     overlay._apply_permission_mode(overlay._full_mode)   # back to full access
     assert overlay.read_only is False
-    assert "○" in overlay.toggle_ro.cget("text")
+    row2 = next(lbl for lbl, _ in overlay._gear_items() if "Read-only" in lbl)
+    assert "✓" not in row2
+    assert overlay.gear.cget("fg") == co.T["muted"]
 
 
 def test_apply_permission_mode_unchanged_mode_is_quiet(overlay):
@@ -420,6 +421,38 @@ def test_apply_permission_mode_unchanged_mode_is_quiet(overlay):
     before = chat_text(overlay)
     overlay._apply_permission_mode(overlay._full_mode)
     assert chat_text(overlay) == before
+
+
+# ── ⚙ settings menu (Window-only / Shareable / Read-only consolidated) ────────
+
+def _gear_row(overlay, name):
+    return next(lbl for lbl, _ in overlay._gear_items() if name in lbl)
+
+
+def test_gear_items_reflect_each_state(overlay):
+    overlay.window_shot = overlay.share_visible = overlay.read_only = True
+    for name in ("Window-only", "Shareable", "Read-only"):
+        assert "✓" in _gear_row(overlay, name)
+    overlay.window_shot = overlay.share_visible = overlay.read_only = False
+    for name in ("Window-only", "Shareable", "Read-only"):
+        assert "✓" not in _gear_row(overlay, name)
+
+
+def test_gear_items_wire_to_toggle_handlers(overlay):
+    cmds = {lbl.strip("✓ "): cmd for lbl, cmd in overlay._gear_items()}
+    assert cmds["Window-only"] == overlay.toggle_window_shot
+    assert cmds["Shareable"] == overlay.toggle_screen_share
+    assert cmds["Read-only"] == overlay.toggle_read_only
+
+
+def test_paint_gear_color_tracks_read_only(overlay):
+    import claude_overlay as co
+    overlay.read_only = True
+    overlay._paint_gear()
+    assert overlay.gear.cget("fg") == co.T["accent"]
+    overlay.read_only = False
+    overlay._paint_gear()
+    assert overlay.gear.cget("fg") == co.T["muted"]
 
 
 # ── Persisted UI state (window_shot survives a relaunch) ─────────────────────

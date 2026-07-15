@@ -887,20 +887,18 @@ class Overlay:
         self.toggle_screen.pack(side="left", padx=(self.px(16), self.px(2)), pady=pad)
         self.toggle_screen.bind("<Button-1>", lambda e: self.toggle_auto())
         self._paint_screen_toggle()
-        self.toggle_window = tk.Label(st, bg=T["bg"], font=self.f_small, cursor="hand2")
-        self.toggle_window.pack(side="left", padx=(self.px(8), self.px(2)), pady=pad)
-        self.toggle_window.bind("<Button-1>", lambda e: self.toggle_window_shot())
-        self._paint_window_toggle()
-        self.toggle_share = tk.Label(st, bg=T["bg"], font=self.f_small, cursor="hand2")
-        self.toggle_share.pack(side="left", padx=(self.px(8), self.px(2)), pady=pad)
-        self.toggle_share.bind("<Button-1>", lambda e: self.toggle_screen_share())
-        self._paint_share_toggle()
-        self.toggle_ro = tk.Label(st, bg=T["bg"], font=self.f_small, cursor="hand2")
-        self.toggle_ro.pack(side="left", padx=(self.px(8), self.px(2)), pady=pad)
-        self.toggle_ro.bind("<Button-1>", lambda e: self.toggle_read_only())
-        self._paint_ro_toggle()
         self._chip(st, "Compact", self.compact_now)
         self._chip(st, "Clear", self.reset)
+        # The Window-only / Shareable / Read-only toggles used to sit inline here, which
+        # crowded the bar. They now live behind a single ⚙ settings menu (see _gear_menu).
+        # The gear turns the accent color while Read-only is ON, so that safety state stays
+        # visible at a glance without opening the menu.
+        self.gear = tk.Label(st, text="⚙", bg=T["bg"], font=self.f_small, cursor="hand2")
+        self.gear.pack(side="left", padx=(self.px(10), self.px(2)), pady=pad)
+        self.gear.bind("<Button-1>", self._gear_menu)
+        self.gear.bind("<Enter>", lambda e: self.gear.configure(fg=T["accent"]))
+        self.gear.bind("<Leave>", lambda e: self._paint_gear())
+        self._paint_gear()
         self.attach_lbl = tk.Label(st, text="", bg=T["bg"], fg=T["accent"],
                                    font=self.f_small, cursor="hand2")
         self.attach_lbl.pack(side="left", padx=self.px(6), pady=pad)
@@ -1285,24 +1283,52 @@ class Overlay:
         self.toggle_screen.configure(text=("◉  Auto-shot" if on else "○  Auto-shot"),
                                      fg=(T["accent"] if on else T["muted"]))
 
+    def _paint_gear(self):
+        # The ⚙ settings menu holds Window-only / Shareable / Read-only. It carries no
+        # per-toggle text on the bar; instead it turns the accent color while Read-only is
+        # ON, so that safety lock stays visible without opening the menu. Guarded so the
+        # paint helpers below are safe to call before the gear exists / in headless tests.
+        if not hasattr(self, "gear"):
+            return
+        self.gear.configure(fg=(T["accent"] if self.read_only else T["muted"]))
+
+    # Window-only / Shareable / Read-only moved into the ⚙ menu; their state is shown by
+    # the checkmarks in _gear_items and (for Read-only) the gear color. These three keep
+    # their old names so every existing caller (the toggle handlers, _apply_permission_mode)
+    # just refreshes the gear.
     def _paint_window_toggle(self):
-        # ON (◉, accent) = screenshots capture only the active window; OFF = all screens.
-        on = self.window_shot
-        self.toggle_window.configure(text=("◉  Window-only" if on else "○  Window-only"),
-                                     fg=(T["accent"] if on else T["muted"]))
+        self._paint_gear()
 
     def _paint_share_toggle(self):
-        # ON (◉, accent) = the overlay shows up in screen shares; OFF (○, muted) = hidden/private.
-        on = self.share_visible
-        self.toggle_share.configure(text=("◉  Shareable" if on else "○  Shareable"),
-                                    fg=(T["accent"] if on else T["muted"]))
+        self._paint_gear()
 
     def _paint_ro_toggle(self):
-        # ON (◉, accent) = read-only ("plan"): Claude may look and answer, but not change
-        # anything; OFF (○, muted) = the configured full-access mode.
-        on = self.read_only
-        self.toggle_ro.configure(text=("◉  Read-only" if on else "○  Read-only"),
-                                 fg=(T["accent"] if on else T["muted"]))
+        self._paint_gear()
+
+    def _gear_items(self):
+        """The (label, command) rows of the ⚙ settings menu. A ✓ prefixes each setting
+        that is currently ON. Split out from _gear_menu so it's unit-testable without
+        popping a real Tk menu. Read-only reflects the CONFIRMED state (it flips only after
+        the worker confirms), so the checkmark never claims a lock that isn't live."""
+        def row(on, name):
+            return ("✓  " + name) if on else ("      " + name)
+        return [
+            (row(self.window_shot, "Window-only"), self.toggle_window_shot),
+            (row(self.share_visible, "Shareable"), self.toggle_screen_share),
+            (row(self.read_only, "Read-only"), self.toggle_read_only),
+        ]
+
+    def _gear_menu(self, e):
+        # Same popup pattern as the model switcher (_model_menu): build fresh on each open
+        # so the checkmarks reflect current state, then tk_popup at the click point.
+        m = tk.Menu(self.root, tearoff=0, bg=T["field"], fg=T["text"],
+                    activebackground=T["accent"], activeforeground=T["on_accent"], bd=0)
+        for lbl, cmd in self._gear_items():
+            m.add_command(label=lbl, command=cmd)
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
 
     # ── rounded input layout ──
     def _layout_input(self, e=None):

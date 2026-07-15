@@ -3,6 +3,16 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.12.1] — 2026-07-16
+
+### Changed
+- **The Window-only, Shareable, and Read-only toggles are now tucked behind a single ⚙
+  settings menu, so the status bar isn't crowded.** Auto-shot, Compact, and Clear stay
+  inline; clicking **⚙** opens a menu where each setting shows a ✓ when it's on. The gear
+  turns the accent color while **Read-only** is on, so that safety state stays visible at
+  a glance without opening the menu. Nothing about the toggles themselves changed — only
+  where they live.
+
 ## [1.12.0] — 2026-07-16
 
 ### Added
@@ -724,6 +734,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.12.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.12.1
 [1.12.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.12.0
 [1.11.4]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.4
 [1.11.3]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.3
