@@ -360,11 +360,72 @@ class TestAllowTool:
             assert isinstance(result, PermissionResultAllow)
 
     def test_allows_ordinary_tool(self):
-        # Every non-blacklisted tool is still auto-approved (bypass-disabled hosts rely on this).
+        # Every non-blacklisted tool is still auto-approved (bypass-disabled hosts rely on
+        # this). Mode pinned explicitly: the callback's answer now depends on the ACTIVE
+        # permission mode, and the test must not float with the machine's config.
         w = make_worker()
+        w._permission_mode = "bypassPermissions"
         result = asyncio.run(w._allow_tool("Bash", {"command": "ls"}, None))
         from worker import PermissionResultAllow
         assert isinstance(result, PermissionResultAllow)
+
+    def test_plan_mode_denies_exit_plan_mode(self):
+        # THE read-only guarantee: in plan mode, ExitPlanMode (the tool that ASKS for
+        # write access) must be denied — the blanket auto-approve would otherwise grant
+        # it and silently lift read-only. Deny degrades to Allow only on an SDK too old
+        # to have PermissionResultDeny (where set_permission_mode doesn't exist either).
+        w = make_worker()
+        w._permission_mode = "plan"
+        if worker_module.PermissionResultDeny is None:
+            pytest.skip("SDK has no PermissionResultDeny; runtime mode switching is off too")
+        result = asyncio.run(w._allow_tool("ExitPlanMode", {}, None))
+        assert isinstance(result, worker_module.PermissionResultDeny)
+
+    def test_plan_mode_denies_any_escalation(self):
+        # Plan mode runs read-only tools without consulting the callback, so ANYTHING
+        # that reaches it is a request for more power — all of it must be denied.
+        w = make_worker()
+        w._permission_mode = "plan"
+        if worker_module.PermissionResultDeny is None:
+            pytest.skip("SDK has no PermissionResultDeny")
+        for tool in ("Bash", "Write", "Edit", "NotebookEdit"):
+            result = asyncio.run(w._allow_tool(tool, {}, None))
+            assert isinstance(result, worker_module.PermissionResultDeny), tool
+
+    def test_plan_mode_ask_user_question_keeps_specific_message(self):
+        # The AskUserQuestion deny (checked first) has its own message steering the model
+        # to ask inline; the read-only deny must not swallow it.
+        w = make_worker()
+        w._permission_mode = "plan"
+        if worker_module.PermissionResultDeny is None:
+            pytest.skip("SDK has no PermissionResultDeny")
+        result = asyncio.run(w._allow_tool("AskUserQuestion", {}, None))
+        assert "question" in (result.message or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# 5c. Runtime permission-mode switching
+# ---------------------------------------------------------------------------
+
+class TestPermissionModeSwitch:
+
+    def test_enqueue_set_permission_mode(self):
+        w = make_worker()
+        w.set_permission_mode("plan")
+        kind, payload = w.req.get_nowait()
+        assert (kind, payload) == ("set_permission_mode", "plan")
+
+    def test_initial_mode_follows_config(self):
+        w = make_worker()
+        assert w._permission_mode == config.PERMISSION_MODE
+
+    def test_make_options_uses_runtime_mode_not_config(self):
+        # A reconnect after a runtime switch must come back in the SWITCHED mode: the
+        # options builder has to read the live attribute, not the startup constant.
+        w = make_worker()
+        w._permission_mode = "plan"
+        opts = w._make_options()
+        assert opts.permission_mode == "plan"
 
 
 # ---------------------------------------------------------------------------
@@ -527,3 +588,91 @@ class TestEmitUsageModel:
         ctxs = [v for (k, v) in items if k == "ctx"]
         assert models == ["claude-opus-4-8[1m]"]
         assert ctxs == [12]
+
+
+# ---------------------------------------------------------------------------
+# 5d. bypassPermissions runtime-elevation fallback
+# ---------------------------------------------------------------------------
+
+class _FakeModeClient:
+    def __init__(self, fail=False):
+        self.calls, self.fail = [], fail
+
+    async def set_permission_mode(self, mode):
+        if self.fail:
+            raise RuntimeError("nope")
+        self.calls.append(mode)
+
+
+def _drain(q):
+    out = []
+    while True:
+        try:
+            out.append(q.get_nowait())
+        except queue.Empty:
+            return out
+
+
+class TestBypassElevationFallback:
+
+    def test_substitutes_accept_edits_when_not_launch_capable(self):
+        # A session NOT launched with --dangerously-skip-permissions can never be
+        # elevated to bypassPermissions (the CLI refuses) — the worker must switch to
+        # acceptEdits instead and confirm THAT mode to the UI, not the requested one.
+        w = make_worker()
+        w._bypass_capable = False
+        c = _FakeModeClient()
+        asyncio.run(w._do_set_permission_mode(c, "bypassPermissions"))
+        assert c.calls == ["acceptEdits"]
+        assert w._permission_mode == "acceptEdits"
+        assert ("permission_mode", "acceptEdits") in _drain(w.ui)
+
+    def test_passes_bypass_through_when_launch_capable(self):
+        w = make_worker()
+        w._bypass_capable = True
+        c = _FakeModeClient()
+        asyncio.run(w._do_set_permission_mode(c, "bypassPermissions"))
+        assert c.calls == ["bypassPermissions"]
+        assert w._permission_mode == "bypassPermissions"
+
+    def test_plan_never_substituted(self):
+        # The fallback must only affect ELEVATION to bypass — locking to plan is
+        # always allowed and must go through untouched.
+        w = make_worker()
+        w._bypass_capable = False
+        c = _FakeModeClient()
+        asyncio.run(w._do_set_permission_mode(c, "plan"))
+        assert c.calls == ["plan"]
+
+    def test_failure_keeps_mode_and_resyncs_ui(self):
+        # On a CLI refusal the active mode must NOT change, and the UI must get the
+        # UNCHANGED mode back so the toggle repaints truthfully (plus an error line).
+        w = make_worker()
+        w._bypass_capable = True
+        before = w._permission_mode
+        asyncio.run(w._do_set_permission_mode(_FakeModeClient(fail=True), "plan"))
+        assert w._permission_mode == before
+        events = _drain(w.ui)
+        assert ("permission_mode", before) in events
+        assert any(k == "error" for k, _ in events)
+
+
+# ---------------------------------------------------------------------------
+# 5e. Launch permission mode parameter
+# ---------------------------------------------------------------------------
+
+class TestLaunchPermissionMode:
+
+    def test_launch_mode_param_overrides_config(self):
+        w = ClaudeWorker(queue.Queue(), permission_mode="plan")
+        assert w._permission_mode == "plan"
+        assert w._bypass_capable is False     # plan launch → can never elevate to bypass
+
+    def test_launch_mode_bypass_is_capable(self):
+        w = ClaudeWorker(queue.Queue(), permission_mode="bypassPermissions")
+        assert w._permission_mode == "bypassPermissions"
+        assert w._bypass_capable is True
+
+    def test_launch_mode_default_follows_config(self):
+        w = make_worker()
+        assert w._permission_mode == config.PERMISSION_MODE

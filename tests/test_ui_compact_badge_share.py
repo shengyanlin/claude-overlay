@@ -346,3 +346,153 @@ def test_format_turn_error_returns_string(overlay):
     msg = overlay._format_turn_error(payload)
     assert isinstance(msg, str)
     assert len(msg) > 0
+
+
+# ── Window-only (active-window capture) toggle ────────────────────────────────
+
+def test_toggle_window_shot_flips_state(overlay):
+    before = overlay.window_shot
+    overlay.toggle_window_shot()
+    assert overlay.window_shot is not before
+    overlay.toggle_window_shot()  # restore
+
+
+def test_toggle_window_shot_label_reflects_state(overlay):
+    import claude_overlay as co
+    overlay.window_shot = (co.SHOT_SCOPE == "window")
+    overlay._paint_window_toggle()
+    overlay.toggle_window_shot()
+    overlay.root.update_idletasks()
+    txt = overlay.toggle_window.cget("text")
+    assert "Window-only" in txt
+    assert ("◉" in txt) if overlay.window_shot else ("○" in txt)
+    overlay.toggle_window_shot()  # restore
+
+
+def test_toggle_window_shot_adds_confirmation_line(overlay):
+    overlay.toggle_window_shot()
+    txt = chat_text(overlay).lower()
+    assert "window" in txt or "screen" in txt
+    overlay.toggle_window_shot()  # restore
+
+
+def test_toggle_window_shot_drops_stale_precapture(overlay):
+    # A frame grabbed under the OLD scope must not be sent after the scope changes.
+    overlay._precaptured = ([{"path": "x.png", "primary": True, "index": 1}], 0.0)
+    overlay.toggle_window_shot()
+    assert overlay._precaptured is None
+    overlay.toggle_window_shot()  # restore
+
+
+# ── Read-only (permission mode) toggle ────────────────────────────────────────
+
+def test_toggle_read_only_asks_worker_does_not_flip_yet(overlay):
+    # Unlike the other toggles, state must NOT change until the worker confirms —
+    # the label must never claim a safety state the CLI isn't in.
+    before = overlay.read_only
+    overlay.toggle_read_only()
+    assert overlay.read_only == before
+    calls = [c for c in overlay.worker.calls if c[0] == "set_permission_mode"]
+    assert calls, "toggle must enqueue a set_permission_mode request"
+    target = calls[-1][1][0]
+    assert target == ("plan" if not before else overlay._full_mode)
+
+
+def test_apply_permission_mode_flips_paints_and_confirms(overlay):
+    overlay.read_only = False
+    overlay._paint_ro_toggle()
+    overlay._apply_permission_mode("plan")
+    overlay.root.update_idletasks()
+    assert overlay.read_only is True
+    txt = overlay.toggle_ro.cget("text")
+    assert "◉" in txt and "Read-only" in txt
+    assert "read-only" in chat_text(overlay).lower()
+    overlay._apply_permission_mode(overlay._full_mode)   # back to full access
+    assert overlay.read_only is False
+    assert "○" in overlay.toggle_ro.cget("text")
+
+
+def test_apply_permission_mode_unchanged_mode_is_quiet(overlay):
+    # Re-confirming the mode we're already in (e.g. after a failed switch re-sync)
+    # must not spam the chat.
+    overlay.read_only = False
+    overlay._paint_ro_toggle()
+    before = chat_text(overlay)
+    overlay._apply_permission_mode(overlay._full_mode)
+    assert chat_text(overlay) == before
+
+
+# ── Persisted UI state (window_shot survives a relaunch) ─────────────────────
+
+def test_save_and_load_state_roundtrip(monkeypatch, tmp_path):
+    import claude_overlay as co
+    monkeypatch.setattr(co, "STATE_FILE", tmp_path / "state.json")
+    co._save_state(window_shot=True)
+    assert co._load_state() == {"window_shot": True}
+    co._save_state(window_shot=False)        # merge/overwrite, not append
+    assert co._load_state() == {"window_shot": False}
+
+
+def test_load_state_corrupt_or_wrong_shape_is_empty(monkeypatch, tmp_path):
+    import claude_overlay as co
+    p = tmp_path / "state.json"
+    monkeypatch.setattr(co, "STATE_FILE", p)
+    p.write_text("{definitely not json", encoding="utf-8")
+    assert co._load_state() == {}
+    p.write_text('["a", "list"]', encoding="utf-8")   # valid JSON, wrong shape
+    assert co._load_state() == {}
+
+
+def test_toggle_window_shot_persists_choice(overlay, monkeypatch, tmp_path):
+    import claude_overlay as co
+    monkeypatch.setattr(co, "STATE_FILE", tmp_path / "state.json")
+    overlay.window_shot = False
+    overlay._paint_window_toggle()
+    overlay.toggle_window_shot()              # → on
+    assert co._load_state().get("window_shot") is True
+    overlay.toggle_window_shot()              # → off again
+    assert co._load_state().get("window_shot") is False
+
+
+# ── Read-only persistence (remembered across launches) ───────────────────────
+
+def test_startup_permission_mode_first_launch_follows_config(monkeypatch, tmp_path):
+    import claude_overlay as co
+    monkeypatch.setattr(co, "STATE_FILE", tmp_path / "absent.json")   # no saved state
+    monkeypatch.setattr(co, "PERMISSION_MODE", "plan")
+    assert co._startup_permission_mode() == (True, "plan")
+    monkeypatch.setattr(co, "PERMISSION_MODE", "bypassPermissions")
+    assert co._startup_permission_mode() == (False, "bypassPermissions")
+
+
+def test_startup_permission_mode_saved_choice_wins(monkeypatch, tmp_path):
+    import claude_overlay as co
+    monkeypatch.setattr(co, "STATE_FILE", tmp_path / "state.json")
+    # Remembered UNLOCK over a plan config: launch straight into full access — and
+    # into bypassPermissions specifically, so the session is born bypass-capable.
+    monkeypatch.setattr(co, "PERMISSION_MODE", "plan")
+    co._save_state(read_only=False)
+    assert co._startup_permission_mode() == (False, "bypassPermissions")
+    # Remembered LOCK over a bypass config: launch straight into plan.
+    monkeypatch.setattr(co, "PERMISSION_MODE", "bypassPermissions")
+    co._save_state(read_only=True)
+    assert co._startup_permission_mode() == (True, "plan")
+
+
+def test_startup_permission_mode_garbage_state_ignored(monkeypatch, tmp_path):
+    import claude_overlay as co
+    monkeypatch.setattr(co, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(co, "PERMISSION_MODE", "plan")
+    co._save_state(read_only="yes please")   # non-bool must fall back to the config default
+    assert co._startup_permission_mode() == (True, "plan")
+
+
+def test_apply_permission_mode_persists_confirmed_choice(overlay, monkeypatch, tmp_path):
+    import claude_overlay as co
+    monkeypatch.setattr(co, "STATE_FILE", tmp_path / "state.json")
+    overlay.read_only = False
+    overlay._paint_ro_toggle()
+    overlay._apply_permission_mode("plan")
+    assert co._load_state().get("read_only") is True
+    overlay._apply_permission_mode("acceptEdits")
+    assert co._load_state().get("read_only") is False

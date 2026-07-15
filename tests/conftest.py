@@ -34,10 +34,11 @@ class FakeWorker:
     """Stand-in for ClaudeWorker: stores the UI queue, records calls for assertions,
     starts no thread and connects to nothing."""
 
-    def __init__(self, ui_queue):
+    def __init__(self, ui_queue, permission_mode=None):
         self.ui = ui_queue
         self.req = queue.Queue()
         self.calls = []
+        self.permission_mode = permission_mode   # launch mode the Overlay asked for
 
     def _rec(self, name, *a):
         self.calls.append((name, a))
@@ -47,6 +48,7 @@ class FakeWorker:
     def reset(self):            self._rec("reset")
     def compact(self):          self._rec("compact")
     def set_model(self, *a):    self._rec("set_model", *a)
+    def set_permission_mode(self, *a):  self._rec("set_permission_mode", *a)
     def interrupt(self):        self._rec("interrupt")
     def shutdown(self):         self._rec("shutdown")
     def join(self, *a, **k):    self._rec("join")
@@ -61,6 +63,11 @@ def _overlay_singleton():
     mp.setattr(co, "ClaudeWorker", FakeWorker)
     mp.setattr(co.Overlay, "_register_hotkey", lambda self: None)
     mp.setattr(co.Overlay, "_check_for_update", lambda self: None)
+    # Point the persisted-UI-state store at a throwaway path: the suite must neither
+    # read this machine's real toggle state nor overwrite it from toggle tests.
+    import tempfile
+    from pathlib import Path as _Path
+    mp.setattr(co, "STATE_FILE", _Path(tempfile.mkdtemp(prefix="ov_state_")) / "state.json")
     try:
         ov = co.Overlay()
     except Exception as e:
@@ -110,7 +117,9 @@ def _clean_overlay(ov):
         pass
     # View / per-turn state reset() doesn't cover:
     ov.auto_shot = co.AUTO_SCREENSHOT_DEFAULT
+    ov.window_shot = (co.SHOT_SCOPE == "window")
     ov.share_visible = co.SHOW_IN_SCREEN_SHARE_DEFAULT
+    ov.read_only = (co.PERMISSION_MODE == "plan")
     ov.overlay_name = ""
     ov._model = None
     ov._ctx_pct = None

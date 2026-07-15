@@ -272,7 +272,9 @@ Double-click **`Create Desktop Shortcut.cmd`** to drop a **Claude Overlay** shor
 | Stop a running reply | click **Stop** (the ↑ becomes ■ while busy) |
 | Paste an image | **Ctrl+V** (click **📎** to clear) |
 | Toggle auto-screenshot | **◉ / ○ Auto-shot** (orange = on) |
+| Capture only the active window | **◉ / ○ Window-only** (orange = window-only; off = every monitor) |
 | Show / hide in screen shares | **◉ / ○ Shareable** (orange = visible to Teams/Zoom/OBS; off = private, the default) |
+| Lock Claude read-only | **◉ / ○ Read-only** (orange = "plan" mode: looks and answers, changes nothing; off = the configured `PERMISSION_MODE`) |
 | Switch model | click the **statusline** (`model ▾`) |
 | Zoom text in / out | **Ctrl +** / **Ctrl −** (or **Ctrl + mouse-wheel**); **Ctrl 0** resets |
 | New conversation | **Clear** |
@@ -297,8 +299,12 @@ All settings are constants at the top of `claude_overlay.py`:
   in-app switcher lists them all (the statusline shows the concrete version each alias
   resolved to, e.g. `claude-opus-4-8`). Don't use `None`: the Agent SDK resolves `None`
   to an older model, not the CLI's interactive default.
-- `PERMISSION_MODE` — `"bypassPermissions"` by default (see security note below).
-  Use `"acceptEdits"`, `"default"`, or `"plan"` to add confirmation / read-only.
+- `PERMISSION_MODE` — `"bypassPermissions"` by default (see security note below); this
+  is just the **first-launch** mode — the **◉ / ○ Read-only** status-bar toggle switches
+  the live session between `"plan"` (read-only) and this mode at any time, and the
+  toggle **remembers your last choice across launches** (announced in-chat at startup
+  whenever the remembered state differs from this default). Set `"plan"` to start
+  locked read-only.
 - `WORKING_DIR` — folder Claude operates in (default: your home directory).
 - `THEME` — `"light"` (warm paper) or `"dark"`.
 - `TASKBAR_BUTTON` — `True` (default) gives the frameless window a real, clickable
@@ -310,6 +316,16 @@ All settings are constants at the top of `claude_overlay.py`:
 - `SHOT_FORMAT` / `SHOT_JPEG_QUALITY` (or the `CLAUDE_OVERLAY_SHOT_FORMAT` /
   `CLAUDE_OVERLAY_SHOT_JPEG_QUALITY` env vars) — screenshot payload: `"auto"` keeps
   the smaller of PNG/JPEG per capture; `"png"`/`"jpeg"` force one; JPEG quality 50–95.
+- `SHOT_SCOPE` (or the `CLAUDE_OVERLAY_SHOT_SCOPE` env var) — what a screenshot covers:
+  `"screens"` (default) captures every monitor, one image each; `"window"` captures
+  **only the active window** — more private and cheaper in vision tokens, but Claude
+  can't see anything outside it. This is just the startup default; flip it live with
+  the **◉ / ○ Window-only** status-bar toggle — and the toggle **remembers your choice
+  across launches** (stored per-machine in `%LOCALAPPDATA%\claude-overlay\state.json`;
+  setting the env var explicitly overrides it for that launch). While you're typing *in* the overlay,
+  "active" means the window you were working in before it (tracked automatically), and
+  when no usable window exists (fresh launch, desktop focused, window minimized) it
+  falls back to full-screen capture rather than sending nothing.
 - `AUTO_SCREENSHOT_DEFAULT`, `FONT_SANS/SERIF/MONO`, `CORNER_RADIUS`, `ORB_SIZE`,
   `HIDE_SCREENSHOT_TOOL`, `WINDOW_ALPHA` — see inline comments.
 
@@ -322,9 +338,20 @@ also lets it **act on the app you have open** — e.g. edit the document or slid
 deck on your screen via Windows/COM automation, and (with autosave on) persist
 those edits straight to the original file. That's the magic, but it also means it
 can change important documents without a confirmation step — double-check before
-you let it loose on anything you can't afford to lose. If you don't want that, set
-`PERMISSION_MODE` to `"acceptEdits"` (asks before edits), `"default"` (asks before
-most actions), or `"plan"` (read-only) before running.
+you let it loose on anything you can't afford to lose. If you don't want that, flip
+the **◉ / ○ Read-only** status-bar toggle: it switches the live session into `"plan"`
+mode (Claude looks, reads, and answers — but edits and runs nothing), and while it's
+on the overlay **denies every permission escalation the agent asks for** (including
+`ExitPlanMode`), so read-only can't be talked out of; flip it back for full access.
+(One nuance: the CLI refuses to elevate a session to `bypassPermissions` unless it was
+*launched* in it — so when the overlay started read-only, flipping the toggle off lands
+on `acceptEdits` instead, which the overlay's auto-approval makes effectively full
+access; the in-chat notice always names the mode you actually got.)
+To *start* locked on first launch, set `PERMISSION_MODE = "plan"` — after that the
+toggle's last state is remembered per-machine, and a launch says so in-chat whenever
+the remembered choice differs from the configured default. (`"acceptEdits"` / `"default"` are
+of limited use here: a GUI with no terminal has nowhere to show a permission prompt,
+so the overlay auto-answers them — see `worker._allow_tool`.)
 
 ## Contributing
 

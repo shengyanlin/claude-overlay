@@ -65,6 +65,47 @@ def _ensure_shot_dir():
         SHOT_DIR = Path(tempfile.gettempdir())
 
 
+def _load_state():
+    """Best-effort read of the tiny persisted UI state (STATE_FILE). Any problem —
+    missing, unreadable, not a dict, absurdly large — yields {} so startup can't break."""
+    try:
+        if STATE_FILE.stat().st_size > 64 * 1024:   # sanity cap; ours is tens of bytes
+            return {}
+        data = json.loads(STATE_FILE.read_text("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_state(**updates):
+    """Merge updates into STATE_FILE (temp file + os.replace, so a crash mid-write can't
+    leave truncated JSON behind). Best-effort: persisting a toggle must never break the UI."""
+    try:
+        state = _load_state()
+        state.update(updates)
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state), "utf-8")
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        pass
+
+
+def _startup_permission_mode():
+    """Decide this launch's permission state: (read_only, mode to LAUNCH the worker in).
+    The remembered Read-only toggle — a deliberate user choice, like Window-only — wins
+    over the config default; PERMISSION_MODE seeds the first launch (no saved state).
+    A remembered unlock launches straight in the full-access mode, so the session is
+    born bypass-capable when full access means bypassPermissions — a running session
+    can never be ELEVATED to bypass later (see worker._bypass_capable)."""
+    ro = (PERMISSION_MODE == "plan")
+    saved = _load_state().get("read_only")
+    if isinstance(saved, bool):
+        ro = saved
+    full = PERMISSION_MODE if PERMISSION_MODE != "plan" else "bypassPermissions"
+    return ro, ("plan" if ro else full)
+
+
 def round_rect(c, x1, y1, x2, y2, r, **kw):
     pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
            x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
@@ -75,11 +116,25 @@ class Overlay:
     def __init__(self):
         self.ui_q: "queue.Queue" = queue.Queue()
         _ensure_shot_dir()          # before the worker, so a bad TEMP can't crash us mid-startup
-        self.worker = ClaudeWorker(self.ui_q)
+        # Resolve the remembered Read-only toggle BEFORE the worker exists: the session
+        # must be LAUNCHED in the remembered mode (a plan-launched session can't be
+        # elevated to bypassPermissions at run time, only started in it).
+        self.read_only, _launch_mode = _startup_permission_mode()
+        self.worker = ClaudeWorker(self.ui_q, permission_mode=_launch_mode)
         self.worker.start()
 
         self.auto_shot = AUTO_SCREENSHOT_DEFAULT
+        self.window_shot = (SHOT_SCOPE == "window")   # True → capture only the active window
+        if not SHOT_SCOPE_FORCED:                     # remembered toggle choice survives a
+            self.window_shot = bool(_load_state().get("window_shot", self.window_shot))
+                                                      # relaunch; an explicit env var beats it
         self.share_visible = SHOW_IN_SCREEN_SHARE_DEFAULT   # True → overlay shows in screen shares
+        # self.read_only was set above (worker launch); the toggle flips it via the
+        # worker (confirmed async) and each confirmed change is persisted.
+        self._full_mode = (PERMISSION_MODE if PERMISSION_MODE != "plan"
+                           else "bypassPermissions")  # what Read-only OFF returns to: the
+                                                      # configured mode — unless that IS plan,
+                                                      # then the CLI default full-access mode
         self.pending_shot = None
         self.pending_images: list = []
         self._precaptured = None        # (shots, monotonic_ts) grabbed while typing
@@ -125,6 +180,10 @@ class Overlay:
         self._fronting = False            # re-entrancy guard for _raise_to_front (focus churn)
         self._vscreen_sig = None          # last virtual-desktop bounding box (display-topology sig)
         self._vscreen_checked = 0.0       # throttle the topology watchdog to ~1.5s in _poll
+        self._last_ext_fg = None          # last EXTERNAL foreground hwnd — the window the user was
+                                          # working in before focusing the overlay; the "window"
+                                          # capture scope targets it whenever the overlay has focus
+        self._fg_checked = 0.0            # throttle that tracking to ~0.5s in _poll
         # Per-overlay custom name (session-only, set by clicking the titlebar "Claude"). Shown
         # in the titlebar + window title when expanded, and as a small pill UNDER the orb when
         # collapsed — so several overlays open at once (one per task) are tellable apart at a
@@ -214,6 +273,13 @@ class Overlay:
         self._build_edges()        # invisible drag strips on every edge/corner → resize
         self._bind_zoom()          # Ctrl +/- and Ctrl+wheel → live text zoom
         self._intro()
+        # A remembered Read-only choice silently overriding the config default is a
+        # SAFETY state — say so up front, so a launch never surprises.
+        if self.read_only != (PERMISSION_MODE == "plan"):
+            self.add_sys("🔒 Read-only restored from your last session — flip the "
+                         "Read-only toggle off for full access." if self.read_only else
+                         "⚡ Full access restored from your last session (you had "
+                         "switched Read-only off). Flip it back on any time.")
 
         self.root.after(130, lambda: (self.root.focus_force(), self.entry.focus_set()))
         self.root.bind("<Configure>", self._on_configure)
@@ -469,6 +535,12 @@ class Overlay:
         try:
             hwnd = self._hwnd()
             fg = _user32.GetForegroundWindow()
+            try:                              # the hotkey moment is the freshest possible
+                hw = foreground_capture_window()   # answer to "which window was the user in?"
+                if hw:                             # — record it before we steal the foreground
+                    self._last_ext_fg = hw
+            except Exception:
+                pass
             cur = _user32.GetWindowThreadProcessId(fg, None) if fg else 0
             me = _user32.GetWindowThreadProcessId(hwnd, None)
             attached = bool(cur and cur != me and _user32.AttachThreadInput(cur, me, True))
@@ -815,10 +887,18 @@ class Overlay:
         self.toggle_screen.pack(side="left", padx=(self.px(16), self.px(2)), pady=pad)
         self.toggle_screen.bind("<Button-1>", lambda e: self.toggle_auto())
         self._paint_screen_toggle()
+        self.toggle_window = tk.Label(st, bg=T["bg"], font=self.f_small, cursor="hand2")
+        self.toggle_window.pack(side="left", padx=(self.px(8), self.px(2)), pady=pad)
+        self.toggle_window.bind("<Button-1>", lambda e: self.toggle_window_shot())
+        self._paint_window_toggle()
         self.toggle_share = tk.Label(st, bg=T["bg"], font=self.f_small, cursor="hand2")
         self.toggle_share.pack(side="left", padx=(self.px(8), self.px(2)), pady=pad)
         self.toggle_share.bind("<Button-1>", lambda e: self.toggle_screen_share())
         self._paint_share_toggle()
+        self.toggle_ro = tk.Label(st, bg=T["bg"], font=self.f_small, cursor="hand2")
+        self.toggle_ro.pack(side="left", padx=(self.px(8), self.px(2)), pady=pad)
+        self.toggle_ro.bind("<Button-1>", lambda e: self.toggle_read_only())
+        self._paint_ro_toggle()
         self._chip(st, "Compact", self.compact_now)
         self._chip(st, "Clear", self.reset)
         self.attach_lbl = tk.Label(st, text="", bg=T["bg"], fg=T["accent"],
@@ -1205,11 +1285,24 @@ class Overlay:
         self.toggle_screen.configure(text=("◉  Auto-shot" if on else "○  Auto-shot"),
                                      fg=(T["accent"] if on else T["muted"]))
 
+    def _paint_window_toggle(self):
+        # ON (◉, accent) = screenshots capture only the active window; OFF = all screens.
+        on = self.window_shot
+        self.toggle_window.configure(text=("◉  Window-only" if on else "○  Window-only"),
+                                     fg=(T["accent"] if on else T["muted"]))
+
     def _paint_share_toggle(self):
         # ON (◉, accent) = the overlay shows up in screen shares; OFF (○, muted) = hidden/private.
         on = self.share_visible
         self.toggle_share.configure(text=("◉  Shareable" if on else "○  Shareable"),
                                     fg=(T["accent"] if on else T["muted"]))
+
+    def _paint_ro_toggle(self):
+        # ON (◉, accent) = read-only ("plan"): Claude may look and answer, but not change
+        # anything; OFF (○, muted) = the configured full-access mode.
+        on = self.read_only
+        self.toggle_ro.configure(text=("◉  Read-only" if on else "○  Read-only"),
+                                 fg=(T["accent"] if on else T["muted"]))
 
     # ── rounded input layout ──
     def _layout_input(self, e=None):
@@ -2619,7 +2712,11 @@ class Overlay:
         """Short text companion for inline-image turns: the model sees the images
         directly, so we only add a one-line note about what's attached."""
         note = []
-        if shots:
+        if shots and shots[0].get("window") is not None:
+            note.append(f"[Attached: a live screenshot of my ACTIVE WINDOW only — "
+                        f"“{shots[0]['window']}” — not the full screen; other "
+                        f"windows and monitors are not visible to you.]")
+        elif shots:
             tags = ", ".join(f"monitor {s['index']}" + (" (primary)" if s["primary"] else "")
                              for s in shots)
             note.append(f"[Attached: a live screenshot of my screen — {tags}.]")
@@ -2664,7 +2761,7 @@ class Overlay:
         shots = None
         try:
             mons = enumerate_monitors() or [{"rect": None, "primary": True}]
-            shots, _ = self._grab_shots(mons)
+            shots, _ = self._grab_shots_scoped(mons)
         except BaseException:
             shots = None
         finally:
@@ -2673,7 +2770,11 @@ class Overlay:
     def _build_prompt(self, text, shots, images=None):
         parts = []
         lines = []
-        if shots:
+        if shots and shots[0].get("window") is not None:
+            lines.append("My ACTIVE WINDOW was just captured — window only, NOT the full "
+                         "screen (other windows/monitors are not visible to you):")
+            lines.append(f"- Active window “{shots[0]['window']}”: {shots[0]['path']}")
+        elif shots:
             lines.append("My current display was just captured — one image per monitor:")
             for s in shots:
                 tag = "PRIMARY screen" if s["primary"] else "secondary screen"
@@ -2733,6 +2834,48 @@ class Overlay:
             pass
         return keep
 
+    def _capture_target_hwnd(self):
+        """The window a 'window'-scope capture should shoot: the current foreground
+        window when it's a usable external one, else the last external foreground
+        window _poll tracked (the app the user was in before focusing the overlay).
+        None → no usable window; the caller falls back to full-screen capture."""
+        hw = foreground_capture_window()
+        if hw:
+            return hw
+        hw = self._last_ext_fg
+        return hw if window_capturable(hw) else None
+
+    def _grab_window_shot(self):
+        """Capture ONLY the active window → ([shot], None), or (None, err) when there is
+        no usable window / the grab failed — the caller falls back to _grab_shots so a
+        capture is never silently dropped. Win32 + Pillow only, no Tk: safe on the
+        background precapture thread, like _grab_shots."""
+        try:
+            hwnd = self._capture_target_hwnd()
+            if not hwnd:
+                return None, None
+            bbox = window_bbox(hwnd)
+            if not bbox:
+                return None, None
+            img = ImageGrab.grab(bbox=bbox, all_screens=True)
+            if SHOT_MAX_EDGE and max(img.size) > SHOT_MAX_EDGE:
+                img.thumbnail((SHOT_MAX_EDGE, SHOT_MAX_EDGE), Image.LANCZOS)
+            p = self._save_shot(img, SHOT_DIR / f"shot_{int(time.time() * 1000)}_w")
+            self._prune_shots()
+            return [{"path": str(p), "primary": True, "index": 1,
+                     "window": window_title(hwnd) or "untitled window"}], None
+        except Exception as ex:
+            return None, ex
+
+    def _grab_shots_scoped(self, mons):
+        """Scope dispatcher used by both the send-time and precapture paths: the active
+        window when that scope is on AND a usable window exists, else every monitor."""
+        if self.window_shot:
+            shots, err = self._grab_window_shot()
+            if shots:
+                return shots, err
+        return self._grab_shots(mons)
+
     def _grab_shots(self, mons):
         """Pure capture: one screenshot per monitor → downscale → save. Touches NO Tk, so
         it is safe to run on a background thread (used by the precapture path). Returns
@@ -2774,7 +2917,7 @@ class Overlay:
             self.root.update()
             time.sleep(0.15)
         try:
-            shots, err = self._grab_shots(mons)
+            shots, err = self._grab_shots_scoped(mons)
         finally:
             if do_hide:
                 self.root.deiconify()
@@ -2819,6 +2962,45 @@ class Overlay:
     def toggle_auto(self):
         self.auto_shot = not self.auto_shot
         self._paint_screen_toggle()
+
+    def toggle_window_shot(self):
+        """Flip the capture scope between the active window and all screens. Like the
+        share toggle, the change is invisible on screen, so confirm it in-chat."""
+        self.window_shot = not self.window_shot
+        self._precaptured = None   # a frame grabbed under the OLD scope must not be sent
+        self._paint_window_toggle()
+        _save_state(window_shot=self.window_shot)   # deliberate choice → survives relaunch
+        if self.window_shot:
+            self.add_sys("🎯 Screenshots now capture the ACTIVE WINDOW only "
+                         "(falls back to full screen when no window is in focus).")
+        else:
+            self.add_sys("🖥 Screenshots capture all screens again (one image per monitor).")
+
+    def toggle_read_only(self):
+        """Ask the worker to flip between read-only ("plan") and the configured
+        full-access mode. Unlike the other toggles the state does NOT flip
+        optimistically: it only changes when the worker confirms the CLI accepted
+        the switch (the "permission_mode" event → _apply_permission_mode), so the
+        label never claims a safety state the agent isn't actually in."""
+        target = self._full_mode if self.read_only else "plan"
+        self._set_status("switching permissions…")
+        self.worker.set_permission_mode(target)
+
+    def _apply_permission_mode(self, mode):
+        """Worker confirmed the active permission mode: sync the toggle and, when it
+        actually changed, say so in-chat (the switch itself is invisible on screen)."""
+        ro = (mode == "plan")
+        changed = (ro != self.read_only)
+        self.read_only = ro
+        self._paint_ro_toggle()
+        if changed:
+            _save_state(read_only=ro)   # persist only CONFIRMED switches, never requests
+        if changed and ro:
+            self.add_sys("🔒 Read-only: Claude can see your screen, read files, and "
+                         "answer — but won't edit anything or run commands.")
+        elif changed:
+            self.add_sys(f"⚡ Full access ({mode}): Claude can now edit files and run "
+                         "commands without asking. Flip Read-only back on any time.")
 
     def toggle_screen_share(self):
         """Flip whether the overlay is visible in screen shares (Teams/Zoom/OBS). The change
@@ -3158,6 +3340,19 @@ class Overlay:
                     self._vscreen_sig = sig
             except Exception:
                 pass
+        # Track the most recent EXTERNAL foreground window (throttled, one cheap Win32
+        # call): when a "window"-scope capture happens while the overlay itself has
+        # focus — which is ALWAYS the case at send time, the user just typed here —
+        # this remembered hwnd is the window the user was actually working in. Tracked
+        # even while the toggle is off, so flipping it on works on the very next send.
+        if self._last_pump - self._fg_checked > 0.5:
+            self._fg_checked = self._last_pump
+            try:
+                hw = foreground_capture_window()
+                if hw:
+                    self._last_ext_fg = hw
+            except Exception:
+                pass
         if DEBUG_LOG and (self._last_pump - getattr(self, "_pump_logged", 0.0)) > 10.0:
             self._pump_logged = self._last_pump
             try:
@@ -3283,6 +3478,8 @@ class Overlay:
                 self._precaptured = (payload, time.monotonic())
         elif kind == "status":
             self._set_status(str(payload))
+        elif kind == "permission_mode":
+            self._apply_permission_mode(str(payload))
         elif kind == "system":
             self.add_sys(str(payload))
         elif kind == "update":

@@ -239,3 +239,30 @@ class TestMiscConstants:
 
     def test_system_append_is_non_empty(self):
         assert len(config.SYSTEM_APPEND.strip()) > 0
+
+
+# ---------------------------------------------------------------------------
+# 7. SHOT_SCOPE
+# ---------------------------------------------------------------------------
+
+class TestShotScope:
+    """Tests for SHOT_SCOPE (active-window vs. all-screens capture default)."""
+
+    def test_default_is_screens(self):
+        env_val = os.environ.get("CLAUDE_OVERLAY_SHOT_SCOPE")
+        if env_val is not None:
+            pytest.skip("CLAUDE_OVERLAY_SHOT_SCOPE is set in env; skipping default check")
+        assert config.SHOT_SCOPE == "screens"
+
+    def test_env_override_is_normalized(self, monkeypatch):
+        # The env value is stripped + lowercased so "  Window " still means window scope.
+        monkeypatch.setenv("CLAUDE_OVERLAY_SHOT_SCOPE", "  Window ")
+        try:
+            importlib.reload(config)
+            assert config.SHOT_SCOPE == "window"
+        finally:
+            monkeypatch.delenv("CLAUDE_OVERLAY_SHOT_SCOPE", raising=False)
+            importlib.reload(config)
+
+    def test_shot_scope_is_str(self):
+        assert isinstance(config.SHOT_SCOPE, str)

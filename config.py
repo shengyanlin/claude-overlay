@@ -51,6 +51,11 @@ MODEL = "opus"   # startup default: the latest Opus family
 MODELS = [("Opus", "opus"), ("Opus (1M)", "opus[1m]"),
           ("Sonnet", "sonnet"), ("Haiku", "haiku")]  # click the statusline to switch
 PERMISSION_MODE = "bypassPermissions"
+                                 # the STARTUP permission mode; flip it at run time with the
+                                 # status-bar "Read-only" toggle (◉ = "plan", a read-only agent
+                                 # that can look and answer but not edit/run anything; ○ = back
+                                 # to this configured mode). "plan" here starts the overlay
+                                 # locked read-only. See the security note in README.md.
 # Tools the overlay must NEVER let the model call, because they need an interactive UI
 # this app can't provide. AskUserQuestion (Claude Code's structured multiple-choice
 # question tool) is the one that bites: when the model calls it, the CLI blocks waiting
@@ -132,6 +137,29 @@ SHOT_FORMAT = os.environ.get("CLAUDE_OVERLAY_SHOT_FORMAT", "auto").strip().lower
 SHOT_JPEG_QUALITY = _env_int("CLAUDE_OVERLAY_SHOT_JPEG_QUALITY", 82, 50, 95)
                                  # Claude downsamples larger images internally anyway, so
                                  # bigger files only cost upload time + vision tokens.
+SHOT_SCOPE = os.environ.get("CLAUDE_OVERLAY_SHOT_SCOPE", "screens").strip().lower()
+                                 # what a screenshot covers — the STARTUP default; flip it live
+                                 # via the status-bar "Window-only" toggle. "screens" (default):
+                                 # one image per monitor, Claude sees everything you see.
+                                 # "window": ONLY the active (foreground) window — more private
+                                 # and far cheaper in vision tokens, but Claude can't see other
+                                 # windows/monitors. When you're typing IN the overlay, "active"
+                                 # means the last window you worked in before it (tracked live);
+                                 # when no usable window exists (fresh launch, desktop focused,
+                                 # window minimized) it falls back to full-screen capture rather
+                                 # than sending nothing. Any other value → "screens".
+SHOT_SCOPE_FORCED = "CLAUDE_OVERLAY_SHOT_SCOPE" in os.environ
+                                 # an EXPLICIT env var is a per-launch decision, so it beats the
+                                 # remembered toggle state below; unset → last toggle choice wins
+STATE_FILE = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "claude-overlay" / "state.json"
+                                 # tiny per-machine store for UI-toggle state the user expects to
+                                 # survive a relaunch (Window-only and Read-only). Deliberately
+                                 # OUTSIDE the app folder: machine state must not dirty the git
+                                 # clone or ride along in updates. SHOT_SCOPE / PERMISSION_MODE
+                                 # seed the very first launch; after that the remembered toggle
+                                 # wins — and because a restored Read-only choice is a SAFETY
+                                 # state, the overlay announces it in-chat whenever it differs
+                                 # from the configured default.
 IMAGE_INPUT = "inline"           # "inline" → attach screenshots as base64 image blocks
                                  # (no per-turn Read round-trip); "read" → legacy path:
                                  # save PNG + ask Claude to Read it. Flip to "read" if a

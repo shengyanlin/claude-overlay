@@ -3,6 +3,36 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **A Read-only status-bar toggle (◉ / ○ Read-only).** Switches the live session between
+  `"plan"` — Claude can see your screen, read files, and answer, but not edit anything or
+  run commands — and the configured `PERMISSION_MODE`, with no restart. The toggle only
+  flips once the CLI confirms the switch, and while read-only is on the overlay denies
+  every permission escalation the agent requests (including `ExitPlanMode`, which the
+  overlay's blanket auto-approval would otherwise grant — silently lifting read-only).
+  Set `PERMISSION_MODE = "plan"` to start locked on first launch — the toggle remembers
+  your last choice across launches (same per-machine state store as Window-only, and a
+  remembered unlock launches the session directly in the full-access mode so it stays
+  bypass-capable); because that memory is a safety state, startup announces it in-chat
+  whenever it differs from the configured default. The mode also survives the overlay's
+  automatic reconnects. When the session wasn't *launched* in `bypassPermissions` the
+  CLI forbids elevating to it at run time, so unlocking lands on `acceptEdits` instead —
+  effectively full access here, and the in-chat notice names the mode you actually got.
+- **Screenshots can now capture just the active window instead of every monitor.** A new
+  **◉ / ○ Window-only** status-bar toggle (startup default via `SHOT_SCOPE` /
+  `CLAUDE_OVERLAY_SHOT_SCOPE`) scopes each capture to the window you're working in —
+  more private (Claude sees nothing outside that window) and much cheaper in vision
+  tokens on multi-monitor setups. Because the overlay itself has focus while you type,
+  it remembers the window you were in before summoning it and captures that one; the
+  window's title is passed to Claude so it knows what it's looking at, and the visible
+  frame is captured without the drop shadow. When no usable window exists (fresh
+  launch, desktop focused, window minimized) it falls back to the normal full-screen
+  capture rather than sending nothing. The toggle remembers your choice across launches
+  (a tiny per-machine `state.json` under `%LOCALAPPDATA%\claude-overlay`); an explicitly
+  set `CLAUDE_OVERLAY_SHOT_SCOPE` env var overrides the memory for that launch.
+
 ## [1.11.4] — 2026-07-15
 
 ### Fixed
