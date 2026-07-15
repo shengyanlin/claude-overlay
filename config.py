@@ -148,6 +148,16 @@ SHOT_SCOPE = os.environ.get("CLAUDE_OVERLAY_SHOT_SCOPE", "screens").strip().lowe
                                  # when no usable window exists (fresh launch, desktop focused,
                                  # window minimized) it falls back to full-screen capture rather
                                  # than sending nothing. Any other value → "screens".
+SHOT_SCOPE_FORCED = "CLAUDE_OVERLAY_SHOT_SCOPE" in os.environ
+                                 # an EXPLICIT env var is a per-launch decision, so it beats the
+                                 # remembered toggle state below; unset → last toggle choice wins
+STATE_FILE = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "claude-overlay" / "state.json"
+                                 # tiny per-machine store for UI-toggle state the user expects to
+                                 # survive a relaunch (currently: Window-only). Deliberately
+                                 # OUTSIDE the app folder: machine state must not dirty the git
+                                 # clone or ride along in updates. Permission mode is deliberately
+                                 # NOT persisted — starting locked/unlocked is a safety posture
+                                 # that should come from PERMISSION_MODE, not linger silently.
 IMAGE_INPUT = "inline"           # "inline" → attach screenshots as base64 image blocks
                                  # (no per-turn Read round-trip); "read" → legacy path:
                                  # save PNG + ask Claude to Read it. Flip to "read" if a

@@ -65,6 +65,32 @@ def _ensure_shot_dir():
         SHOT_DIR = Path(tempfile.gettempdir())
 
 
+def _load_state():
+    """Best-effort read of the tiny persisted UI state (STATE_FILE). Any problem —
+    missing, unreadable, not a dict, absurdly large — yields {} so startup can't break."""
+    try:
+        if STATE_FILE.stat().st_size > 64 * 1024:   # sanity cap; ours is tens of bytes
+            return {}
+        data = json.loads(STATE_FILE.read_text("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_state(**updates):
+    """Merge updates into STATE_FILE (temp file + os.replace, so a crash mid-write can't
+    leave truncated JSON behind). Best-effort: persisting a toggle must never break the UI."""
+    try:
+        state = _load_state()
+        state.update(updates)
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state), "utf-8")
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        pass
+
+
 def round_rect(c, x1, y1, x2, y2, r, **kw):
     pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
            x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
@@ -80,6 +106,9 @@ class Overlay:
 
         self.auto_shot = AUTO_SCREENSHOT_DEFAULT
         self.window_shot = (SHOT_SCOPE == "window")   # True → capture only the active window
+        if not SHOT_SCOPE_FORCED:                     # remembered toggle choice survives a
+            self.window_shot = bool(_load_state().get("window_shot", self.window_shot))
+                                                      # relaunch; an explicit env var beats it
         self.share_visible = SHOW_IN_SCREEN_SHARE_DEFAULT   # True → overlay shows in screen shares
         self.read_only = (PERMISSION_MODE == "plan")  # True → agent may look, not act; the toggle
                                                       # flips it via the worker (confirmed async)
@@ -2914,6 +2943,7 @@ class Overlay:
         self.window_shot = not self.window_shot
         self._precaptured = None   # a frame grabbed under the OLD scope must not be sent
         self._paint_window_toggle()
+        _save_state(window_shot=self.window_shot)   # deliberate choice → survives relaunch
         if self.window_shot:
             self.add_sys("🎯 Screenshots now capture the ACTIVE WINDOW only "
                          "(falls back to full screen when no window is in focus).")

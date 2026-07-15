@@ -420,3 +420,35 @@ def test_apply_permission_mode_unchanged_mode_is_quiet(overlay):
     before = chat_text(overlay)
     overlay._apply_permission_mode(overlay._full_mode)
     assert chat_text(overlay) == before
+
+
+# ── Persisted UI state (window_shot survives a relaunch) ─────────────────────
+
+def test_save_and_load_state_roundtrip(monkeypatch, tmp_path):
+    import claude_overlay as co
+    monkeypatch.setattr(co, "STATE_FILE", tmp_path / "state.json")
+    co._save_state(window_shot=True)
+    assert co._load_state() == {"window_shot": True}
+    co._save_state(window_shot=False)        # merge/overwrite, not append
+    assert co._load_state() == {"window_shot": False}
+
+
+def test_load_state_corrupt_or_wrong_shape_is_empty(monkeypatch, tmp_path):
+    import claude_overlay as co
+    p = tmp_path / "state.json"
+    monkeypatch.setattr(co, "STATE_FILE", p)
+    p.write_text("{definitely not json", encoding="utf-8")
+    assert co._load_state() == {}
+    p.write_text('["a", "list"]', encoding="utf-8")   # valid JSON, wrong shape
+    assert co._load_state() == {}
+
+
+def test_toggle_window_shot_persists_choice(overlay, monkeypatch, tmp_path):
+    import claude_overlay as co
+    monkeypatch.setattr(co, "STATE_FILE", tmp_path / "state.json")
+    overlay.window_shot = False
+    overlay._paint_window_toggle()
+    overlay.toggle_window_shot()              # → on
+    assert co._load_state().get("window_shot") is True
+    overlay.toggle_window_shot()              # → off again
+    assert co._load_state().get("window_shot") is False

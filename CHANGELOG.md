@@ -23,7 +23,9 @@ This project follows [Semantic Versioning](https://semver.org/).
   window's title is passed to Claude so it knows what it's looking at, and the visible
   frame is captured without the drop shadow. When no usable window exists (fresh
   launch, desktop focused, window minimized) it falls back to the normal full-screen
-  capture rather than sending nothing.
+  capture rather than sending nothing. The toggle remembers your choice across launches
+  (a tiny per-machine `state.json` under `%LOCALAPPDATA%\claude-overlay`); an explicitly
+  set `CLAUDE_OVERLAY_SHOT_SCOPE` env var overrides the memory for that launch.
 
 ## [1.11.4] — 2026-07-15
 

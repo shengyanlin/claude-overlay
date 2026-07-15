@@ -318,7 +318,9 @@ All settings are constants at the top of `claude_overlay.py`:
   `"screens"` (default) captures every monitor, one image each; `"window"` captures
   **only the active window** — more private and cheaper in vision tokens, but Claude
   can't see anything outside it. This is just the startup default; flip it live with
-  the **◉ / ○ Window-only** status-bar toggle. While you're typing *in* the overlay,
+  the **◉ / ○ Window-only** status-bar toggle — and the toggle **remembers your choice
+  across launches** (stored per-machine in `%LOCALAPPDATA%\claude-overlay\state.json`;
+  setting the env var explicitly overrides it for that launch). While you're typing *in* the overlay,
   "active" means the window you were working in before it (tracked automatically), and
   when no usable window exists (fresh launch, desktop focused, window minimized) it
   falls back to full-screen capture rather than sending nothing.

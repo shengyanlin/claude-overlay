@@ -62,6 +62,11 @@ def _overlay_singleton():
     mp.setattr(co, "ClaudeWorker", FakeWorker)
     mp.setattr(co.Overlay, "_register_hotkey", lambda self: None)
     mp.setattr(co.Overlay, "_check_for_update", lambda self: None)
+    # Point the persisted-UI-state store at a throwaway path: the suite must neither
+    # read this machine's real toggle state nor overwrite it from toggle tests.
+    import tempfile
+    from pathlib import Path as _Path
+    mp.setattr(co, "STATE_FILE", _Path(tempfile.mkdtemp(prefix="ov_state_")) / "state.json")
     try:
         ov = co.Overlay()
     except Exception as e:
