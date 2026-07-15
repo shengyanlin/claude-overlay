@@ -261,6 +261,15 @@ class Overlay:
         # Collapsed-orb name pill: a fixed-size label (NOT registered for zoom — it only shows
         # while collapsed, where the chat-text zoom is irrelevant). Kept as a ref so Tk won't GC it.
         self.f_pill  = tkfont.Font(family=self.sans, size=-self.px(13), weight="bold")
+        # Status-bar icon font: the native Windows symbol face renders a crisp, monochrome
+        # settings gear (U+E713 — the same glyph Windows uses in its own Settings UI) that
+        # colors cleanly with the theme, far nicer than the thin U+2699 the body font makes.
+        # Falls back to that plain glyph if neither Windows icon font is present.
+        _icon_fam = next((f for f in ("Segoe Fluent Icons", "Segoe MDL2 Assets") if f in avail), None)
+        if _icon_fam:
+            self.f_icon, self.gear_glyph = mk(_icon_fam, 13), "\uE713"
+        else:
+            self.f_icon, self.gear_glyph = self.f_small, "⚙"
 
         self._build_titlebar()
         self.hairline = tk.Frame(self.root, bg=T["border"], height=1)
@@ -893,7 +902,7 @@ class Overlay:
         # crowded the bar. They now live behind a single ⚙ settings menu (see _gear_menu).
         # The gear turns the accent color while Read-only is ON, so that safety state stays
         # visible at a glance without opening the menu.
-        self.gear = tk.Label(st, text="⚙", bg=T["bg"], font=self.f_small, cursor="hand2")
+        self.gear = tk.Label(st, text=self.gear_glyph, bg=T["bg"], font=self.f_icon, cursor="hand2")
         self.gear.pack(side="left", padx=(self.px(10), self.px(2)), pady=pad)
         self.gear.bind("<Button-1>", self._gear_menu)
         self.gear.bind("<Enter>", lambda e: self.gear.configure(fg=T["accent"]))

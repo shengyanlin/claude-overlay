@@ -3,6 +3,23 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.12.2] — 2026-07-16
+
+### Fixed
+- **Turning the Read-only lock back off no longer errors on machines where
+  `bypassPermissions` is disabled by policy.** If your Claude configuration disables bypass
+  mode (common on managed/enterprise setups), the overlay silently launches in a degraded
+  mode but still believed it could return to `bypassPermissions` at run time — so flipping
+  Read-only off failed with *"Cannot set permission mode to bypassPermissions because it is
+  disabled by settings or configuration"*. It now falls back to `acceptEdits` (the same
+  effective full access here, since the overlay auto-approves prompts) instead of erroring,
+  and remembers bypass is unreachable so it won't try again.
+
+### Changed
+- **The ⚙ settings-menu icon is now the crisp native Windows settings glyph** (Segoe Fluent
+  Icons / MDL2 Assets) instead of the thin, awkward `⚙` character, so it reads cleanly in
+  the status bar. Falls back to the plain glyph if those fonts aren't present.
+
 ## [1.12.1] — 2026-07-16
 
 ### Changed
@@ -734,6 +751,7 @@ Initial public release.
   edge/corner resize, paste images (Ctrl+V), text zoom (Ctrl +/−), global hotkey
   (Ctrl+Alt+Space).
 
+[1.12.2]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.12.2
 [1.12.1]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.12.1
 [1.12.0]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.12.0
 [1.11.4]: https://github.com/shengyanlin/claude-overlay/releases/tag/v1.11.4

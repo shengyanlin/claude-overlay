@@ -613,6 +613,20 @@ def _drain(q):
             return out
 
 
+class _BypassRejectingClient:
+    """set_permission_mode raises ONLY for bypassPermissions — mirrors a managed CLI with
+    disableBypassPermissionsMode, which silently launches in a non-bypass mode and then
+    REFUSES a runtime switch to bypass. Any other mode succeeds."""
+    def __init__(self):
+        self.calls = []
+
+    async def set_permission_mode(self, mode):
+        self.calls.append(mode)
+        if mode == "bypassPermissions":
+            raise RuntimeError("Cannot set permission mode to bypassPermissions because "
+                               "it is disabled by settings or configuration")
+
+
 class TestBypassElevationFallback:
 
     def test_substitutes_accept_edits_when_not_launch_capable(self):
@@ -655,6 +669,24 @@ class TestBypassElevationFallback:
         events = _drain(w.ui)
         assert ("permission_mode", before) in events
         assert any(k == "error" for k, _ in events)
+
+    def test_falls_back_to_accept_edits_when_bypass_rejected_at_runtime(self):
+        # _bypass_capable can be a FALSE POSITIVE: launched in bypassPermissions but the CLI
+        # silently degraded (managed settings disable it), so a runtime switch to bypass is
+        # REJECTED. The worker must catch that, retry acceptEdits, confirm THAT to the UI,
+        # and NOT surface an error. Repro of the "Cannot set permission mode to
+        # bypassPermissions because it is disabled by settings or configuration" bug seen
+        # after toggling Read-only on then off.
+        w = make_worker()
+        w._bypass_capable = True          # false positive from the launch mode
+        c = _BypassRejectingClient()
+        asyncio.run(w._do_set_permission_mode(c, "bypassPermissions"))
+        assert c.calls == ["bypassPermissions", "acceptEdits"]
+        assert w._permission_mode == "acceptEdits"
+        assert w._bypass_capable is False           # remembered → skip bypass next time
+        events = _drain(w.ui)
+        assert ("permission_mode", "acceptEdits") in events
+        assert not any(k == "error" for k, _ in events)   # fell back silently, no error line
 
 
 # ---------------------------------------------------------------------------

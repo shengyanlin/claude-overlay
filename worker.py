@@ -164,7 +164,22 @@ class ClaudeWorker(threading.Thread):
             if fn is None:   # pre-0.1 SDKs: no runtime switching — keep the mode truthful
                 raise RuntimeError("this claude-agent-sdk can't switch permission modes "
                                    "at run time — update it (pip install -U claude-agent-sdk)")
-            await fn(mode)
+            try:
+                await fn(mode)
+            except Exception:
+                # bypassPermissions can be REFUSED at run time even when we launched in it:
+                # if managed settings disable it (disableBypassPermissionsMode), the CLI
+                # silently launched in a non-bypass mode, so _bypass_capable (derived from
+                # the REQUESTED launch mode) was a false positive. Fall back to acceptEdits —
+                # the runtime-reachable full-access equivalent here (everything that would
+                # prompt is auto-approved by _allow_tool outside plan) — instead of surfacing
+                # an error, and remember bypass is unreachable so we skip it next time.
+                if mode == "bypassPermissions":
+                    self._bypass_capable = False
+                    mode = "acceptEdits"
+                    await fn(mode)
+                else:
+                    raise
             self._permission_mode = mode   # AFTER success only; also survives reconnects
             self.ui.put(("permission_mode", mode))
         except Exception as e:
