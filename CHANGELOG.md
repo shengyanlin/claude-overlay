@@ -12,7 +12,11 @@ This project follows [Semantic Versioning](https://semver.org/).
   flips once the CLI confirms the switch, and while read-only is on the overlay denies
   every permission escalation the agent requests (including `ExitPlanMode`, which the
   overlay's blanket auto-approval would otherwise grant — silently lifting read-only).
-  Set `PERMISSION_MODE = "plan"` to start locked; the mode also survives the overlay's
+  Set `PERMISSION_MODE = "plan"` to start locked on first launch — the toggle remembers
+  your last choice across launches (same per-machine state store as Window-only, and a
+  remembered unlock launches the session directly in the full-access mode so it stays
+  bypass-capable); because that memory is a safety state, startup announces it in-chat
+  whenever it differs from the configured default. The mode also survives the overlay's
   automatic reconnects. When the session wasn't *launched* in `bypassPermissions` the
   CLI forbids elevating to it at run time, so unlocking lands on `acceptEdits` instead —
   effectively full access here, and the in-chat notice names the mode you actually got.

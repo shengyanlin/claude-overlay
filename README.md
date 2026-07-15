@@ -300,9 +300,11 @@ All settings are constants at the top of `claude_overlay.py`:
   resolved to, e.g. `claude-opus-4-8`). Don't use `None`: the Agent SDK resolves `None`
   to an older model, not the CLI's interactive default.
 - `PERMISSION_MODE` — `"bypassPermissions"` by default (see security note below); this
-  is just the **startup** mode — the **◉ / ○ Read-only** status-bar toggle switches the
-  live session between `"plan"` (read-only) and this mode at any time. Set `"plan"` to
-  start locked read-only.
+  is just the **first-launch** mode — the **◉ / ○ Read-only** status-bar toggle switches
+  the live session between `"plan"` (read-only) and this mode at any time, and the
+  toggle **remembers your last choice across launches** (announced in-chat at startup
+  whenever the remembered state differs from this default). Set `"plan"` to start
+  locked read-only.
 - `WORKING_DIR` — folder Claude operates in (default: your home directory).
 - `THEME` — `"light"` (warm paper) or `"dark"`.
 - `TASKBAR_BUTTON` — `True` (default) gives the frameless window a real, clickable
@@ -345,7 +347,9 @@ on the overlay **denies every permission escalation the agent asks for** (includ
 *launched* in it — so when the overlay started read-only, flipping the toggle off lands
 on `acceptEdits` instead, which the overlay's auto-approval makes effectively full
 access; the in-chat notice always names the mode you actually got.)
-To *start* locked, set `PERMISSION_MODE = "plan"`. (`"acceptEdits"` / `"default"` are
+To *start* locked on first launch, set `PERMISSION_MODE = "plan"` — after that the
+toggle's last state is remembered per-machine, and a launch says so in-chat whenever
+the remembered choice differs from the configured default. (`"acceptEdits"` / `"default"` are
 of limited use here: a GUI with no terminal has nowhere to show a permission prompt,
 so the overlay auto-answers them — see `worker._allow_tool`.)
 

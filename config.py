@@ -153,11 +153,13 @@ SHOT_SCOPE_FORCED = "CLAUDE_OVERLAY_SHOT_SCOPE" in os.environ
                                  # remembered toggle state below; unset → last toggle choice wins
 STATE_FILE = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "claude-overlay" / "state.json"
                                  # tiny per-machine store for UI-toggle state the user expects to
-                                 # survive a relaunch (currently: Window-only). Deliberately
+                                 # survive a relaunch (Window-only and Read-only). Deliberately
                                  # OUTSIDE the app folder: machine state must not dirty the git
-                                 # clone or ride along in updates. Permission mode is deliberately
-                                 # NOT persisted — starting locked/unlocked is a safety posture
-                                 # that should come from PERMISSION_MODE, not linger silently.
+                                 # clone or ride along in updates. SHOT_SCOPE / PERMISSION_MODE
+                                 # seed the very first launch; after that the remembered toggle
+                                 # wins — and because a restored Read-only choice is a SAFETY
+                                 # state, the overlay announces it in-chat whenever it differs
+                                 # from the configured default.
 IMAGE_INPUT = "inline"           # "inline" → attach screenshots as base64 image blocks
                                  # (no per-turn Read round-trip); "read" → legacy path:
                                  # save PNG + ask Claude to Read it. Flip to "read" if a

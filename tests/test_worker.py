@@ -655,3 +655,24 @@ class TestBypassElevationFallback:
         events = _drain(w.ui)
         assert ("permission_mode", before) in events
         assert any(k == "error" for k, _ in events)
+
+
+# ---------------------------------------------------------------------------
+# 5e. Launch permission mode parameter
+# ---------------------------------------------------------------------------
+
+class TestLaunchPermissionMode:
+
+    def test_launch_mode_param_overrides_config(self):
+        w = ClaudeWorker(queue.Queue(), permission_mode="plan")
+        assert w._permission_mode == "plan"
+        assert w._bypass_capable is False     # plan launch → can never elevate to bypass
+
+    def test_launch_mode_bypass_is_capable(self):
+        w = ClaudeWorker(queue.Queue(), permission_mode="bypassPermissions")
+        assert w._permission_mode == "bypassPermissions"
+        assert w._bypass_capable is True
+
+    def test_launch_mode_default_follows_config(self):
+        w = make_worker()
+        assert w._permission_mode == config.PERMISSION_MODE

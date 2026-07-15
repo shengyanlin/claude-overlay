@@ -69,7 +69,7 @@ from debuglog import dbg, DEBUG_LOG, _UIQueueTap, _dbg_stream_last, _dbg_think_l
 from modelresolve import resolve_model
 
 class ClaudeWorker(threading.Thread):
-    def __init__(self, ui_queue: "queue.Queue"):
+    def __init__(self, ui_queue: "queue.Queue", permission_mode=None):
         super().__init__(daemon=True)
         # Tap the UI channel so the debug log captures every worker→UI event (no-op when
         # DEBUG_LOG is ""). The UI side keeps reading the raw queue.
@@ -84,18 +84,19 @@ class ClaudeWorker(threading.Thread):
         # before the event loop starts; defaults to the raw alias so nothing breaks if
         # resolution is skipped or fails. See modelresolve for WHY (streaming alias lag).
         self._resolved_model = MODEL
-        # The ACTIVE permission mode. Starts at the config constant; the status-bar
-        # "Read-only" toggle switches it at run time ("plan" ⇄ the configured mode).
+        # The ACTIVE permission mode. Starts at the caller's launch mode (the UI passes
+        # the remembered Read-only state; None → the config constant); the status-bar
+        # "Read-only" toggle switches it at run time ("plan" ⇄ the full-access mode).
         # Kept here (not just CLI-side) because (a) _make_options must rebuild any
         # reconnect with the CURRENT mode, not the startup one, and (b) _allow_tool
         # must know when it's read-only (see the plan guard there).
-        self._permission_mode = PERMISSION_MODE
+        self._permission_mode = permission_mode or PERMISSION_MODE
         # Whether THIS session may ever be switched to bypassPermissions at run time:
         # the CLI refuses to ELEVATE a running session to bypass unless it was launched
         # with --dangerously-skip-permissions, and the SDK only adds that flag when the
         # session STARTS in bypass mode. Re-derived on every _open() (a reconnect that
         # happens while read-only relaunches without the flag).
-        self._bypass_capable = (PERMISSION_MODE == "bypassPermissions")
+        self._bypass_capable = (self._permission_mode == "bypassPermissions")
 
     def ask(self, text: str, image_paths=None):
         self.req.put(("ask", (text, list(image_paths or []))))

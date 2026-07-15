@@ -452,3 +452,47 @@ def test_toggle_window_shot_persists_choice(overlay, monkeypatch, tmp_path):
     assert co._load_state().get("window_shot") is True
     overlay.toggle_window_shot()              # → off again
     assert co._load_state().get("window_shot") is False
+
+
+# ── Read-only persistence (remembered across launches) ───────────────────────
+
+def test_startup_permission_mode_first_launch_follows_config(monkeypatch, tmp_path):
+    import claude_overlay as co
+    monkeypatch.setattr(co, "STATE_FILE", tmp_path / "absent.json")   # no saved state
+    monkeypatch.setattr(co, "PERMISSION_MODE", "plan")
+    assert co._startup_permission_mode() == (True, "plan")
+    monkeypatch.setattr(co, "PERMISSION_MODE", "bypassPermissions")
+    assert co._startup_permission_mode() == (False, "bypassPermissions")
+
+
+def test_startup_permission_mode_saved_choice_wins(monkeypatch, tmp_path):
+    import claude_overlay as co
+    monkeypatch.setattr(co, "STATE_FILE", tmp_path / "state.json")
+    # Remembered UNLOCK over a plan config: launch straight into full access — and
+    # into bypassPermissions specifically, so the session is born bypass-capable.
+    monkeypatch.setattr(co, "PERMISSION_MODE", "plan")
+    co._save_state(read_only=False)
+    assert co._startup_permission_mode() == (False, "bypassPermissions")
+    # Remembered LOCK over a bypass config: launch straight into plan.
+    monkeypatch.setattr(co, "PERMISSION_MODE", "bypassPermissions")
+    co._save_state(read_only=True)
+    assert co._startup_permission_mode() == (True, "plan")
+
+
+def test_startup_permission_mode_garbage_state_ignored(monkeypatch, tmp_path):
+    import claude_overlay as co
+    monkeypatch.setattr(co, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(co, "PERMISSION_MODE", "plan")
+    co._save_state(read_only="yes please")   # non-bool must fall back to the config default
+    assert co._startup_permission_mode() == (True, "plan")
+
+
+def test_apply_permission_mode_persists_confirmed_choice(overlay, monkeypatch, tmp_path):
+    import claude_overlay as co
+    monkeypatch.setattr(co, "STATE_FILE", tmp_path / "state.json")
+    overlay.read_only = False
+    overlay._paint_ro_toggle()
+    overlay._apply_permission_mode("plan")
+    assert co._load_state().get("read_only") is True
+    overlay._apply_permission_mode("acceptEdits")
+    assert co._load_state().get("read_only") is False

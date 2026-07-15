@@ -91,6 +91,21 @@ def _save_state(**updates):
         pass
 
 
+def _startup_permission_mode():
+    """Decide this launch's permission state: (read_only, mode to LAUNCH the worker in).
+    The remembered Read-only toggle — a deliberate user choice, like Window-only — wins
+    over the config default; PERMISSION_MODE seeds the first launch (no saved state).
+    A remembered unlock launches straight in the full-access mode, so the session is
+    born bypass-capable when full access means bypassPermissions — a running session
+    can never be ELEVATED to bypass later (see worker._bypass_capable)."""
+    ro = (PERMISSION_MODE == "plan")
+    saved = _load_state().get("read_only")
+    if isinstance(saved, bool):
+        ro = saved
+    full = PERMISSION_MODE if PERMISSION_MODE != "plan" else "bypassPermissions"
+    return ro, ("plan" if ro else full)
+
+
 def round_rect(c, x1, y1, x2, y2, r, **kw):
     pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
            x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
@@ -101,7 +116,11 @@ class Overlay:
     def __init__(self):
         self.ui_q: "queue.Queue" = queue.Queue()
         _ensure_shot_dir()          # before the worker, so a bad TEMP can't crash us mid-startup
-        self.worker = ClaudeWorker(self.ui_q)
+        # Resolve the remembered Read-only toggle BEFORE the worker exists: the session
+        # must be LAUNCHED in the remembered mode (a plan-launched session can't be
+        # elevated to bypassPermissions at run time, only started in it).
+        self.read_only, _launch_mode = _startup_permission_mode()
+        self.worker = ClaudeWorker(self.ui_q, permission_mode=_launch_mode)
         self.worker.start()
 
         self.auto_shot = AUTO_SCREENSHOT_DEFAULT
@@ -110,8 +129,8 @@ class Overlay:
             self.window_shot = bool(_load_state().get("window_shot", self.window_shot))
                                                       # relaunch; an explicit env var beats it
         self.share_visible = SHOW_IN_SCREEN_SHARE_DEFAULT   # True → overlay shows in screen shares
-        self.read_only = (PERMISSION_MODE == "plan")  # True → agent may look, not act; the toggle
-                                                      # flips it via the worker (confirmed async)
+        # self.read_only was set above (worker launch); the toggle flips it via the
+        # worker (confirmed async) and each confirmed change is persisted.
         self._full_mode = (PERMISSION_MODE if PERMISSION_MODE != "plan"
                            else "bypassPermissions")  # what Read-only OFF returns to: the
                                                       # configured mode — unless that IS plan,
@@ -254,6 +273,13 @@ class Overlay:
         self._build_edges()        # invisible drag strips on every edge/corner → resize
         self._bind_zoom()          # Ctrl +/- and Ctrl+wheel → live text zoom
         self._intro()
+        # A remembered Read-only choice silently overriding the config default is a
+        # SAFETY state — say so up front, so a launch never surprises.
+        if self.read_only != (PERMISSION_MODE == "plan"):
+            self.add_sys("🔒 Read-only restored from your last session — flip the "
+                         "Read-only toggle off for full access." if self.read_only else
+                         "⚡ Full access restored from your last session (you had "
+                         "switched Read-only off). Flip it back on any time.")
 
         self.root.after(130, lambda: (self.root.focus_force(), self.entry.focus_set()))
         self.root.bind("<Configure>", self._on_configure)
@@ -2967,6 +2993,8 @@ class Overlay:
         changed = (ro != self.read_only)
         self.read_only = ro
         self._paint_ro_toggle()
+        if changed:
+            _save_state(read_only=ro)   # persist only CONFIRMED switches, never requests
         if changed and ro:
             self.add_sys("🔒 Read-only: Claude can see your screen, read files, and "
                          "answer — but won't edit anything or run commands.")
