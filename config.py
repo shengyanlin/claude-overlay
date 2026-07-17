@@ -3,6 +3,7 @@
 Claude Overlay. Pure data + small env helpers; no project imports (leaf module),
 so anything may import it without a circular-import risk."""
 
+import json
 import os
 from pathlib import Path
 
@@ -253,4 +254,156 @@ THEMES = {
         "sel": "#3A3934", "hover": "#30302E",
     },
 }
+
+# ── per-machine overrides: config.json ──────────────────────────────────────
+# Every constant above is a COMMITTED default — editing this file to taste dirties the
+# git clone and turns every `git pull` into a conflict (or forces a rebase dance). So
+# personal settings go in a tiny JSON file OUTSIDE the repo instead, in the same
+# per-machine home that already holds the toggle state (STATE_FILE):
+#
+#     %LOCALAPPDATA%\claude-overlay\config.json
+#     e.g.  { "PERMISSION_MODE": "plan", "THEME": "dark" }
+#
+# (or set CLAUDE_OVERLAY_CONFIG to any path — also how the tests isolate themselves).
+# Precedence, weakest → strongest: the constants above < config.json < an explicitly
+# set CLAUDE_OVERLAY_* env var (a per-launch decision keeps its old rank). And exactly
+# like the constants they replace, SHOT_SCOPE / PERMISSION_MODE from the file only SEED
+# the very first launch — the remembered Window-only / Read-only toggle state still wins.
+# Unknown keys and wrong-typed values are SKIPPED, never fatal: each problem lands in
+# USER_CONFIG_WARNINGS and the overlay surfaces them in-chat at startup, so a typo can't
+# silently launch a misconfigured (say, full-access) session.
+USER_CONFIG_FILE = Path(os.environ.get("CLAUDE_OVERLAY_CONFIG")
+                        or Path(os.environ.get("LOCALAPPDATA") or Path.home())
+                        / "claude-overlay" / "config.json")
+USER_CONFIG_WARNINGS: list = []   # human-readable; shown in-chat by the overlay at startup
+
+_BAD = object()   # sentinel: a validator rejected the value
+
+
+def _v_bool(v):
+    return v if isinstance(v, bool) else _BAD   # JSON true/false only — "true" is a typo
+
+
+def _v_str(v):
+    return v if isinstance(v, str) and v.strip() else _BAD
+
+
+def _v_choice(*allowed):
+    """Case-insensitive membership, returning the CANONICAL spelling (the CLI wants
+    "bypassPermissions", not whatever casing the user typed)."""
+    def check(v):
+        if isinstance(v, str):
+            s = v.strip().lower()
+            for a in allowed:
+                if s == a.lower():
+                    return a
+        return _BAD
+    return check
+
+
+def _v_num(lo, hi, cast):
+    """Clamp into [lo, hi] like _env_int does — a slightly-out-of-range number means
+    'as far as it goes', not a typo worth rejecting. bool is an int; exclude it."""
+    def check(v):
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return cast(max(lo, min(hi, v)))
+        return _BAD
+    return check
+
+
+def _v_str_list(v):
+    if isinstance(v, list) and v and all(isinstance(s, str) and s.strip() for s in v):
+        return list(v)
+    return _BAD
+
+
+def _v_skills(v):
+    return v if v is None or v == "all" else _v_str_list(v)
+
+
+def _v_dir(v):
+    """WORKING_DIR: expand ~ and %VARS%, and require the directory to EXIST — the CLI
+    is spawned with this as its cwd, and a bad cwd fails far less legibly than this."""
+    if not (isinstance(v, str) and v.strip()):
+        return _BAD
+    p = os.path.expandvars(os.path.expanduser(v.strip()))
+    return p if os.path.isdir(p) else _BAD
+
+
+# Which constants config.json may override, and how each value is checked. Deliberately
+# a whitelist: derived/structural values (STATE_FILE, SHOT_DIR, THEMES, MODELS, the
+# MAX_* safety caps…) stay source-only.
+_USER_CONFIG_KEYS = {
+    # agent
+    "WORKING_DIR": _v_dir,
+    "MODEL": _v_str,
+    "PERMISSION_MODE": _v_choice("bypassPermissions", "acceptEdits", "default", "plan"),
+    "SKILLS": _v_skills,                       # "all" | ["name", …] | null
+    "STRICT_MCP_CONFIG": _v_bool,
+    "CLI_UPDATE_CHECK": _v_bool,
+    # capture
+    "AUTO_SCREENSHOT_DEFAULT": _v_bool,
+    "SHOT_SCOPE": _v_choice("screens", "window"),
+    "SHOT_FORMAT": _v_choice("auto", "png", "jpeg"),
+    "SHOT_JPEG_QUALITY": _v_num(50, 95, int),
+    "HIDE_SCREENSHOT_TOOL": _v_bool,
+    # appearance / window
+    "THEME": _v_choice("light", "dark"),
+    "SHOW_IN_SCREEN_SHARE_DEFAULT": _v_bool,
+    "TASKBAR_BUTTON": _v_bool,
+    "HOTKEY": _v_str,
+    "WINDOW_ALPHA": _v_num(0.3, 1.0, float),   # floor 0.3: an ~invisible window looks broken
+    "CORNER_RADIUS": _v_num(0, 40, int),
+    "ORB_SIZE": _v_num(24, 160, int),
+    "FONT_SANS": _v_str_list,
+    "FONT_SERIF": _v_str_list,
+    "FONT_MONO": _v_str_list,
+}
+
+# Settings that ALSO have an env var: an explicitly set (non-blank) env var is a
+# per-launch decision and beats the file — the same rank env overrides always had.
+_ENV_BEATS_JSON = {
+    "SHOT_FORMAT": "CLAUDE_OVERLAY_SHOT_FORMAT",
+    "SHOT_JPEG_QUALITY": "CLAUDE_OVERLAY_SHOT_JPEG_QUALITY",
+    "SHOT_SCOPE": "CLAUDE_OVERLAY_SHOT_SCOPE",
+    "STRICT_MCP_CONFIG": "CLAUDE_OVERLAY_STRICT_MCP",
+    "CLI_UPDATE_CHECK": "CLAUDE_OVERLAY_CLI_UPDATE_CHECK",
+}
+
+
+def _apply_user_config():
+    """Overlay USER_CONFIG_FILE onto the module constants, collecting a warning for
+    everything skipped. Never raises: a broken config file must degrade to the
+    committed defaults, not kill the app at import time."""
+    try:
+        if not USER_CONFIG_FILE.is_file():
+            return
+        if USER_CONFIG_FILE.stat().st_size > 64 * 1024:   # sanity cap, like STATE_FILE
+            USER_CONFIG_WARNINGS.append("file is implausibly large — ignored.")
+            return
+        data = json.loads(USER_CONFIG_FILE.read_text("utf-8"))
+        if not isinstance(data, dict):
+            USER_CONFIG_WARNINGS.append("top level must be a JSON object — ignored.")
+            return
+    except Exception as e:
+        USER_CONFIG_WARNINGS.append(f"couldn't read it ({e}) — using the defaults.")
+        return
+    for key, val in data.items():
+        check = _USER_CONFIG_KEYS.get(key)
+        if check is None:
+            USER_CONFIG_WARNINGS.append(f"unknown setting {key!r} — ignored.")
+            continue
+        env = _ENV_BEATS_JSON.get(key)
+        if env and (os.environ.get(env) or "").strip():
+            continue                       # explicit env var outranks the file this launch
+        good = check(val)
+        if good is _BAD:
+            USER_CONFIG_WARNINGS.append(
+                f"invalid value for {key}: {val!r} — keeping the default.")
+            continue
+        globals()[key] = good
+
+
+_apply_user_config()
+
 T = THEMES.get(THEME, THEMES["light"])

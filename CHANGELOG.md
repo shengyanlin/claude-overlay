@@ -3,6 +3,22 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Personal settings now live in a per-machine `config.json` — no more editing
+  `config.py`.** Drop the settings you want to change (e.g. `{"PERMISSION_MODE":
+  "plan", "THEME": "dark"}`) into `%LOCALAPPDATA%\claude-overlay\config.json` (or any
+  path via the `CLAUDE_OVERLAY_CONFIG` env var) and they override the committed
+  defaults at startup — so a customized setup survives every `git pull` / `update.cmd`
+  with no conflicts. Precedence: constants < `config.json` < an explicitly set
+  `CLAUDE_OVERLAY_*` env var, and the remembered ⚙-toggle state still wins over all
+  three, exactly as before. Values are validated against a whitelist; anything typo'd,
+  wrong-typed, or unknown is skipped and called out in-chat at startup — a mistake in
+  the file can never silently launch a misconfigured (say, full-access) session, and a
+  broken file degrades to the defaults instead of preventing launch. See the README's
+  **Configuration** section for the full list of overridable settings.
+
 ## [1.12.1] — 2026-07-16
 
 ### Changed

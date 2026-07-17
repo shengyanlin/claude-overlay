@@ -280,6 +280,11 @@ class Overlay:
                          "Read-only toggle off for full access." if self.read_only else
                          "⚡ Full access restored from your last session (you had "
                          "switched Read-only off). Flip it back on any time.")
+        # Anything the per-machine config.json couldn't apply (typo'd key, wrong type,
+        # unreadable file) must be SEEN — a silently-skipped PERMISSION_MODE would
+        # launch a full-access session the user believed was read-only.
+        for w in USER_CONFIG_WARNINGS:
+            self.add_sys(f"⚠ {USER_CONFIG_FILE.name}: {w}")
 
         self.root.after(130, lambda: (self.root.focus_force(), self.entry.focus_set()))
         self.root.bind("<Configure>", self._on_configure)
