@@ -48,6 +48,7 @@ class FakeWorker:
     def reset(self):            self._rec("reset")
     def compact(self):          self._rec("compact")
     def set_model(self, *a):    self._rec("set_model", *a)
+    def resume(self, *a):       self._rec("resume", *a)
     def set_permission_mode(self, *a):  self._rec("set_permission_mode", *a)
     def interrupt(self):        self._rec("interrupt")
     def shutdown(self):         self._rec("shutdown")

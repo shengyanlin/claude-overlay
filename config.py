@@ -211,6 +211,16 @@ CLI_UPDATE_CHECK = _env_bool("CLAUDE_OVERLAY_CLI_UPDATE_CHECK", True)   # on lau
                             # the overlay current never advances the CLI, and an old CLI silently
                             # runs an older model. Set CLAUDE_OVERLAY_CLI_UPDATE_CHECK=0 to disable
                             # (e.g. a locked-down box where global npm installs aren't allowed)
+RESUME_OFFER = _env_bool("CLAUDE_OVERLAY_RESUME_OFFER", True)   # on launch, when the previous
+                            # run left a conversation behind, show a one-click "Resume last
+                            # conversation" button in the chat. The session id is remembered
+                            # (in STATE_FILE) on every completed turn; Clear wipes the record,
+                            # so a deliberately discarded conversation is never offered back.
+                            # Set CLAUDE_OVERLAY_RESUME_OFFER=0 to never offer.
+RESUME_OFFER_MAX_AGE = 7 * 24 * 3600   # only offer to resume a conversation younger than this
+                            # (seconds). Days-old context is rarely what you want back, and the
+                            # CLI eventually cleans up old session files anyway (then a click
+                            # would just fall back to a fresh session with a notice).
 
 SYSTEM_APPEND = (
     "You are running as an always-on-top floating overlay assistant on the user's "

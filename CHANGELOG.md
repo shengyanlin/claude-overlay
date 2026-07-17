@@ -3,6 +3,26 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Conversations survive restarts.** The overlay remembers the CLI session id of your
+  current conversation (per completed turn, in the same per-machine `state.json` as the
+  toggles), and the next launch offers a one-click **↺ Resume last conversation** button
+  in the chat — the transcript isn't replayed, but Claude remembers everything, so you
+  just keep going. Closing the overlay to update it no longer costs you your context.
+  Offered only for a session from the same working directory, younger than
+  `RESUME_OFFER_MAX_AGE` (7 days); **Clear wipes the record**, so a deliberately
+  discarded conversation is never offered back. If the session file is gone, the click
+  falls back to a fresh session with a notice. Set `RESUME_OFFER = False` (or
+  `CLAUDE_OVERLAY_RESUME_OFFER=0`) to never offer.
+
+### Fixed
+- **A transport drop mid-session no longer loses the conversation.** The
+  "↻ Connection hiccup" recovery path used to reconnect with a *fresh* session —
+  silently discarding all context. It now reconnects with `--resume` into the same
+  conversation; only a failed resume falls back to a fresh session (and says so).
+
 ## [1.12.1] — 2026-07-16
 
 ### Changed

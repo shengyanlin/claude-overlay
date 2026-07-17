@@ -676,3 +676,146 @@ class TestLaunchPermissionMode:
     def test_launch_mode_default_follows_config(self):
         w = make_worker()
         assert w._permission_mode == config.PERMISSION_MODE
+
+
+# ---------------------------------------------------------------------------
+# Session tracking + resume (the "conversations survive restarts" feature)
+# ---------------------------------------------------------------------------
+
+class TestSessionTracking:
+    """Session-id capture from stream messages, and how resume flows through the
+    worker. Still no .start()/.run()/connect — the async bits are exercised with
+    stubbed _open/_close on a throwaway event loop."""
+
+    def test_resume_enqueues(self):
+        w = make_worker()
+        w.resume("sess-1")
+        assert w.req.get_nowait() == ("resume", "sess-1")
+
+    def test_resume_coerces_id_to_str(self):
+        w = make_worker()
+        w.resume(12345)
+        assert w.req.get_nowait() == ("resume", "12345")
+
+    def test_set_session_records_and_emits(self):
+        w = make_worker()
+        w._set_session("s-abc")
+        assert w._session_id == "s-abc"
+        assert w.ui.get_nowait() == ("session", "s-abc")
+
+    def test_set_session_same_id_emits_once(self):
+        w = make_worker()
+        w._set_session("s-abc")
+        w.ui.get_nowait()
+        w._set_session("s-abc")          # unchanged → no duplicate UI event
+        assert w.ui.empty()
+
+    def test_set_session_ignores_empty(self):
+        w = make_worker()
+        w._set_session(None)
+        w._set_session("")
+        assert w._session_id is None
+        assert w.ui.empty()
+
+    def test_result_message_captures_session_id(self):
+        from claude_agent_sdk import ResultMessage
+        w = make_worker()
+        msg = ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1,
+                            is_error=False, num_turns=1, session_id="s-result")
+        w._dispatch(msg, {})
+        assert w._session_id == "s-result"
+
+    def test_system_init_captures_session_id(self):
+        from claude_agent_sdk import SystemMessage
+        w = make_worker()
+        w._dispatch(SystemMessage(subtype="init", data={"session_id": "s-init"}), {})
+        assert w._session_id == "s-init"
+
+    def test_system_non_init_is_ignored(self):
+        from claude_agent_sdk import SystemMessage
+        w = make_worker()
+        w._dispatch(SystemMessage(subtype="status", data={"session_id": "s-x"}), {})
+        assert w._session_id is None
+
+    def test_make_options_passes_resume(self):
+        w = make_worker()
+        w._resume_session_id = "s-9"
+        opts = w._make_options()
+        assert getattr(opts, "resume", None) == "s-9"
+
+    def test_make_options_no_resume_by_default(self):
+        w = make_worker()
+        opts = w._make_options()
+        assert getattr(opts, "resume", None) is None
+
+
+class TestReconnectResume:
+    """_reconnect must carry the known session id into the next _open (context
+    preserved across a dead transport), and say which of the two things it's doing."""
+
+    def _run_reconnect(self, w):
+        async def _noop():
+            return None
+        w._close = lambda: _noop()
+        w._open = lambda: _noop()        # capture happens BEFORE _open would consume it
+        asyncio.run(w._reconnect())
+
+    def test_reconnect_with_session_resumes(self):
+        w = make_worker()
+        w._session_id = "s-live"
+        self._run_reconnect(w)
+        assert w._resume_session_id == "s-live"
+        kind, text = w.ui.get_nowait()
+        assert kind == "system" and "resum" in text.lower()
+
+    def test_reconnect_without_session_is_fresh(self):
+        w = make_worker()
+        self._run_reconnect(w)
+        assert w._resume_session_id is None
+        kind, text = w.ui.get_nowait()
+        assert kind == "system" and "fresh" in text.lower()
+
+
+class TestDoResume:
+    """_do_resume outcome signalling: 'resumed' only when the client is up AND the
+    session id stuck; anything else must tell the UI the resume failed."""
+
+    @staticmethod
+    def _stub(w, client, session_after):
+        async def _close():
+            return None
+
+        async def _open():
+            # mimic _open's contract: success adopts the pending id, either way it's consumed
+            w._client = client
+            w._session_id = session_after
+            w._resume_session_id = None
+        w._close = _close
+        w._open = _open
+
+    def test_success_emits_resumed(self):
+        w = make_worker()
+        self._stub(w, client=object(), session_after="s-1")
+        asyncio.run(w._do_resume("s-1"))
+        kinds = []
+        while not w.ui.empty():
+            kinds.append(w.ui.get_nowait()[0])
+        assert "resumed" in kinds and "resume_failed" not in kinds
+
+    def test_fallback_emits_resume_failed(self):
+        w = make_worker()
+        self._stub(w, client=object(), session_after=None)   # fresh-session fallback
+        asyncio.run(w._do_resume("s-1"))
+        kinds = []
+        while not w.ui.empty():
+            kinds.append(w.ui.get_nowait()[0])
+        assert "resume_failed" in kinds and "resumed" not in kinds
+
+    def test_no_client_emits_resume_failed(self):
+        w = make_worker()
+        self._stub(w, client=None, session_after=None)
+        asyncio.run(w._do_resume("s-1"))
+        kinds = []
+        while not w.ui.empty():
+            kinds.append(w.ui.get_nowait()[0])
+        assert "resume_failed" in kinds

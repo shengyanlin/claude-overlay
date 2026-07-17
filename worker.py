@@ -97,11 +97,23 @@ class ClaudeWorker(threading.Thread):
         # session STARTS in bypass mode. Re-derived on every _open() (a reconnect that
         # happens while read-only relaunches without the flag).
         self._bypass_capable = (self._permission_mode == "bypassPermissions")
+        # The CLI's id for the CURRENT conversation, captured from init/result stream
+        # messages (_set_session). The UI persists it on every completed turn so the
+        # NEXT launch can offer to resume the conversation; _reconnect uses it so a
+        # dead transport no longer costs the user their context.
+        self._session_id = None
+        # When set, the next _open() launches the CLI with --resume <id> (consumed
+        # there; a failed resume falls back to ONE fresh attempt).
+        self._resume_session_id = None
 
     def ask(self, text: str, image_paths=None):
         self.req.put(("ask", (text, list(image_paths or []))))
     def reset(self):                  self.req.put(("reset", None))
     def compact(self):                self.req.put(("compact", None))
+    def resume(self, session_id):
+        # Queued like reset (serialized behind in-flight work): swap the live client
+        # for one that resumes <session_id>. Driven by the launch-time Resume button.
+        self.req.put(("resume", str(session_id)))
     def shutdown(self):
         self._running = False
         # If the worker is currently AWAITING a lifecycle call (connect/disconnect), the
@@ -252,6 +264,10 @@ class ClaudeWorker(threading.Thread):
             # Skill tool + sets setting_sources=["user","project"] when this is provided; left
             # unset the overlay discovers no skills at all. A list enables only those skills.
             opts["skills"] = SKILLS
+        if self._resume_session_id:
+            # Relaunch INTO a previous conversation: the launch-time Resume button, or
+            # a reconnect carrying the live session across a dead transport (_reconnect).
+            opts["resume"] = self._resume_session_id
         if STRICT_MCP_CONFIG:
             # Use ONLY the (empty) MCP servers defined here, ignoring the user's filesystem
             # config. Without this the spawned CLI loads every MCP server from ~/.claude.json
@@ -264,7 +280,7 @@ class ClaudeWorker(threading.Thread):
         # SDKs. Strip any the installed SDK rejects, one at a time, so an older install still
         # loads (with reduced features) instead of failing to construct options at all.
         droppable = ["strict_mcp_config", "max_buffer_size", "can_use_tool",
-                     "include_partial_messages", "skills", "disallowed_tools"]
+                     "include_partial_messages", "skills", "disallowed_tools", "resume"]
         while True:
             try:
                 return ClaudeAgentOptions(**opts)
@@ -341,12 +357,17 @@ class ClaudeWorker(threading.Thread):
                 if kind == "reset":
                     await self._close()
                     self._saw_stream = False
+                    self._session_id = None          # Clear = deliberate discard: neither a
+                    self._resume_session_id = None   # reconnect nor the next launch may
+                                                     # resurrect the wiped conversation
                     await self._open()
                     self.ui.put(("reset_done", None))
                 elif kind == "ask":
                     await self._run_turn(payload)
                 elif kind == "compact":
                     await self._run_compact()
+                elif kind == "resume":
+                    await self._do_resume(payload)
                 elif kind == "set_model":
                     if self._client is None:
                         self.ui.put(("error", "Not connected to Claude yet — can't switch model."))
@@ -371,18 +392,72 @@ class ClaudeWorker(threading.Thread):
         await self._close()
 
     async def _reconnect(self):
-        """Tear down a broken client and stand up a fresh one so the next turn works.
-        The conversation context is lost (new session), but the app stays alive instead
-        of freezing on a dead transport."""
-        self.ui.put(("system", "↻ Connection hiccup — reconnected with a fresh session."))
+        """Tear down a broken client and stand up a working one so the next turn works.
+        When the session id is known, reconnect WITH it (--resume) so the conversation
+        survives the transport dying — historically this path silently cost the user
+        their whole context. Only a failed resume falls back to a fresh session (and
+        _open announces that fallback)."""
+        sid = self._session_id
+        self.ui.put(("system",
+                     "↻ Connection hiccup — reconnecting and resuming the conversation…"
+                     if sid else
+                     "↻ Connection hiccup — reconnected with a fresh session."))
         try:
             await self._close()
         except Exception:
             pass
         self._saw_stream = False
+        self._resume_session_id = sid
         await self._open()
 
+    async def _do_resume(self, session_id):
+        """Swap the live client for one launched with --resume <id>: the previous
+        conversation's context comes back (the transcript is not re-streamed, but the
+        model remembers all of it). Driven by the UI's launch-time Resume button; the
+        button waits for the ('resumed'/'resume_failed') outcome to restyle itself."""
+        sid = str(session_id)
+        await self._close()
+        self._saw_stream = False
+        self._resume_session_id = sid
+        await self._open()          # a failed resume falls back to a fresh session there
+        if self._client is not None and self._session_id == sid:
+            self.ui.put(("session", sid))
+            self.ui.put(("resumed", None))
+        else:
+            self.ui.put(("resume_failed", None))
+        self.ui.put(("status", ""))
+
+    def _set_session(self, sid):
+        """Track the CLI's id for the current conversation (init/result messages carry
+        it) and tell the UI, which persists it per completed turn — that record is what
+        the next launch's Resume offer and _reconnect's context preservation run on."""
+        if not sid:
+            return
+        sid = str(sid)
+        if sid != self._session_id:
+            self._session_id = sid
+            self.ui.put(("session", sid))
+
     async def _open(self):
+        """Stand up a client. When a resume id is pending (Resume button, reconnect), a
+        failed resume-connect falls back to ONE fresh attempt — a vanished session file
+        must degrade to a fresh conversation, never to 'can't connect at all'."""
+        resuming = bool(self._resume_session_id)
+        ok = await self._open_once(quiet=resuming)
+        if ok:
+            if resuming:
+                # The conversation continues under this id until the CLI's init/result
+                # messages report the continuation id (see _set_session).
+                self._session_id = self._resume_session_id
+            self._resume_session_id = None
+            return
+        if resuming:
+            self._resume_session_id = None
+            self.ui.put(("system", "⚠ Couldn't resume the previous conversation (its "
+                                   "session may have been cleaned up) — starting fresh."))
+            await self._open_once()
+
+    async def _open_once(self, quiet=False):
         try:
             self._client = ClaudeSDKClient(options=self._make_options())
             self._bypass_capable = (self._permission_mode == "bypassPermissions")
@@ -402,8 +477,14 @@ class ClaudeWorker(threading.Thread):
                 self._loop.create_task(self._emit_usage())
             except Exception:
                 pass
-        except BaseException as e:   # incl. CancelledError — _open must never propagate
+            return True
+        except BaseException as e:   # incl. CancelledError — _open_once must never propagate
             self._client = None
+            if quiet:
+                # A resume attempt: _open announces the fallback itself; the raw error
+                # would only alarm (the retry right after it usually succeeds).
+                dbg("open_quiet_fail", f"{type(e).__name__}: {e}")
+                return False
             if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
                 self.ui.put(("error",
                     f"Connecting to Claude timed out after {CONNECT_TIMEOUT}s. The next "
@@ -418,6 +499,7 @@ class ClaudeWorker(threading.Thread):
                     "Is the `claude` CLI installed and logged in? Run `claude --version` "
                     "in a terminal; if it's missing, run setup.cmd (or `irm "
                     "https://claude.ai/install.ps1 | iex`), then `claude` to /login."))
+            return False
 
     @staticmethod
     def _model_family(m):
@@ -801,6 +883,7 @@ class ClaudeWorker(threading.Thread):
                     elif isinstance(blk, ToolUseBlock):
                         self.ui.put(("tool", (blk.name, blk.input)))
         elif isinstance(msg, ResultMessage):
+            self._set_session(getattr(msg, "session_id", None))
             is_err = getattr(msg, "is_error", False)
             subtype = getattr(msg, "subtype", None)
             detail = getattr(msg, "result", None)
@@ -812,3 +895,12 @@ class ClaudeWorker(threading.Thread):
             self.ui.put(("result", {"cost": getattr(msg, "total_cost_usd", None),
                                     "is_error": is_err, "subtype": subtype,
                                     "result": detail, "stop_reason": stop_reason}))
+        elif type(msg).__name__ == "SystemMessage":
+            # The init system message carries the session id the moment the first turn
+            # streams — earlier than the result, so a turn interrupted mid-stream still
+            # leaves the conversation resumable. Matched by class name like the compact
+            # helpers, so this never depends on which types the installed SDK exports.
+            if getattr(msg, "subtype", None) == "init":
+                data = getattr(msg, "data", None)
+                if isinstance(data, dict):
+                    self._set_session(data.get("session_id"))
