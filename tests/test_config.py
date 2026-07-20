@@ -382,3 +382,40 @@ class TestUserConfig:
         assert load_cfg({"SKILLS": None}).SKILLS is None
         c = load_cfg({"SKILLS": 42})
         assert any("SKILLS" in w for w in c.USER_CONFIG_WARNINGS)
+
+    def test_structural_globals_are_not_overridable(self, load_cfg):
+        # The whitelist is a security boundary: derived/structural globals must stay
+        # source-only. Trying to set them from the file leaves them untouched and is
+        # reported as an unknown setting, not silently applied.
+        before_state = config.STATE_FILE
+        before_max = config.MAX_BUFFER_SIZE
+        c = load_cfg({"STATE_FILE": r"C:\evil\state.json", "MAX_BUFFER_SIZE": 999999999})
+        assert c.STATE_FILE == before_state
+        assert c.MAX_BUFFER_SIZE == before_max
+        assert any("STATE_FILE" in w for w in c.USER_CONFIG_WARNINGS)
+        assert any("MAX_BUFFER_SIZE" in w for w in c.USER_CONFIG_WARNINGS)
+
+    def test_bom_prefixed_file_is_read_not_discarded(self, load_cfg):
+        # Notepad / PowerShell Out-File on Windows prepend a UTF-8 BOM. It must be
+        # stripped, not fatal — otherwise the whole file is dropped and PERMISSION_MODE
+        # silently reverts to the bypassPermissions default (a full-access session).
+        c = load_cfg("﻿" + json.dumps({"PERMISSION_MODE": "plan"}))
+        assert c.PERMISSION_MODE == "plan"
+        assert c.USER_CONFIG_WARNINGS == []
+
+    def test_validator_that_raises_degrades_to_warning(self, load_cfg):
+        # _v_dir calls os.path.isdir, which raises "embedded null byte" on Windows for a
+        # path containing \x00. The per-key loop must catch it: a raising validator has to
+        # become a warning, never propagate and abort `from config import *` at launch.
+        default = config.WORKING_DIR
+        c = load_cfg({"WORKING_DIR": "bad\x00dir"})
+        assert c.WORKING_DIR == default
+        assert any("WORKING_DIR" in w for w in c.USER_CONFIG_WARNINGS)
+
+    def test_bad_permission_mode_warning_names_effective_mode(self, load_cfg):
+        # A typo'd read-only intent falls through to the committed default. The warning
+        # must name the mode actually in force so a permissive fallback isn't missed.
+        c = load_cfg({"PERMISSION_MODE": "raed-only"})
+        assert c.PERMISSION_MODE == "bypassPermissions"
+        warning = next(w for w in c.USER_CONFIG_WARNINGS if "PERMISSION_MODE" in w)
+        assert "bypassPermissions" in warning and "full access" in warning

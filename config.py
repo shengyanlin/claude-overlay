@@ -371,6 +371,16 @@ _ENV_BEATS_JSON = {
 }
 
 
+def _perm_note(key):
+    """When a skipped key is PERMISSION_MODE, spell out the mode still in force — the
+    committed default is bypassPermissions (full access), so a typo'd read-only intent
+    would otherwise fall through to a permissive session with only a generic warning."""
+    if key != "PERMISSION_MODE":
+        return ""
+    mode = globals().get("PERMISSION_MODE")
+    return f" — running in {mode!r}{', full access' if mode == 'bypassPermissions' else ''}"
+
+
 def _apply_user_config():
     """Overlay USER_CONFIG_FILE onto the module constants, collecting a warning for
     everything skipped. Never raises: a broken config file must degrade to the
@@ -381,7 +391,11 @@ def _apply_user_config():
         if USER_CONFIG_FILE.stat().st_size > 64 * 1024:   # sanity cap, like STATE_FILE
             USER_CONFIG_WARNINGS.append("file is implausibly large — ignored.")
             return
-        data = json.loads(USER_CONFIG_FILE.read_text("utf-8"))
+        # utf-8-sig, not utf-8: Notepad and PowerShell Out-File/Set-Content default to a
+        # UTF-8 BOM on Windows; plain "utf-8" leaves it in the text, json.loads then raises
+        # and the WHOLE file is discarded — silently reverting PERMISSION_MODE to the
+        # bypassPermissions default. "utf-8-sig" strips the BOM if present, no-op without.
+        data = json.loads(USER_CONFIG_FILE.read_text("utf-8-sig"))
         if not isinstance(data, dict):
             USER_CONFIG_WARNINGS.append("top level must be a JSON object — ignored.")
             return
@@ -396,10 +410,17 @@ def _apply_user_config():
         env = _ENV_BEATS_JSON.get(key)
         if env and (os.environ.get(env) or "").strip():
             continue                       # explicit env var outranks the file this launch
-        good = check(val)
+        try:
+            good = check(val)
+        except Exception:
+            # A validator that touches the OS (e.g. _v_dir → os.path.isdir) can raise on a
+            # hostile value — on Windows a null byte gives "ValueError: embedded null byte".
+            # Must degrade to a warning here: this loop runs at import, so a propagating
+            # exception would break `from config import *` and the app wouldn't launch.
+            good = _BAD
         if good is _BAD:
             USER_CONFIG_WARNINGS.append(
-                f"invalid value for {key}: {val!r} — keeping the default.")
+                f"invalid value for {key}: {val!r} — keeping the default{_perm_note(key)}.")
             continue
         globals()[key] = good
 
