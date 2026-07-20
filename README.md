@@ -338,7 +338,10 @@ All settings are constants at the top of `claude_overlay.py`:
   session id is remembered per completed turn; **Clear** wipes it, so a discarded
   conversation is never offered back). `RESUME_OFFER_MAX_AGE` bounds how old a
   conversation may be to qualify (default 7 days). The transcript isn't replayed —
-  Claude just remembers the context and you keep going.
+  Claude just remembers the context and you keep going. Note the overlay resumes the
+  session **it** recorded, not "the latest conversation in this directory" — if you
+  continue that session elsewhere (the CLI or Desktop) afterward, resume still loads its
+  newest state, but the "from … ago" label is measured from the overlay's last turn.
 - `AUTO_SCREENSHOT_DEFAULT`, `FONT_SANS/SERIF/MONO`, `CORNER_RADIUS`, `ORB_SIZE`,
   `HIDE_SCREENSHOT_TOOL`, `WINDOW_ALPHA` — see inline comments.
 

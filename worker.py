@@ -105,6 +105,21 @@ class ClaudeWorker(threading.Thread):
         # When set, the next _open() launches the CLI with --resume <id> (consumed
         # there; a failed resume falls back to ONE fresh attempt).
         self._resume_session_id = None
+        # Set True by _open ONLY when a --resume connect genuinely carried the session
+        # (kwarg supported + connect succeeded). _do_resume reports "resumed" off this,
+        # not off _session_id, which _open force-sets optimistically before any stream
+        # confirms it. Cleared/False on any fresh-session fallback.
+        self._resume_ok = False
+        # The id we asked the CLI to --resume, held until the first streamed init/result
+        # reveals the id the CLI ACTUALLY loaded. If they differ, the CLI accepted
+        # --resume but silently started fresh (a pruned session, or an older CLI that
+        # warns-and-continues instead of raising) → _set_session flags it as resume_lost,
+        # so an optimistic "resumed" can't stand while the context is really gone.
+        self._resume_expected = None
+        # Kwargs _make_options had to strip because the installed SDK is too old for them
+        # (see the droppable list). Recorded so _open can tell "connected WITH --resume"
+        # from "connected fresh because this SDK has no --resume".
+        self._last_dropped = []
 
     def ask(self, text: str, image_paths=None):
         self.req.put(("ask", (text, list(image_paths or []))))
@@ -281,6 +296,7 @@ class ClaudeWorker(threading.Thread):
         # loads (with reduced features) instead of failing to construct options at all.
         droppable = ["strict_mcp_config", "max_buffer_size", "can_use_tool",
                      "include_partial_messages", "skills", "disallowed_tools", "resume"]
+        self._last_dropped = []
         while True:
             try:
                 return ClaudeAgentOptions(**opts)
@@ -290,6 +306,7 @@ class ClaudeWorker(threading.Thread):
                     victim = next((k for k in droppable if k in opts), None)
                 if victim is None:
                     raise
+                self._last_dropped.append(victim)
                 opts.pop(victim, None)
 
     def run(self):
@@ -359,7 +376,8 @@ class ClaudeWorker(threading.Thread):
                     self._saw_stream = False
                     self._session_id = None          # Clear = deliberate discard: neither a
                     self._resume_session_id = None   # reconnect nor the next launch may
-                                                     # resurrect the wiped conversation
+                    self._resume_expected = None     # resurrect the wiped conversation (and
+                                                     # no stale expectation fires resume_lost)
                     await self._open()
                     self.ui.put(("reset_done", None))
                 elif kind == "ask":
@@ -408,6 +426,7 @@ class ClaudeWorker(threading.Thread):
             pass
         self._saw_stream = False
         self._resume_session_id = sid
+        self._resume_expected = sid   # same silent-fresh backstop as the Resume button
         await self._open()
 
     async def _do_resume(self, session_id):
@@ -419,11 +438,18 @@ class ClaudeWorker(threading.Thread):
         await self._close()
         self._saw_stream = False
         self._resume_session_id = sid
-        await self._open()          # a failed resume falls back to a fresh session there
-        if self._client is not None and self._session_id == sid:
+        self._resume_expected = sid   # verified against the CLI's first streamed id below
+        await self._open()            # a failed resume falls back to a fresh session there
+        # Report off _resume_ok, not `_session_id == sid`: _open force-sets _session_id to
+        # the pending id on any successful connect, so that comparison always held and
+        # validated nothing. _resume_ok is True only when --resume was actually honoured;
+        # the streamed-init check in _set_session then catches a CLI that accepted --resume
+        # but silently started fresh (→ resume_lost).
+        if self._client is not None and self._resume_ok:
             self.ui.put(("session", sid))
             self.ui.put(("resumed", None))
         else:
+            self._resume_expected = None
             self.ui.put(("resume_failed", None))
         self.ui.put(("status", ""))
 
@@ -434,6 +460,15 @@ class ClaudeWorker(threading.Thread):
         if not sid:
             return
         sid = str(sid)
+        expected, self._resume_expected = self._resume_expected, None
+        if expected is not None and sid != expected:
+            # We launched with --resume <expected>, but the CLI's FIRST streamed message
+            # reports a different id: it accepted --resume yet silently started a fresh
+            # conversation (a pruned session, or an older CLI that warns-and-continues
+            # rather than raising). The earlier optimistic "resumed" is therefore wrong —
+            # the old context is gone. Tell the UI so it can correct the claim; the id
+            # update just below then makes this fresh session the resumable one.
+            self.ui.put(("resume_lost", None))
         if sid != self._session_id:
             self._session_id = sid
             self.ui.put(("session", sid))
@@ -443,16 +478,34 @@ class ClaudeWorker(threading.Thread):
         failed resume-connect falls back to ONE fresh attempt — a vanished session file
         must degrade to a fresh conversation, never to 'can't connect at all'."""
         resuming = bool(self._resume_session_id)
+        if resuming:
+            self._resume_ok = False          # set True only on a genuine --resume connect
         ok = await self._open_once(quiet=resuming)
         if ok:
             if resuming:
+                if "resume" in self._last_dropped:
+                    # The installed SDK is too old for the `resume` kwarg: _make_options
+                    # stripped it, so this "successful" connect is a FRESH session, not
+                    # the resumed one. Report it as a resume failure — otherwise the
+                    # caller announces "resumed" for a conversation that never loaded.
+                    self._resume_session_id = None
+                    self._resume_expected = None
+                    self.ui.put(("system",
+                        "⚠ Your claude-agent-sdk is too old to resume a conversation "
+                        "(no --resume support) — started a fresh session. Update it "
+                        "(pip install --upgrade claude-agent-sdk) to keep conversations "
+                        "across restarts."))
+                    return
                 # The conversation continues under this id until the CLI's init/result
-                # messages report the continuation id (see _set_session).
+                # messages report the continuation id (see _set_session), which also
+                # backstops the case where the CLI silently started fresh.
                 self._session_id = self._resume_session_id
+                self._resume_ok = True
             self._resume_session_id = None
             return
         if resuming:
             self._resume_session_id = None
+            self._resume_expected = None
             self.ui.put(("system", "⚠ Couldn't resume the previous conversation (its "
                                    "session may have been cleaned up) — starting fresh."))
             await self._open_once()

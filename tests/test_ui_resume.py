@@ -110,6 +110,17 @@ def test_resume_failed_event_restyles(overlay):
     assert btn._ustate == "failed"
     assert overlay._resume_btn is None
 
+def test_resume_lost_event_corrects_the_claim(overlay):
+    # The worker reported the CLI silently started fresh after an optimistic "resumed":
+    # the button flips to failed and the chat says the context isn't actually back.
+    _seed_last_session("sess-42")
+    overlay._maybe_offer_resume()
+    btn = overlay._resume_btn
+    overlay._handle("resume_lost", None)
+    assert btn._ustate == "failed"
+    assert overlay._resume_btn is None
+    assert "couldn't be restored" in chat_text(overlay)
+
 def test_offer_goes_stale_when_new_conversation_starts(overlay):
     _seed_last_session("sess-42")
     overlay._maybe_offer_resume()
@@ -149,3 +160,26 @@ def test_reset_wipes_the_record(overlay):
     overlay.reset()
     assert co._load_state().get("last_session") is None
     assert overlay._session_id is None
+
+def test_clear_race_stale_events_dont_resurrect(overlay):
+    # A turn's (session / turn_done) batch enqueued just before Clear must not re-set the
+    # id or re-persist the record while the discard is pending — the worker's reset_done
+    # hasn't drained yet. (#5 review, finding 2.)
+    overlay._handle("session", "sess-live")
+    overlay._handle("turn_done", None)
+    assert co._load_state()["last_session"]["id"] == "sess-live"
+
+    overlay.reset()                               # user clicks Clear
+    assert overlay._discard_pending is True
+    assert co._load_state().get("last_session") is None
+
+    overlay._handle("session", "sess-live")       # stale batch drains AFTER the click
+    overlay._handle("turn_done", None)
+    assert overlay._session_id is None            # not resurrected
+    assert co._load_state().get("last_session") is None
+
+    overlay._handle("reset_done", None)           # worker confirms the wipe
+    assert overlay._discard_pending is False
+    overlay._handle("session", "sess-new")        # a genuine new turn persists again
+    overlay._handle("turn_done", None)
+    assert co._load_state()["last_session"]["id"] == "sess-new"

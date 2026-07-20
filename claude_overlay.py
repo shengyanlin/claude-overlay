@@ -180,6 +180,10 @@ class Overlay:
                                           # launch can offer to resume — see _persist_session
         self._resume_btn = None           # the in-chat "Resume last conversation" button while
                                           # it's still actionable, so events can restyle it
+        self._discard_pending = False     # True from a Clear click until the worker's reset_done
+                                          # drains: a turn's (session / turn_done) batch already
+                                          # queued before the click must not re-set _session_id or
+                                          # re-persist the record and resurrect the discarded chat
         self._restarting = False          # guard: one self-restart (relaunch + quit) at a time
         self._mapping = False             # re-entrancy guard for the <Map> taskbar re-assert
         self._fronting = False            # re-entrancy guard for _raise_to_front (focus churn)
@@ -3187,6 +3191,10 @@ class Overlay:
         # the next launch can't offer to resume a conversation the user threw away.
         self._session_id = None
         self._resume_btn = None          # the embedded button was just wiped with the chat
+        # Guard the window until the worker confirms the reset (reset_done): a stale
+        # (session / turn_done) batch from the turn that was in flight when Clear was
+        # clicked would otherwise re-set _session_id and re-persist the discarded record.
+        self._discard_pending = True
         _save_state(last_session=None)
         self.worker.reset()
         self._set_status("resetting…")
@@ -3579,6 +3587,8 @@ class Overlay:
             self.busy_lbl.configure(text="")
             self._refresh_statusline()
         elif kind == "reset_done":
+            self._discard_pending = False   # worker confirmed the wipe: stale events, if any,
+                                            # have drained ahead of this; the new session is live
             self.add_sys("🔄 new conversation.")
             # Don't null _ctx_pct here: reset() already cleared it on click, and the worker's
             # post-_open _emit_usage has (just before this) pushed the NEW session's real
@@ -3602,9 +3612,12 @@ class Overlay:
             self._finish_turn_copy()     # then a Copy button under the reply
             self._set_busy(False)
             self._maybe_flag_done()      # badge the orb if this finished while collapsed
-            self._persist_session()      # this conversation is now the resumable one
+            if not self._discard_pending:
+                self._persist_session()  # this conversation is now the resumable one
+                                         # (skipped for a turn Cleared mid-flight)
         elif kind == "session":
-            self._session_id = str(payload)
+            if not self._discard_pending:   # ignore a stale id from a Cleared conversation
+                self._session_id = str(payload)
         elif kind == "resumed":
             self._set_status("")
             if self._resume_btn is not None:
@@ -3618,6 +3631,18 @@ class Overlay:
             self._persist_session()      # keep it resumable even if no new turn follows
         elif kind == "resume_failed":
             self._set_status("")
+            if self._resume_btn is not None:
+                try:
+                    self._resume_btn._set_ustate("failed")
+                except Exception:
+                    pass
+                self._resume_btn = None
+        elif kind == "resume_lost":
+            # The connect looked like a resume, but the CLI's first streamed id proves it
+            # silently started FRESH (see worker._set_session). Correct the earlier
+            # optimistic "resumed" so the user isn't told the context is back when it isn't.
+            self.add_err("⚠ The previous conversation couldn't be restored after all — the "
+                         "CLI started a fresh session, so earlier context isn't available.")
             if self._resume_btn is not None:
                 try:
                     self._resume_btn._set_ustate("failed")
