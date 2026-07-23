@@ -47,6 +47,10 @@ so it uses your **existing Claude subscription — no API key, no metered billin
   edits files, runs commands, and can even reach into the app on your screen (say,
   fix the wording on your open slide, or build a model in your open Excel), not just
   answer questions.
+- 🔁 **Conversations survive restarts.** Relaunch the overlay (say, after an update)
+  and it offers a one-click **Resume last conversation** — and if the connection to
+  the CLI drops mid-session, it reconnects *into the same conversation* instead of
+  losing your context.
 - 💸 **No API key, no extra cost.** Runs on your existing Claude subscription.
 - 🖼️ **Screenshots *and* pasted images.** It grabs your screen automatically on every
   message, or paste any image with **Ctrl+V** to ask about it.
@@ -231,7 +235,9 @@ git pull
 
 > **Then restart the overlay.** It's a long-running process and does **not** reload
 > while running — close it and re-open **`Start Claude Overlay.cmd`** for the update to
-> take effect. (On a managed/enterprise machine, updating is what fixes the older
+> take effect. Your conversation isn't lost: the relaunch offers a one-click
+> **↺ Resume last conversation**, and Claude picks up right where you left off.
+> (On a managed/enterprise machine, updating is what fixes the older
 > versions that could hang on the first tool call.)
 >
 > Updated **by hand** (`git pull`) and the Desktop icon still looks old? Re-run
@@ -360,6 +366,15 @@ The settings themselves:
   "active" means the window you were working in before it (tracked automatically), and
   when no usable window exists (fresh launch, desktop focused, window minimized) it
   falls back to full-screen capture rather than sending nothing.
+- `RESUME_OFFER` (or the `CLAUDE_OVERLAY_RESUME_OFFER` env var) — on launch, offer a
+  one-click **↺ Resume last conversation** when the previous run left one behind (the
+  session id is remembered per completed turn; **Clear** wipes it, so a discarded
+  conversation is never offered back). `RESUME_OFFER_MAX_AGE` bounds how old a
+  conversation may be to qualify (default 7 days). The transcript isn't replayed —
+  Claude just remembers the context and you keep going. Note the overlay resumes the
+  session **it** recorded, not "the latest conversation in this directory" — if you
+  continue that session elsewhere (the CLI or Desktop) afterward, resume still loads its
+  newest state, but the "from … ago" label is measured from the overlay's last turn.
 - `AUTO_SCREENSHOT_DEFAULT`, `FONT_SANS/SERIF/MONO`, `CORNER_RADIUS`, `ORB_SIZE`,
   `HIDE_SCREENSHOT_TOOL`, `WINDOW_ALPHA` — see inline comments.
 

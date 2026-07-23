@@ -25,6 +25,14 @@ def make_worker():
     return ClaudeWorker(queue.Queue())
 
 
+def _drain(q):
+    """Every (kind, payload) the worker queued onto its UI queue, in order."""
+    out = []
+    while not q.empty():
+        out.append(q.get_nowait())
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 1. Enqueue helpers
 # ---------------------------------------------------------------------------
@@ -708,3 +716,272 @@ class TestLaunchPermissionMode:
     def test_launch_mode_default_follows_config(self):
         w = make_worker()
         assert w._permission_mode == config.PERMISSION_MODE
+
+
+# ---------------------------------------------------------------------------
+# Session tracking + resume (the "conversations survive restarts" feature)
+# ---------------------------------------------------------------------------
+
+class TestSessionTracking:
+    """Session-id capture from stream messages, and how resume flows through the
+    worker. Still no .start()/.run()/connect — the async bits are exercised with
+    stubbed _open/_close on a throwaway event loop."""
+
+    def test_resume_enqueues(self):
+        w = make_worker()
+        w.resume("sess-1")
+        assert w.req.get_nowait() == ("resume", "sess-1")
+
+    def test_resume_coerces_id_to_str(self):
+        w = make_worker()
+        w.resume(12345)
+        assert w.req.get_nowait() == ("resume", "12345")
+
+    def test_set_session_records_and_emits(self):
+        w = make_worker()
+        w._set_session("s-abc")
+        assert w._session_id == "s-abc"
+        assert w.ui.get_nowait() == ("session", "s-abc")
+
+    def test_set_session_same_id_emits_once(self):
+        w = make_worker()
+        w._set_session("s-abc")
+        w.ui.get_nowait()
+        w._set_session("s-abc")          # unchanged → no duplicate UI event
+        assert w.ui.empty()
+
+    def test_set_session_ignores_empty(self):
+        w = make_worker()
+        w._set_session(None)
+        w._set_session("")
+        assert w._session_id is None
+        assert w.ui.empty()
+
+    def test_result_message_captures_session_id(self):
+        from claude_agent_sdk import ResultMessage
+        w = make_worker()
+        msg = ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1,
+                            is_error=False, num_turns=1, session_id="s-result")
+        w._dispatch(msg, {})
+        assert w._session_id == "s-result"
+
+    def test_system_init_captures_session_id(self):
+        from claude_agent_sdk import SystemMessage
+        w = make_worker()
+        w._dispatch(SystemMessage(subtype="init", data={"session_id": "s-init"}), {})
+        assert w._session_id == "s-init"
+
+    def test_system_non_init_is_ignored(self):
+        from claude_agent_sdk import SystemMessage
+        w = make_worker()
+        w._dispatch(SystemMessage(subtype="status", data={"session_id": "s-x"}), {})
+        assert w._session_id is None
+
+    def test_make_options_passes_resume(self):
+        w = make_worker()
+        w._resume_session_id = "s-9"
+        opts = w._make_options()
+        assert getattr(opts, "resume", None) == "s-9"
+
+    def test_make_options_no_resume_by_default(self):
+        w = make_worker()
+        opts = w._make_options()
+        assert getattr(opts, "resume", None) is None
+
+
+class TestReconnectResume:
+    """_reconnect must carry the known session id into the next _open (context
+    preserved across a dead transport), and say which of the two things it's doing."""
+
+    def _run_reconnect(self, w):
+        async def _noop():
+            return None
+        w._close = lambda: _noop()
+        w._open = lambda: _noop()        # capture happens BEFORE _open would consume it
+        asyncio.run(w._reconnect())
+
+    def test_reconnect_with_session_resumes(self):
+        w = make_worker()
+        w._session_id = "s-live"
+        self._run_reconnect(w)
+        assert w._resume_session_id == "s-live"
+        kind, text = w.ui.get_nowait()
+        assert kind == "system" and "resum" in text.lower()
+
+    def test_reconnect_without_session_is_fresh(self):
+        w = make_worker()
+        self._run_reconnect(w)
+        assert w._resume_session_id is None
+        kind, text = w.ui.get_nowait()
+        assert kind == "system" and "fresh" in text.lower()
+
+
+class TestDoResume:
+    """_do_resume outcome signalling: 'resumed' only when the client is up AND the
+    resume was genuinely honoured (_resume_ok); anything else tells the UI it failed.
+    Reporting off _resume_ok, not `_session_id == sid`, is the fix for #5's blocking
+    finding — _open force-sets _session_id to the pending id, so that equality was
+    always true and validated nothing."""
+
+    @staticmethod
+    def _stub(w, client, resume_ok):
+        async def _close():
+            return None
+
+        async def _open():
+            # mimic the real _open contract: a genuine resume adopts the pending id and
+            # sets _resume_ok; a fresh fallback leaves _resume_ok False. Either way the
+            # pending id is consumed.
+            w._client = client
+            if resume_ok:
+                w._session_id = w._resume_session_id
+                w._resume_ok = True
+            w._resume_session_id = None
+        w._close = _close
+        w._open = _open
+
+    def test_success_emits_resumed(self):
+        w = make_worker()
+        self._stub(w, client=object(), resume_ok=True)
+        asyncio.run(w._do_resume("s-1"))
+        kinds = []
+        while not w.ui.empty():
+            kinds.append(w.ui.get_nowait()[0])
+        assert "resumed" in kinds and "resume_failed" not in kinds
+
+    def test_fallback_emits_resume_failed(self):
+        w = make_worker()
+        self._stub(w, client=object(), resume_ok=False)   # connected, but fresh session
+        asyncio.run(w._do_resume("s-1"))
+        kinds = []
+        while not w.ui.empty():
+            kinds.append(w.ui.get_nowait()[0])
+        assert "resume_failed" in kinds and "resumed" not in kinds
+
+    def test_no_client_emits_resume_failed(self):
+        w = make_worker()
+        self._stub(w, client=None, resume_ok=False)
+        asyncio.run(w._do_resume("s-1"))
+        kinds = []
+        while not w.ui.empty():
+            kinds.append(w.ui.get_nowait()[0])
+        assert "resume_failed" in kinds
+
+    def test_sets_resume_expected_for_streamed_verification(self):
+        # _do_resume must arm the streamed-init backstop (_resume_expected) so a CLI that
+        # accepts --resume but silently starts fresh is caught on the first message.
+        w = make_worker()
+        seen = {}
+
+        async def _close():
+            return None
+
+        async def _open():
+            seen["expected_at_open"] = w._resume_expected
+            w._client = object()
+            w._resume_ok = True
+            w._resume_session_id = None
+        w._close, w._open = _close, _open
+        asyncio.run(w._do_resume("s-1"))
+        assert seen["expected_at_open"] == "s-1"
+
+
+class TestOpenResumeContract:
+    """The real _open resume path (not stubbed): force-set is backed by _resume_ok, and
+    an SDK too old for --resume is reported as a resume failure, never silent success."""
+
+    def _stub_open_once(self, w, results):
+        # results: list of booleans returned by successive _open_once calls.
+        calls = {"n": 0}
+
+        async def _open_once(quiet=False):
+            i = calls["n"]
+            calls["n"] += 1
+            w._client = object() if results[i] else None
+            return results[i]
+        w._open_once = _open_once
+        return calls
+
+    def test_genuine_resume_sets_resume_ok(self):
+        w = make_worker()
+        self._stub_open_once(w, [True])          # resume connect succeeds
+        w._resume_session_id = "s-1"
+        w._last_dropped = []                     # SDK supports --resume
+        asyncio.run(w._open())
+        assert w._resume_ok is True
+        assert w._session_id == "s-1"
+
+    def test_old_sdk_dropping_resume_is_not_reported_resumed(self):
+        w = make_worker()
+        self._stub_open_once(w, [True])          # connect "succeeds" — but fresh
+        w._resume_session_id = "s-1"
+        w._last_dropped = ["resume"]             # _make_options had to strip --resume
+        asyncio.run(w._open())
+        assert w._resume_ok is False             # so _do_resume reports resume_failed
+        assert w._resume_expected is None
+        msgs = [t for k, t in _drain(w.ui) if k == "system"]
+        assert any("too old" in m for m in msgs)
+
+    def test_vanished_session_falls_back_to_fresh(self):
+        w = make_worker()
+        self._stub_open_once(w, [False, True])   # resume connect fails, fresh retry works
+        w._resume_session_id = "s-gone"
+        w._last_dropped = []
+        asyncio.run(w._open())
+        assert w._resume_ok is False
+        assert w._resume_expected is None
+        msgs = [t for k, t in _drain(w.ui) if k == "system"]
+        assert any("starting fresh" in m for m in msgs)
+
+    def test_old_sdk_fresh_connect_clears_stale_session_id(self):
+        # A reconnect arms resume with the live id; if the SDK is too old for --resume the
+        # connect is FRESH, so the stale id must be dropped — else a later _reconnect would
+        # --resume a session this client never had.
+        w = make_worker()
+        self._stub_open_once(w, [True])
+        w._session_id = "s-live"
+        w._resume_session_id = "s-live"
+        w._last_dropped = ["resume"]
+        asyncio.run(w._open())
+        assert w._session_id is None
+
+    def test_vanished_session_fallback_clears_stale_session_id(self):
+        # Same invariant on the vanished-session fresh fallback: the brand-new client carries
+        # no known id until it next streams one (was left as the stale pending id before).
+        w = make_worker()
+        self._stub_open_once(w, [False, True])
+        w._session_id = "s-live"
+        w._resume_session_id = "s-live"
+        w._last_dropped = []
+        asyncio.run(w._open())
+        assert w._session_id is None
+
+
+class TestResumeStreamedVerification:
+    """_set_session backstops the 'accepted --resume but silently started fresh' case:
+    when the streamed id differs from the one we asked to resume, flag resume_lost."""
+
+    def test_mismatched_streamed_id_flags_resume_lost(self):
+        w = make_worker()
+        w._session_id = "s-old"          # _open force-set this to the pending id
+        w._resume_expected = "s-old"
+        w._set_session("s-fresh")        # CLI answered with a DIFFERENT id
+        kinds = dict(_drain(w.ui))
+        assert "resume_lost" in kinds
+        assert w._session_id == "s-fresh"   # the fresh session becomes the live one
+        assert w._resume_expected is None   # expectation consumed
+
+    def test_matching_streamed_id_is_quiet(self):
+        w = make_worker()
+        w._session_id = "s-keep"
+        w._resume_expected = "s-keep"
+        w._set_session("s-keep")         # genuine resume: same id comes back
+        assert w.ui.empty()              # no resume_lost, no duplicate session event
+        assert w._resume_expected is None
+
+    def test_no_expectation_behaves_normally(self):
+        w = make_worker()
+        w._set_session("s-1")            # ordinary turn, no resume in flight
+        events = _drain(w.ui)
+        assert ("resume_lost", None) not in events
+        assert ("session", "s-1") in events

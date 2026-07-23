@@ -56,6 +56,7 @@ class FakeWorker:
     def reset(self):            self._rec("reset")
     def compact(self):          self._rec("compact")
     def set_model(self, *a):    self._rec("set_model", *a)
+    def resume(self, *a):       self._rec("resume", *a)
     def set_permission_mode(self, *a):  self._rec("set_permission_mode", *a)
     def interrupt(self):        self._rec("interrupt")
     def shutdown(self):         self._rec("shutdown")
@@ -134,6 +135,8 @@ def _clean_overlay(ov):
     ov.pending_images = []
     ov.pending_shot = None
     ov._precaptured = None
+    ov._discard_pending = False         # reset() sets it True; a real run clears it on the
+                                        # worker's reset_done, which the fixture never delivers
     ov._capture_busy = False
     ov._paste_busy = False
     ov._send_hover = False
