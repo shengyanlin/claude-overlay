@@ -3,6 +3,7 @@
 Claude Overlay. Pure data + small env helpers; no project imports (leaf module),
 so anything may import it without a circular-import risk."""
 
+import difflib
 import json
 import os
 from pathlib import Path
@@ -405,11 +406,18 @@ def _apply_user_config():
     for key, val in data.items():
         check = _USER_CONFIG_KEYS.get(key)
         if check is None:
-            USER_CONFIG_WARNINGS.append(f"unknown setting {key!r} — ignored.")
+            # Suggest the intended key: a typo'd PERMISSION_MODE ("PERMISSIONS_MODE") is an
+            # UNKNOWN key, so it can't be attributed to a specific setting — but "did you
+            # mean 'PERMISSION_MODE'?" makes a mistyped safety-critical key just as legible
+            # as a mistyped VALUE (which _perm_note already spells out).
+            near = difflib.get_close_matches(str(key), _USER_CONFIG_KEYS, n=1)
+            hint = f" — did you mean {near[0]!r}?" if near else " — ignored."
+            USER_CONFIG_WARNINGS.append(f"unknown setting {key!r}{hint}")
             continue
-        env = _ENV_BEATS_JSON.get(key)
-        if env and (os.environ.get(env) or "").strip():
-            continue                       # explicit env var outranks the file this launch
+        # Validate BEFORE the env-beats-file skip: an explicit env var outranks a VALID file
+        # value silently (its old rank), but a typo'd/invalid file value must still be called
+        # out even when an env var happens to shadow it — otherwise a bad setting vanishes
+        # with no diagnostic, contradicting the "every skipped value is surfaced" contract.
         try:
             good = check(val)
         except Exception:
@@ -422,6 +430,9 @@ def _apply_user_config():
             USER_CONFIG_WARNINGS.append(
                 f"invalid value for {key}: {val!r} — keeping the default{_perm_note(key)}.")
             continue
+        env = _ENV_BEATS_JSON.get(key)
+        if env and (os.environ.get(env) or "").strip():
+            continue                       # valid, but an explicit env var outranks it this launch
         globals()[key] = good
 
 

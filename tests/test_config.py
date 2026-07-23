@@ -419,3 +419,24 @@ class TestUserConfig:
         assert c.PERMISSION_MODE == "bypassPermissions"
         warning = next(w for w in c.USER_CONFIG_WARNINGS if "PERMISSION_MODE" in w)
         assert "bypassPermissions" in warning and "full access" in warning
+
+    def test_invalid_value_for_env_overridden_key_still_warns(self, load_cfg, monkeypatch):
+        # An explicit env var silently outranks a VALID file value, but a typo'd file value
+        # for the same key must still be surfaced — it can't vanish just because env shadows
+        # it, or a mistake in the file leaves no trace.
+        monkeypatch.setenv("CLAUDE_OVERLAY_SHOT_SCOPE", "window")
+        try:
+            c = load_cfg({"SHOT_SCOPE": "not-a-scope"})
+            assert c.SHOT_SCOPE == "window"                 # env still wins
+            assert any("SHOT_SCOPE" in w for w in c.USER_CONFIG_WARNINGS)
+        finally:
+            monkeypatch.delenv("CLAUDE_OVERLAY_SHOT_SCOPE", raising=False)
+
+    def test_unknown_key_suggests_close_match(self, load_cfg):
+        # A mistyped safety-critical key name is an UNKNOWN key, but the warning should point
+        # at the setting the user probably meant, so a typo'd PERMISSION_MODE is as legible
+        # as a typo'd value.
+        c = load_cfg({"PERMISSIONS_MODE": "plan"})          # extra S
+        assert c.PERMISSION_MODE == "bypassPermissions"
+        warning = next(w for w in c.USER_CONFIG_WARNINGS if "PERMISSIONS_MODE" in w)
+        assert "PERMISSION_MODE" in warning and "did you mean" in warning
