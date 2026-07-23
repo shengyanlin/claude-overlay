@@ -490,6 +490,7 @@ class ClaudeWorker(threading.Thread):
                     # caller announces "resumed" for a conversation that never loaded.
                     self._resume_session_id = None
                     self._resume_expected = None
+                    self._session_id = None      # this connect is FRESH, not the resumed id
                     self.ui.put(("system",
                         "⚠ Your claude-agent-sdk is too old to resume a conversation "
                         "(no --resume support) — started a fresh session. Update it "
@@ -506,6 +507,10 @@ class ClaudeWorker(threading.Thread):
         if resuming:
             self._resume_session_id = None
             self._resume_expected = None
+            self._session_id = None      # the fresh fallback is a NEW conversation: drop the
+                                         # pending id so a later _reconnect can't --resume a
+                                         # session this client never had (invariant: _session_id
+                                         # is the CURRENT conversation; set when it next streams)
             self.ui.put(("system", "⚠ Couldn't resume the previous conversation (its "
                                    "session may have been cleaned up) — starting fresh."))
             await self._open_once()

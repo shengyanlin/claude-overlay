@@ -901,6 +901,29 @@ class TestOpenResumeContract:
         msgs = [t for k, t in _drain(w.ui) if k == "system"]
         assert any("starting fresh" in m for m in msgs)
 
+    def test_old_sdk_fresh_connect_clears_stale_session_id(self):
+        # A reconnect arms resume with the live id; if the SDK is too old for --resume the
+        # connect is FRESH, so the stale id must be dropped — else a later _reconnect would
+        # --resume a session this client never had.
+        w = make_worker()
+        self._stub_open_once(w, [True])
+        w._session_id = "s-live"
+        w._resume_session_id = "s-live"
+        w._last_dropped = ["resume"]
+        asyncio.run(w._open())
+        assert w._session_id is None
+
+    def test_vanished_session_fallback_clears_stale_session_id(self):
+        # Same invariant on the vanished-session fresh fallback: the brand-new client carries
+        # no known id until it next streams one (was left as the stale pending id before).
+        w = make_worker()
+        self._stub_open_once(w, [False, True])
+        w._session_id = "s-live"
+        w._resume_session_id = "s-live"
+        w._last_dropped = []
+        asyncio.run(w._open())
+        assert w._session_id is None
+
 
 class TestResumeStreamedVerification:
     """_set_session backstops the 'accepted --resume but silently started fresh' case:

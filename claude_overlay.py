@@ -3637,6 +3637,13 @@ class Overlay:
                 except Exception:
                     pass
                 self._resume_btn = None
+            else:
+                # The offer was already retired (a send or Clear raced the resume outcome),
+                # so the button can't carry the news. Say it in the chat, or the fallback to
+                # a fresh session would be completely silent — the one thing this feature is
+                # meant not to do.
+                self.add_sys("↺ Couldn't resume the previous conversation — this is a "
+                             "fresh session.")
         elif kind == "resume_lost":
             # The connect looked like a resume, but the CLI's first streamed id proves it
             # silently started FRESH (see worker._set_session). Correct the earlier

@@ -110,6 +110,14 @@ def test_resume_failed_event_restyles(overlay):
     assert btn._ustate == "failed"
     assert overlay._resume_btn is None
 
+def test_resume_failed_announces_when_button_already_retired(overlay):
+    # A send (or Clear) can retire the offer before the resume outcome arrives — the button
+    # can't then carry the "couldn't resume" news, so it must land in the chat instead of the
+    # fallback-to-fresh going completely silent.
+    overlay._resume_btn = None
+    overlay._handle("resume_failed", None)
+    assert "fresh session" in chat_text(overlay)
+
 def test_resume_lost_event_corrects_the_claim(overlay):
     # The worker reported the CLI silently started fresh after an optimistic "resumed":
     # the button flips to failed and the chat says the context isn't actually back.
