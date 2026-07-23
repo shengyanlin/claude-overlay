@@ -15,8 +15,16 @@ shown: no flash, no focus steal). Skips cleanly if Tk has no display.
 import os
 import queue
 import sys
+import tempfile
 
 import pytest
+
+# Isolate the whole suite from THIS machine's personal config.json overrides: the unit
+# tests assert the COMMITTED defaults, and the UI suite must not inherit a personal
+# theme/permission mode. Point the override loader at a path that can't exist — set
+# BEFORE the first `import config` anywhere (conftest imports before test modules).
+os.environ["CLAUDE_OVERLAY_CONFIG"] = os.path.join(
+    tempfile.gettempdir(), "claude_overlay_test_no_user_config", "config.json")
 
 # Belt-and-suspenders for the one Tk init (and any stray second root): pin the Tcl/Tk
 # library dirs so the interpreter always finds them.

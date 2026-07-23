@@ -5,6 +5,7 @@ All tests are deterministic and require no network, display, or logged-in CLI.
 Env-var mutations use monkeypatch so they never leak between tests.
 """
 import os
+import json
 import importlib
 
 import pytest
@@ -266,3 +267,176 @@ class TestShotScope:
 
     def test_shot_scope_is_str(self):
         assert isinstance(config.SHOT_SCOPE, str)
+
+
+# ---------------------------------------------------------------------------
+# 8. config.json per-machine overrides
+# ---------------------------------------------------------------------------
+
+class TestUserConfig:
+    """Tests for the config.json override loader (config._apply_user_config).
+
+    Each test writes a temp config.json, points CLAUDE_OVERLAY_CONFIG at it, and
+    reloads config. Teardown restores the previous env value — the suite-wide
+    isolation path set in conftest.py — and reloads once more, so every other test
+    still sees the committed defaults.
+    """
+
+    @pytest.fixture
+    def load_cfg(self, tmp_path):
+        path = tmp_path / "config.json"
+        prev = os.environ.get("CLAUDE_OVERLAY_CONFIG")
+
+        def load(content):
+            text = content if isinstance(content, str) else json.dumps(content)
+            path.write_text(text, "utf-8")
+            os.environ["CLAUDE_OVERLAY_CONFIG"] = str(path)
+            importlib.reload(config)
+            return config
+
+        try:
+            yield load
+        finally:
+            if prev is None:
+                os.environ.pop("CLAUDE_OVERLAY_CONFIG", None)
+            else:
+                os.environ["CLAUDE_OVERLAY_CONFIG"] = prev
+            importlib.reload(config)
+
+    def test_no_file_means_defaults_and_no_warnings(self):
+        # conftest points CLAUDE_OVERLAY_CONFIG at a nonexistent path for the suite.
+        assert config.USER_CONFIG_WARNINGS == []
+        assert config.PERMISSION_MODE == "bypassPermissions"
+
+    def test_overrides_applied(self, load_cfg):
+        c = load_cfg({"PERMISSION_MODE": "plan", "THEME": "dark",
+                      "AUTO_SCREENSHOT_DEFAULT": False})
+        assert c.PERMISSION_MODE == "plan"
+        assert c.THEME == "dark"
+        assert c.T is c.THEMES["dark"]          # T is derived AFTER the overrides
+        assert c.AUTO_SCREENSHOT_DEFAULT is False
+        assert c.USER_CONFIG_WARNINGS == []
+
+    def test_choice_is_case_insensitive_but_canonical(self, load_cfg):
+        # The CLI wants "bypassPermissions" exactly; the file may be sloppier.
+        c = load_cfg({"PERMISSION_MODE": "BYPASSPERMISSIONS"})
+        assert c.PERMISSION_MODE == "bypassPermissions"
+
+    def test_explicit_env_var_beats_file(self, load_cfg, monkeypatch):
+        monkeypatch.setenv("CLAUDE_OVERLAY_SHOT_SCOPE", "window")
+        try:
+            c = load_cfg({"SHOT_SCOPE": "screens"})
+            assert c.SHOT_SCOPE == "window"     # env is a per-launch decision: it wins
+            assert c.USER_CONFIG_WARNINGS == []  # outranked, but not an error
+        finally:
+            # Drop the env var BEFORE the fixture's teardown reload, so the module
+            # isn't left with the env value for later tests.
+            monkeypatch.delenv("CLAUDE_OVERLAY_SHOT_SCOPE", raising=False)
+
+    def test_invalid_value_warns_and_keeps_default(self, load_cfg):
+        c = load_cfg({"PERMISSION_MODE": "yolo"})
+        assert c.PERMISSION_MODE == "bypassPermissions"
+        assert len(c.USER_CONFIG_WARNINGS) == 1
+        assert "PERMISSION_MODE" in c.USER_CONFIG_WARNINGS[0]
+
+    def test_unknown_key_warns(self, load_cfg):
+        c = load_cfg({"PERMISSON_MODE": "plan"})     # typo'd key must be SEEN
+        assert c.PERMISSION_MODE == "bypassPermissions"
+        assert any("PERMISSON_MODE" in w for w in c.USER_CONFIG_WARNINGS)
+
+    def test_corrupt_json_warns_and_keeps_defaults(self, load_cfg):
+        c = load_cfg("{ this is not json")
+        assert c.PERMISSION_MODE == "bypassPermissions"
+        assert c.THEME == "light"
+        assert len(c.USER_CONFIG_WARNINGS) == 1
+
+    def test_top_level_must_be_an_object(self, load_cfg):
+        c = load_cfg("[1, 2, 3]")
+        assert len(c.USER_CONFIG_WARNINGS) == 1
+
+    def test_bool_must_be_json_bool_not_string(self, load_cfg):
+        c = load_cfg({"TASKBAR_BUTTON": "true"})
+        assert c.TASKBAR_BUTTON is True              # default kept
+        assert any("TASKBAR_BUTTON" in w for w in c.USER_CONFIG_WARNINGS)
+
+    def test_numbers_clamp_like_env_int(self, load_cfg):
+        c = load_cfg({"SHOT_JPEG_QUALITY": 200, "WINDOW_ALPHA": 0.05})
+        assert c.SHOT_JPEG_QUALITY == 95
+        assert c.WINDOW_ALPHA == 0.3
+        assert c.USER_CONFIG_WARNINGS == []
+
+    def test_working_dir_accepts_existing_dir(self, load_cfg, tmp_path):
+        c = load_cfg({"WORKING_DIR": str(tmp_path)})
+        assert c.WORKING_DIR == str(tmp_path)
+        assert c.USER_CONFIG_WARNINGS == []
+
+    def test_working_dir_must_exist(self, load_cfg):
+        default = config.WORKING_DIR
+        c = load_cfg({"WORKING_DIR": r"C:\definitely\not\a\real\dir\xyz"})
+        assert c.WORKING_DIR == default              # a bad cwd would break the CLI spawn
+        assert any("WORKING_DIR" in w for w in c.USER_CONFIG_WARNINGS)
+
+    def test_skills_accepts_all_list_and_null(self, load_cfg):
+        assert load_cfg({"SKILLS": "all"}).SKILLS == "all"
+        assert load_cfg({"SKILLS": ["a", "b"]}).SKILLS == ["a", "b"]
+        assert load_cfg({"SKILLS": None}).SKILLS is None
+        c = load_cfg({"SKILLS": 42})
+        assert any("SKILLS" in w for w in c.USER_CONFIG_WARNINGS)
+
+    def test_structural_globals_are_not_overridable(self, load_cfg):
+        # The whitelist is a security boundary: derived/structural globals must stay
+        # source-only. Trying to set them from the file leaves them untouched and is
+        # reported as an unknown setting, not silently applied.
+        before_state = config.STATE_FILE
+        before_max = config.MAX_BUFFER_SIZE
+        c = load_cfg({"STATE_FILE": r"C:\evil\state.json", "MAX_BUFFER_SIZE": 999999999})
+        assert c.STATE_FILE == before_state
+        assert c.MAX_BUFFER_SIZE == before_max
+        assert any("STATE_FILE" in w for w in c.USER_CONFIG_WARNINGS)
+        assert any("MAX_BUFFER_SIZE" in w for w in c.USER_CONFIG_WARNINGS)
+
+    def test_bom_prefixed_file_is_read_not_discarded(self, load_cfg):
+        # Notepad / PowerShell Out-File on Windows prepend a UTF-8 BOM. It must be
+        # stripped, not fatal — otherwise the whole file is dropped and PERMISSION_MODE
+        # silently reverts to the bypassPermissions default (a full-access session).
+        c = load_cfg("﻿" + json.dumps({"PERMISSION_MODE": "plan"}))
+        assert c.PERMISSION_MODE == "plan"
+        assert c.USER_CONFIG_WARNINGS == []
+
+    def test_validator_that_raises_degrades_to_warning(self, load_cfg):
+        # _v_dir calls os.path.isdir, which raises "embedded null byte" on Windows for a
+        # path containing \x00. The per-key loop must catch it: a raising validator has to
+        # become a warning, never propagate and abort `from config import *` at launch.
+        default = config.WORKING_DIR
+        c = load_cfg({"WORKING_DIR": "bad\x00dir"})
+        assert c.WORKING_DIR == default
+        assert any("WORKING_DIR" in w for w in c.USER_CONFIG_WARNINGS)
+
+    def test_bad_permission_mode_warning_names_effective_mode(self, load_cfg):
+        # A typo'd read-only intent falls through to the committed default. The warning
+        # must name the mode actually in force so a permissive fallback isn't missed.
+        c = load_cfg({"PERMISSION_MODE": "raed-only"})
+        assert c.PERMISSION_MODE == "bypassPermissions"
+        warning = next(w for w in c.USER_CONFIG_WARNINGS if "PERMISSION_MODE" in w)
+        assert "bypassPermissions" in warning and "full access" in warning
+
+    def test_invalid_value_for_env_overridden_key_still_warns(self, load_cfg, monkeypatch):
+        # An explicit env var silently outranks a VALID file value, but a typo'd file value
+        # for the same key must still be surfaced — it can't vanish just because env shadows
+        # it, or a mistake in the file leaves no trace.
+        monkeypatch.setenv("CLAUDE_OVERLAY_SHOT_SCOPE", "window")
+        try:
+            c = load_cfg({"SHOT_SCOPE": "not-a-scope"})
+            assert c.SHOT_SCOPE == "window"                 # env still wins
+            assert any("SHOT_SCOPE" in w for w in c.USER_CONFIG_WARNINGS)
+        finally:
+            monkeypatch.delenv("CLAUDE_OVERLAY_SHOT_SCOPE", raising=False)
+
+    def test_unknown_key_suggests_close_match(self, load_cfg):
+        # A mistyped safety-critical key name is an UNKNOWN key, but the warning should point
+        # at the setting the user probably meant, so a typo'd PERMISSION_MODE is as legible
+        # as a typo'd value.
+        c = load_cfg({"PERMISSIONS_MODE": "plan"})          # extra S
+        assert c.PERMISSION_MODE == "bypassPermissions"
+        warning = next(w for w in c.USER_CONFIG_WARNINGS if "PERMISSIONS_MODE" in w)
+        assert "PERMISSION_MODE" in warning and "did you mean" in warning
