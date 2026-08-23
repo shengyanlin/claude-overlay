@@ -146,6 +146,13 @@ def _clean_overlay(ov):
     ov._auth_checked = 0.0
     ov._send_hover = False
     ov._thinking_active = False
+    ov._follow = True                   # scroll-follow is a mode; a test that scrolls away
+    ov._unread = False                  # must not leave the next test unable to auto-scroll
+    ov._sb_last = 1.0
+    try:
+        ov._update_jump()               # …and must not leave the jump pill placed on screen
+    except Exception:
+        pass
     try:
         ov._set_busy(False)             # busy flag + Send button image + busy_lbl text, together
     except Exception:

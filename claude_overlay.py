@@ -862,6 +862,14 @@ class Overlay:
         self._sb_first, self._sb_last = 0.0, 1.0
         self._sb_drag = None
         self._sb_hover = False
+        # Scroll-follow state. Following the end is a MODE the user turns off by scrolling up
+        # (and back on by scrolling to the end), not something re-derived from the view on every
+        # insert - see _sync_follow.
+        self._follow = True
+        self._unread = False
+        self._jump = None
+        self._jump_shown = False
+        self._jump_unread_drawn = None
         self.scrollbar = tk.Canvas(wrap, width=self._sb_w, bg=T["bg"], highlightthickness=0,
                                    cursor="arrow", takefocus=0)
         # inset by the resize-edge thickness (px 6) so the right-edge resize strip (which is
@@ -885,6 +893,7 @@ class Overlay:
         self.chat.bind("<MouseWheel>", self._on_wheel)
         self.chat.bind("<Key>", self._readonly_keys)
         self.chat.bind("<Configure>", self._on_chat_configure, add="+")
+        self._build_jump()
 
         m = self.f_body.measure("0") * 5
         self.chat.tag_configure("uh", foreground=T["muted"], font=self.f_chip,
@@ -938,6 +947,7 @@ class Overlay:
         except Exception:
             self._sb_first, self._sb_last = 0.0, 1.0
         self._sb_redraw()
+        self._update_jump()      # the view moved -> the jump pill may need to appear/disappear
 
     def _sb_geom(self):
         """Return (height, thumb_top_px, thumb_bottom_px) honouring a minimum thumb size, or
@@ -976,6 +986,7 @@ class Overlay:
         else:                                              # clicked the track → jump there
             self._sb_drag = (y1 - y0) / 2
             self.chat.yview_moveto(max(0.0, min(1.0, (e.y - self._sb_drag) / h)))
+        self._sync_follow()
         self._sb_redraw()
 
     def _sb_motion(self, e):
@@ -985,6 +996,91 @@ class Overlay:
         if h <= 1:
             return
         self.chat.yview_moveto(max(0.0, min(1.0, (e.y - self._sb_drag) / h)))
+        self._sync_follow()
+
+    # -- scroll-follow + "jump to latest" --
+    def _at_bottom(self):
+        try:
+            return self.chat.yview()[1] > 0.999
+        except Exception:
+            return True
+
+    def _sync_follow(self):
+        """Re-derive follow from the view after a USER scroll gesture (wheel, scrollbar drag,
+        keyboard): scrolled up -> stop following, scrolled back to the end -> resume. This is the
+        ONLY thing that turns following off, so content-driven drift (a throttled giant line, an
+        embedded table, a resize) can no longer strand a reply below the fold."""
+        self._follow = self._at_bottom()
+        if self._follow:
+            self._unread = False
+        self._update_jump()
+
+    def _scroll_follow(self):
+        """Called after appending content: keep the end in view while following, otherwise note
+        that unseen output arrived so the jump pill can say so."""
+        if self._follow:
+            try:
+                self.chat.see("end")
+            except Exception:
+                pass
+        else:
+            self._unread = True
+            self._update_jump()
+
+    def _jump_to_end(self, e=None):
+        self._follow = True
+        self._unread = False
+        try:
+            self.chat.see("end")
+        except Exception:
+            pass
+        self._update_jump()
+        return "break"
+
+    def _build_jump(self):
+        """A small pill floated over the bottom-right of the chat, visible only once you have
+        scrolled away from the end. Without it, output streaming in below the fold gives no sign
+        at all that it arrived."""
+        self._jump = tk.Canvas(self.chat_wrap, bg=T["bg"], highlightthickness=0,
+                               cursor="hand2", takefocus=0)
+        self._jump.bind("<Button-1>", self._jump_to_end)
+        self._jump.bind("<MouseWheel>", self._fwd_wheel)   # must not swallow the scroll
+
+    def _render_jump(self):
+        cv = self._jump
+        if cv is None or not self._widget_alive(cv):
+            return
+        txt = "\u2193 New output" if self._unread else "\u2193 Latest"
+        f = self.f_chip
+        w = f.measure(txt) + self.px(22)
+        h = f.metrics("linespace") + self.px(10)
+        cv.configure(width=w, height=h)
+        cv.delete("all")
+        bg = T["accent"] if self._unread else T["tool_bg"]
+        fg = T["bg"] if self._unread else T["text"]
+        round_rect(cv, 0, 0, w - 1, h - 1, (h - 1) / 2, fill=bg, outline="")
+        cv.create_text(w / 2, h / 2, text=txt, fill=fg, font=f)
+
+    def _update_jump(self):
+        """Show/hide the pill. Uses the cached scrollbar fraction (free - yscrollcommand already
+        handed it to us) rather than yview(), which is O(line length) on a giant streamed line."""
+        cv = getattr(self, "_jump", None)
+        if cv is None:
+            return
+        want = not self._follow and self._sb_last < 0.999
+        try:
+            if want:
+                if not self._jump_shown or self._jump_unread_drawn != self._unread:
+                    self._render_jump()
+                    self._jump_unread_drawn = self._unread
+                if not self._jump_shown:
+                    cv.place(relx=1.0, rely=1.0, anchor="se",
+                             x=-(self._sb_w + self.px(14)), y=-self.px(10))
+            elif self._jump_shown:
+                cv.place_forget()
+        except Exception:
+            pass
+        self._jump_shown = want
 
     def _build_input(self):
         wrap = tk.Frame(self.root, bg=T["bg"])
@@ -1815,6 +1911,8 @@ class Overlay:
                 pass
             live.append((c, render))
         self._zoomables = live
+        self._jump_unread_drawn = None      # font scaled -> the pill must be re-measured
+        self._update_jump()
 
     def _on_chat_configure(self, e):
         """The chat's embedded canvases (user bubbles, tables) are sized to the chat width when
@@ -1981,6 +2079,7 @@ class Overlay:
         if (e.state & 0x4) and e.keysym.lower() in ("c", "a"):
             return
         if e.keysym in ("Up", "Down", "Left", "Right", "Prior", "Next", "Home", "End"):
+            self.root.after_idle(self._sync_follow)   # keyboard scrolling is a user gesture too
             return
         return "break"
 
@@ -2017,10 +2116,8 @@ class Overlay:
 
     def _ins(self, text, *tags):
         text = "" if text is None else str(text)   # Tk insert rejects None
-        at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", text, tags)
-        if at_bottom:
-            self.chat.see("end")
+        self._scroll_follow()
         self._prune_chat()
 
     def add_user(self, text):
@@ -2028,7 +2125,8 @@ class Overlay:
         self._turn_raw = ""              # a new turn starts → fresh assistant-answer buffer
         self._turn_copy_added = False
         self._set_task_badge(False)      # a new task → clear any stale "done" badge on the orb
-        at_bottom = self.chat.yview()[1] > 0.999
+        self._follow = True              # you just sent something → follow the reply again
+        self._unread = False
         self.chat.insert("end", "\n")
         self.chat.window_create("end", window=self._user_bubble(text), pady=self.px(3))
         self.chat.insert("end", "\n")
@@ -2038,8 +2136,7 @@ class Overlay:
             pass
         self._claude_header = False
         self._thinking_active = False    # new turn → next thinking re-inserts its label
-        if at_bottom:
-            self.chat.see("end")
+        self._scroll_follow()
         self._prune_chat()
 
     @staticmethod
@@ -2148,23 +2245,17 @@ class Overlay:
         chunk = str(chunk)
         if not chunk:
             return
-        # Auto-scroll-follow: measure "am I at the bottom" BEFORE mutating content (an append
-        # below the fold would otherwise read as "not at bottom" and break following). yview()/
-        # see() are cheap for normal multi-line content (Tk caches per-line heights) but
-        # O(line length) on a pathological newline-free GIANT line — so only for such a giant
-        # current line do we throttle the scroll to ~25/s (a long stream of one huge line would
-        # otherwise monopolise the UI thread → the v1.1.9-class freeze). Normal replies keep the
-        # exact, correct per-delta follow.
+        # Auto-scroll-follow: driven by self._follow (see _sync_follow), NOT by re-measuring the
+        # view on every delta. Measuring was fragile — a throttled giant line, an embedded table
+        # or a resize leaves the view a hair off the end, which read as "user scrolled away" and
+        # silently stranded the rest of the reply below the fold. see() is O(line length) on a
+        # pathological newline-free GIANT line, so for such a line we still throttle the scroll to
+        # ~25/s (a long stream of one huge line would otherwise monopolise the UI thread → the
+        # v1.1.9-class freeze); _md_autoscroll_final catches up at turn end.
         giant = len(self._md_tail) > self.MD_LIVE_REPARSE_MAX
         scroll = (time.monotonic() - self._md_last_scroll) >= 0.04 if giant else True
-        at_bottom = False
-        if scroll:
-            try:
-                at_bottom = self.chat.yview()[1] > 0.999
-            except Exception:
-                at_bottom = False
-            if giant:
-                self._md_last_scroll = time.monotonic()
+        if scroll and giant:
+            self._md_last_scroll = time.monotonic()
         parts = chunk.split("\n")
         for i, part in enumerate(parts):
             if i < len(parts) - 1:                  # this part is terminated by a newline → commit
@@ -2175,11 +2266,8 @@ class Overlay:
                 self._md_commit_line(line)
             elif part:                              # the trailing, still-unfinished line
                 self._md_grow_tail(part)
-        if scroll and at_bottom:
-            try:
-                self.chat.see("end")
-            except Exception:
-                pass
+        if scroll:
+            self._scroll_follow()
         self._prune_chat()
 
     # cap live inline re-parsing on absurdly long single lines; formatting still finalizes
@@ -2207,14 +2295,9 @@ class Overlay:
 
     def _md_autoscroll_final(self):
         """One-shot scroll-to-end at turn end (a giant line's last deltas may have been throttled
-        out, leaving the view a hair off the bottom). Loose threshold so 'slightly behind due to
-        throttling' still snaps to the end, while a user who clearly scrolled up to read earlier
-        content is left alone."""
-        try:
-            if self.chat.yview()[1] > 0.90:
-                self.chat.see("end")
-        except Exception:
-            pass
+        out, leaving the view a hair off the bottom). Honours the follow flag, so a user who
+        scrolled up to read earlier content is left alone."""
+        self._scroll_follow()
         self._md_last_scroll = time.monotonic()
 
     def _md_clear_tail(self):
@@ -2498,13 +2581,11 @@ class Overlay:
             return
         self._md_finalize()              # seal the answer text streamed so far, then the tool chip
         self._ensure_header()
-        at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", "\n")
         self.chat.window_create("end", window=self._tool_chip(name, self._summ(inp, 46)),
                                 padx=self.px(16), pady=self.px(3))
         self.chat.insert("end", "\n")
-        if at_bottom:
-            self.chat.see("end")
+        self._scroll_follow()
         self._prune_chat()
 
     @staticmethod
@@ -2637,12 +2718,10 @@ class Overlay:
         No-ops on empty/whitespace text (e.g. a turn that produced only tool calls)."""
         if not (text and str(text).strip()):
             return
-        at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", "\n")
         self.chat.window_create("end", window=self._copy_btn(text), padx=self.px(16), pady=self.px(1))
         self.chat.insert("end", "\n")
-        if at_bottom:
-            self.chat.see("end")
+        self._scroll_follow()
         self._prune_chat()
 
     def _finish_turn_copy(self):
@@ -2683,13 +2762,11 @@ class Overlay:
             return
         self.add_sys(f"💬 You have a conversation from {self._age_str(age)} ago. "
                      "Claude can pick it up where you left off:")
-        at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", "\n")
         self.chat.window_create("end", window=self._resume_btn_widget(str(saved["id"])),
                                 padx=self.px(16), pady=self.px(2))
         self.chat.insert("end", "\n")
-        if at_bottom:
-            self.chat.see("end")
+        self._scroll_follow()
 
     @staticmethod
     def _age_str(secs):
@@ -2787,13 +2864,11 @@ class Overlay:
         self.add_sys(f"🔔 Your Claude CLI is out of date (v{inst} → v{latest}). The overlay is "
                      "current, but the CLI it drives isn't — and the newest models need the "
                      "latest CLI. Update it in one click:")
-        at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", "\n")
         self.chat.window_create("end", window=self._cli_update_btn(latest),
                                 padx=self.px(16), pady=self.px(2))
         self.chat.insert("end", "\n")
-        if at_bottom:
-            self.chat.see("end")
+        self._scroll_follow()
         self._prune_chat()
 
     def _cli_update_btn(self, latest):
@@ -3622,7 +3697,6 @@ class Overlay:
         self.chat.tag_configure("compact", foreground=T["accent"], font=self.f_chip,
                                 lmargin1=self.px(18), lmargin2=self.px(18), rmargin=self.px(14),
                                 spacing1=self.px(6), spacing3=self.px(4))
-        at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", "\n")
         start = self.chat.index("end-1c")           # start of our (about-to-be-written) line
         self.chat.insert("end", " \n", "compact")
@@ -3632,8 +3706,7 @@ class Overlay:
         self._compact_t0 = time.monotonic()
         self._compact_frame = 0
         self._set_status("compacting…")
-        if at_bottom:
-            self.chat.see("end")
+        self._scroll_follow()
         self._compact_tick()
 
     def _compact_tick(self):
@@ -3744,6 +3817,7 @@ class Overlay:
         # caught in the act and attributed (large transcript vs. streaming contention).
         t0 = time.monotonic()
         self.chat.yview_scroll(int(-e.delta / 120), "units")
+        self._sync_follow()          # scrolling up stops the follow; back to the end resumes it
         if DEBUG_LOG:
             dt = (time.monotonic() - t0) * 1000
             if dt > 50:   # only genuinely janky frames
