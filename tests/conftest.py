@@ -72,6 +72,12 @@ def _overlay_singleton():
     mp.setattr(co, "ClaudeWorker", FakeWorker)
     mp.setattr(co.Overlay, "_register_hotkey", lambda self: None)
     mp.setattr(co.Overlay, "_check_for_update", lambda self: None)
+    # No usage-endpoint polling: the suite must not reach the network, and must not read
+    # this machine's real OAuth token. The Overlay still BUILDS its Poller, so the wiring
+    # stays under test; only the thread never starts. Patched on the Overlay rather than on
+    # usage.Poller because this fixture is session-scoped — stubbing the class here would
+    # leave it stubbed for every later unit test of the class itself.
+    mp.setattr(co.Overlay, "_start_usage_poll", lambda self: None)
     # Point the persisted-UI-state store at a throwaway path: the suite must neither
     # read this machine's real toggle state nor overwrite it from toggle tests.
     import tempfile
@@ -132,6 +138,11 @@ def _clean_overlay(ov):
     ov.overlay_name = ""
     ov._model = None
     ov._ctx_pct = None
+    ov._quota = None                    # allowance readings are per-test: a leaked one would
+    ov._quota_polled = None             # take the gauge slot away from the next test's context
+    ov._quota_said = None
+    ov._ring_explained = False          # the ring introduces itself once; a leaked flag would
+                                        # rob the next test of the introduction it is watching
     ov.pending_images = []
     ov.pending_shot = None
     ov._precaptured = None

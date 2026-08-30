@@ -358,9 +358,10 @@ script here *scans* that folder and uses whatever runs, no matter how it got the
 | &nbsp;&nbsp;• Show / hide in screen shares | **⚙ → Shareable** (visible to Teams/Zoom/OBS; off = private, the default) |
 | &nbsp;&nbsp;• Lock Claude read-only | **⚙ → Read-only** ("plan" mode: looks and answers, changes nothing; off = the configured `PERMISSION_MODE`) |
 | Switch model | click the **statusline** (`model ▾`) |
-| See how much allowance is left | the statusline's `quota 78% (5h) · resets 19:40` — the CLI's own rate-limit reading, amber as you approach it and red once it's gone; it speaks up once per transition, and a message refused for allowance is put back in the box rather than lost |
+| See how much allowance is left | **two arcs around the ✻ mark** — the inner one is the 5-hour window, the outer one is weekly. Both are drawn, always: the 5-hour window is the one that ends the session you're in, and it spends most of its life sitting below the weekly number, so showing only whichever is furthest along would hide it for exactly as long as it matters. Filled in from your account the moment the overlay opens, so it's there **before** you send anything, and refreshed every minute while it sits idle; amber as you approach a limit, red once it's gone. It speaks up once per transition, and a message refused for allowance is put back in the box rather than lost |
+| See the exact numbers | **hover the ✻ mark** — a small panel drops under it with both allowance windows, their reset times, and the context headroom in turns (extrapolated from what recent ones cost). No unlabelled gauge explains itself; this is how you ask it |
 | Retry when the allowance returns | a refused message offers **⏱ Send it automatically at &lt;time&gt;** — opt-in, one click, and it stands down the moment you type something else, send by hand, or Clear |
-| See how much context is left | the same slot shows `context 72% · ~8 turns` once context passes 70% — turns extrapolated from what recent ones cost. Below that the allowance is the number that matters, so context stays out of the way |
+| See how much context is left | the statusline's `context 72%` — always there, and it never reflows: the allowance moved to the mark, so nothing competes with it for the slot. A note at 70% and again at 85% says when compacting is worth it |
 | Zoom text in / out | **Ctrl +** / **Ctrl −** (or **Ctrl + mouse-wheel**); **Ctrl 0** resets |
 | New conversation | **Clear** |
 | Compact the conversation (free up context) | **Compact** — summarizes older turns, keeps going |
@@ -502,6 +503,17 @@ toggle's last state is remembered per-machine, and a launch says so in-chat when
 the remembered choice differs from the configured default. (`"acceptEdits"` / `"default"` are
 of limited use here: a GUI with no terminal has nowhere to show a permission prompt,
 so the overlay auto-answers them — see `worker._allow_tool`.)
+
+**One thing the overlay reads that it previously didn't:** to show your plan allowance
+before you've sent anything, it reads the OAuth access token the `claude` CLI already
+stores in `~/.claude/.credentials.json` and sends it, once a minute, in a single
+`GET https://api.anthropic.com/api/oauth/usage` — the same endpoint the CLI's own
+`/usage` screen reads. That token is never stored by the overlay, never written to the
+debug log, and never sent anywhere but `api.anthropic.com`; the request is a GET, so it
+can't spend, change or send anything, and no token is ever refreshed (that stays the
+CLI's job). Accounts authenticating another way — API key, Bedrock, Vertex, a gateway —
+are skipped entirely, and every failure just leaves the gauge as it was. It's all in
+[`usage.py`](usage.py), which is short and commented for exactly this reason.
 
 ## Contributing
 

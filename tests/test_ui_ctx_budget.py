@@ -92,12 +92,12 @@ class TestStatusline:
     def test_turns_left_joins_the_percentage(self, gauge):
         for p in (10, 15, 20):
             _turn(gauge, p)
-        assert "~16 turns" in gauge.ctx_lbl.cget("text")
+        assert "~16 turns" in gauge._usage_panel_text()   # the row holds still; the panel carries it
 
     def test_one_turn_left_is_singular(self, gauge):
         for p in (50, 75):
             _turn(gauge, p)
-        assert "~1 turn" in gauge.ctx_lbl.cget("text")
+        assert "~1 turn" in gauge._usage_panel_text()
         assert "turns" not in gauge.ctx_lbl.cget("text")
 
     def test_gauge_colours_by_tier(self, gauge):

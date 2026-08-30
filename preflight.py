@@ -208,7 +208,7 @@ def check():
     # with no window. Checked as files, so it reports even when nothing is importable.
     missing = [m for m in ("config.py", "worker.py", "debuglog.py", "win32utils.py",
                            "modelresolve.py", "cliupdate.py", "authstate.py",
-                           "crashreport.py")
+                           "crashreport.py", "usage.py")
                if not os.path.isfile(os.path.join(repo_dir(), m))]
     if missing:
         problems.append(Problem(

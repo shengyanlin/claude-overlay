@@ -124,6 +124,7 @@ try:
     from worker import ClaudeWorker
     import authstate
     import sessions
+    import usage
 except Exception as _e:
     _report_import_failure(_e)
 
@@ -365,6 +366,72 @@ _QUOTA_WINDOWS = {"five_hour": "5h", "seven_day": "week", "seven_day_opus": "wee
                   "seven_day_sonnet": "week/sonnet", "overage": "overage"}
 _QUOTA_HOT = 0.90                 # colour by the number shown, even if the CLI still says
                                   # "allowed" — a grey 94% reads as nothing being wrong
+_QUOTA_WARN = 0.75                # the ring's amber step. The text gauge can wait for the
+                                  # CLI's own "allowed_warning" because it prints a number you
+                                  # read; an arc has no number, so it has to earn attention
+                                  # before it is nearly spent or it says nothing until too late.
+
+
+def _mix(a, b, t):
+    """Blend two #rrggbb colours, t of the way from a to b."""
+    x, y = (int(a[i:i + 2], 16) for i in (1, 3, 5)), (int(b[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02X%02X%02X" % tuple(round(p + (q - p) * t) for p, q in zip(x, y))
+
+
+def _contrast(a, b):
+    """WCAG contrast ratio between two #rrggbb colours — used to prove a gauge is visible
+    rather than to assume it, after a track at 1.2:1 shipped as a blank mark."""
+    def lum(h):
+        c = [int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        c = [v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4 for v in c]
+        return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    p, q = lum(a), lum(b)
+    return (max(p, q) + 0.05) / (min(p, q) + 0.05)
+
+
+# Radii and stroke widths as fractions of a 32px mark, the size they were tuned at; the mark
+# is drawn at _MARK_PX and these scale with it. Inner track is the 5-hour window and is the
+# thicker of the two — it is the one that ends the session you are sitting in.
+_RING_GEOM = (("five_hour", 10.5 / 32, 3 / 32), ("week", 14.5 / 32, 2 / 32))
+_SPARK_R = 5.75 / 32           # small enough to leave clear air inside the 5h track:
+                               # when that arc goes amber it is T["accent"], the same
+                               # colour as the mark, and touching arc and mark merge
+_RING_SS = 4                      # supersample factor, then downsample: Tk's create_arc has
+                                  # no antialiasing on Windows and a 3px arc on a 36px circle
+                                  # comes out a visible staircase
+_MARK_PX = 36                     # two legible arcs plus a readable ✻ need this much room;
+                                  # the titlebar is 44px tall, so this is the largest that fits
+
+
+def _binding_window(windows):
+    """The one window that earns the statusline's single text slot: whichever is furthest
+    along, because the binding constraint is the limit you reach first and the rest are noise
+    until they overtake it. Ties go to five_hour — at equal percentages it is the one that can
+    end the session you are sitting in right now.
+
+    This rule used to live in usage.reading(), which applied it before the UI ever saw the
+    data. That was the wrong altitude twice over: it is a decision about what to SHOW, and
+    collapsing to it in the data layer threw away the other windows — including the 5-hour one
+    the ring now draws, which by definition is the one being discarded during the whole early
+    stretch when it sits below the weekly number. Reporting is usage.py's job; choosing is ours.
+
+    Takes windows keyed by name (utilization already 0-1) and returns one of them with its
+    name folded in, or None. The result deliberately carries no `status`: a polled reading has
+    none, so _gauge_color goes on colouring by the number, which is what it already did.
+    """
+    best = None
+    for name in _QUOTA_WINDOWS:
+        w = (windows or {}).get(name)
+        if not isinstance(w, dict):
+            continue
+        u = w.get("utilization")
+        if isinstance(u, bool) or not isinstance(u, (int, float)):
+            continue
+        if best is None or u > best[1]:
+            best = (name, float(u))
+    return dict(windows[best[0]], window=best[0]) if best else None
+
+
 _RETRY_POLL_MS = 60_000           # how often an armed retry checks the clock. A single long
                                   # after() would be the obvious choice and the wrong one: Tk
                                   # timers don't run while the machine sleeps, so a laptop
@@ -452,7 +519,13 @@ class Overlay:
                                         # conversation and after a compaction wins the room back
         self._ctx_sample_due = False    # a turn ended; the next usage refresh is its data point
         self._quota = None              # last rate-limit reading the CLI reported (see "quota")
+        self._quota_polled = None       # last reading usage.py fetched itself (see "quota_poll").
+                                        # Kept apart from _quota, not merged into it: this one is
+                                        # fresher and so wins the DISPLAY, while everything that
+                                        # speaks or sends still reads the CLI's own event above.
         self._quota_said = None         # status already announced, so each transition speaks once
+        self._ring_explained = False    # the ring names itself once, when there is finally
+                                        # something to point at (see _maybe_explain_ring)
         self._last_sent = None          # (text, images) of the last message handed to the worker,
                                         # so a refusal that never reached Claude can give it back
         self._retry = None              # {"at", "text", "armed"} — a refused message waiting for
@@ -638,7 +711,18 @@ class Overlay:
         self.root.after(220, self._install_taskbar_button)
         self.root.after(1200, self._check_for_update)
         self.root.after(1500, self._check_cli_update)
+        self._usage_poll = usage.Poller(self.ui_q)
+        self._start_usage_poll()
         self._start_hang_watchdog()    # diagnostic: dumps all-thread stacks if the UI pump stalls
+
+    def _start_usage_poll(self):
+        """Start the allowance poll, so the gauge has a number before the first message.
+
+        Its own method purely so the test suite can neuter it on the Overlay it builds
+        (no network, and this machine's real token never read) WITHOUT patching
+        usage.Poller itself — the session-wide Overlay fixture would otherwise leave the
+        class stubbed for every later unit test of that class."""
+        self._usage_poll.start()
 
     def _start_hang_watchdog(self):
         """Diagnostic (active only when CLAUDE_OVERLAY_DEBUG_LOG is set): a daemon thread that,
@@ -952,10 +1036,28 @@ class Overlay:
         self.titlebar = bar
         bar.pack_propagate(False)
         self._bind_drag(bar)
-        sz = self.px(24)
+        sz = self.px(_MARK_PX)
         mark = tk.Canvas(bar, width=sz, height=sz, bg=T["bg"], highlightthickness=0)
-        mark.pack(side="left", padx=(self.px(14), self.px(7)))
-        self._draw_spark(mark, sz / 2, sz / 2, self.px(9))
+        mark.pack(side="left", padx=(self.px(10), self.px(7)))
+        # The whole mark — allowance arcs AND the ✻ — is one supersampled image rather than
+        # Tk canvas primitives, so every curve is antialiased. See _paint_quota_ring.
+        self._mark, self._mark_sz = mark, sz
+        self._paint_quota_ring()
+        # The ring can carry the numbers but not their name. A pointer cursor says it answers
+        # to something, and <Enter> is where the answer arrives — see _quota_hover_text.
+        mark.configure(cursor="hand2")
+        mark.bind("<Enter>", self._mark_enter, add="+")
+        mark.bind("<Leave>", self._mark_leave, add="+")
+        # Deliberately a child of root rather than a Toplevel. The capture exclusion that keeps
+        # the overlay out of screen shares - and out of the screenshots we send Claude - is set
+        # on the root HWND (see _apply_share_visibility) and a new top-level window does not
+        # inherit it: the panel would show up in a Teams share while the overlay itself did not,
+        # and would land inside our own grabs, because capture() skips its withdraw dance
+        # whenever the exclusion is active. A placed child inherits all of that for nothing.
+        self._usage_panel = tk.Label(self.root, text="", bg=T["tool_bg"], fg=T["text"],
+                                     font=self.f_mono, justify="left", anchor="w",
+                                     padx=self.px(10), pady=self.px(8),
+                                     highlightthickness=1, highlightbackground=T["border"])
         self._bind_drag(mark)
         # The title doubles as the rename target: click it (without dragging) to edit this
         # overlay's name; dragging it still moves the window (moved-detection, like the orb).
@@ -1722,16 +1824,6 @@ class Overlay:
             self.toggle_collapse()   # click the bubble → expand
 
     # ── small widgets ──
-    def _draw_spark(self, c, cx, cy, r):
-        import math
-        for i in range(12):
-            a = math.pi * i / 6
-            r1 = r if i % 2 == 0 else r * 0.5
-            c.create_line(cx, cy, cx + r1 * math.cos(a), cy + r1 * math.sin(a),
-                          fill=T["accent"], width=max(2, self.px(2)), capstyle="round")
-        d = max(2, self.px(2))
-        c.create_oval(cx - d, cy - d, cx + d, cy + d, fill=T["accent"], outline="")
-
     def _title_btn(self, parent, text, cmd):
         b = tk.Label(parent, text=text, bg=T["bg"], fg=T["muted"], font=self.f_small,
                      cursor="hand2", width=3)
@@ -4459,42 +4551,226 @@ class Overlay:
         # version goes last so it clips first if the window is narrow; ⬆ flags an update
         ver = f"v{__version__}" + ("  ⬆" if self._update_available else "")
         self.statusline.configure(text=f"{self._model or 'Claude'} ▾", fg=T["muted"])
-        self.ctx_lbl.configure(text=f"·   {self._gauge_text()}", fg=self._gauge_color())
+        self.ctx_lbl.configure(text=f"·   {self._gauge_text()}", fg=self._ctx_color())
         self.ver_lbl.configure(text=f"·   {ver}", fg=T["muted"])
+        self._paint_quota_ring()
 
     # ── the middle of the statusline ──
     def _ctx_text(self):
-        """Context as a percentage, plus the headroom in turns once there's a slope to read."""
+        """Context as a percentage, and nothing else.
+
+        The headroom in turns used to be appended here, which meant the row grew a second
+        clause the moment a burn rate could be read and lost it again after a compaction. The
+        one strip of chrome that should hold still was reflowing while you looked at it. The
+        figure is not gone - _usage_panel_text carries it, one hover away, and the end-of-turn
+        warning still speaks it."""
         p = f"{self._ctx_pct:.0f}%" if isinstance(self._ctx_pct, (int, float)) else "—"
-        left = self._ctx_turns_left()
-        if left is not None:
-            p += f" · ~{left} turn{'' if left == 1 else 's'}"
         return f"context {p}"
 
     def _gauge_text(self):
-        """What the gauge says. The allowance owns the slot whenever the CLI has reported
-        one, because it's the limit that ends sessions; context joins it only once context is
-        over its own warning line and has become the more urgent of the two. Before any
-        rate-limit event arrives (an older CLI, or a session that hasn't transitioned yet)
-        the slot falls back to context, which is better than an empty gauge."""
-        q = self._quota or {}
-        u = q.get("utilization")
-        if not isinstance(u, (int, float)):
-            return self._ctx_text()
-        win = _QUOTA_WINDOWS.get(q.get("window"))
-        bits = [f"quota {u * 100:.0f}%" + (f" ({win})" if win else "")]
-        resets = self._quota_resets_text()
-        if resets:
-            bits.append(resets)
-        if isinstance(self._ctx_pct, (int, float)) and self._ctx_pct >= _CTX_WARN_PCT:
-            bits.append(self._ctx_text())
-        return " · ".join(bits)
+        """What the row carries when the mark is not being hovered: context.
 
-    def _quota_resets_text(self):
+        The allowance used to own this slot, with context demoted to a fallback and allowed
+        back only once it was over its own warning line - two percentages competing for one
+        place. The allowance lives on the ring now, and printing it here as well would be the
+        same number twice; on a narrow overlay that duplication is what pushed the version off
+        the end. Context is NOT duplicated by the ring: the ring is the plan allowance, context
+        is the size of THIS conversation, and the two answer different questions. So context
+        simply keeps the slot, and the competition this method used to arbitrate is gone.
+        """
+        return self._ctx_text()
+
+    def _usage_panel_text(self):
+        """Everything about usage, in one aligned block, for the panel the mark opens.
+
+        No unlabelled gauge explains itself. What makes one learnable is being able to
+        interrogate it, and the answer belongs where the asking happened - beside the mark,
+        not down in a status row that then reflows under the cursor. Both allowance windows
+        and context sit here together because they are the same question asked three ways, and
+        because context's turns figure had to leave the row to stop it moving."""
+        rows = []
+        wins = self._ring_windows()
+        for key, label in (("five_hour", "5h"), ("week", "week")):
+            u = (wins.get(key) or {}).get("utilization")
+            if isinstance(u, bool) or not isinstance(u, (int, float)):
+                continue
+            rows.append((label, f"{u * 100:.0f}%", self._quota_resets_text(wins[key])))
+        if not rows:
+            rows.append(("allowance", "—", "no reading yet"))
+        p = self._ctx_pct
+        if isinstance(p, (int, float)):
+            left = self._ctx_turns_left()
+            rows.append(("context", f"{p:.0f}%",
+                         f"~{left} turn{'' if left == 1 else 's'} left" if left is not None else ""))
+        w = max(len(r[0]) for r in rows)
+        return "\n".join(f"{a.ljust(w)}   {b:>4}   {c}".rstrip() for a, b, c in rows)
+
+    def _mark_enter(self, _e=None):
+        self._usage_panel.configure(text=self._usage_panel_text())
+        # Just under the titlebar, left-aligned with the mark it belongs to.
+        self._usage_panel.place(x=self.px(10), y=self.px(42))
+        self._usage_panel.lift()
+
+    def _mark_leave(self, _e=None):
+        self._usage_panel.place_forget()
+
+    def _maybe_explain_ring(self):
+        """Name the ring once, the first time there is something to point at.
+
+        A first-time reader has no way to guess that two arcs around a logo are a plan
+        allowance — the shape can carry the numbers but not their meaning. One sentence, said
+        once, is the only thing that closes that gap; after that the hover carries it."""
+        if self._ring_explained or not self._ring_arcs():
+            return
+        self._ring_explained = True
+        self.add_sys("◔ The ring on ✻ is your plan allowance — the inner arc is the 5-hour "
+                     "window, the outer one is weekly. Hover the mark for the numbers.")
+
+    def _gauge_quota(self):
+        """The freshest allowance reading, for DISPLAY only.
+
+        usage.py polls every minute; the CLI speaks only when its status transitions, so its
+        copy can be hours old — and while the overlay sits idle, hours old is exactly when the
+        number is worth looking at. So the poll wins the gauge whenever it has one.
+
+        It wins nothing else. _announce_quota and _offer_retry read self._quota directly and
+        deliberately: the polled reading carries no status (usage.py won't invent one from the
+        endpoint's severity vocabulary), and a warning that speaks, or a retry that puts a
+        message on the wire hours later, must come from the CLI's own event or not at all."""
+        w = (self._quota_polled or {}).get("windows")
+        if isinstance(w, dict) and w:
+            return _binding_window(w) or {}
+        return self._quota or {}
+
+    def _quota_windows(self):
+        """Every allowance window we can place on the ring, keyed by name.
+
+        The poll carries all of them. The CLI's own event carries exactly one, and only
+        sometimes names it — an unnamed one is DROPPED rather than parked on whichever track
+        is handy, because putting a weekly reading on the 5-hour arc would be a lie the user
+        has no way to see through. The statusline text still prints that number, so staying
+        silent here costs nothing.
+        """
+        w = (self._quota_polled or {}).get("windows")
+        if isinstance(w, dict) and w:
+            return w
+        q = self._quota or {}
+        u, name = q.get("utilization"), q.get("window")
+        if name in _QUOTA_WINDOWS and isinstance(u, (int, float)) and not isinstance(u, bool):
+            return {name: {"utilization": float(u), "resets_at": q.get("resets_at")}}
+        return {}
+
+    def _ring_color(self, u, quiet):
+        """Recessive until it isn't. An arc carries no number, so colour is the only channel
+        it has for urgency — hence its own amber step rather than waiting for the CLI's."""
+        if u >= _QUOTA_HOT:
+            return T["err"]
+        if u >= _QUOTA_WARN:
+            return T["accent"]
+        return quiet
+
+    def _ring_track(self):
+        """The empty part of a gauge, in a tone you can actually see.
+
+        The first cut used T["border"], which is 1.2:1 against the surface — exactly right for
+        a hairline between two panels and completely invisible as a track, so a fresh overlay
+        with no reading yet drew a mark that looked untouched. _contrast pins the replacement
+        rather than trusting the eye that missed it the first time."""
+        return _mix(T["bg"], T["faint"], 0.70)   # 1.8:1 light, 2.1:1 dark — seen, not shouted
+
+    def _ring_windows(self):
+        """The two tracks, each resolved to the one window it stands for. Shared by the ring
+        and by the hover text so a number and its label can never come from different windows."""
+        wins = self._quota_windows()
+        return {"five_hour": wins.get("five_hour"),
+                "week": _binding_window({k: v for k, v in wins.items() if k != "five_hour"})}
+
+    def _ring_arcs(self):
+        """What each track should show: {track: (fraction, colour)}, tracks with nothing to
+        say left out. Kept separate from the drawing so the numbers and colours can be tested
+        without decoding a bitmap."""
+        out = {}
+        for key, w in self._ring_windows().items():
+            u = (w or {}).get("utilization")
+            if isinstance(u, bool) or not isinstance(u, (int, float)) or u <= 0.005:
+                continue           # a hairline at 0% would read as "something is used"
+            out[key] = (min(1.0, float(u)), self._ring_color(u, T["muted"]))
+        return out
+
+    def _paint_quota_ring(self):
+        """The ✻ mark, ringed by two allowance gauges: the 5-hour window inside, the weekly
+        one outside.
+
+        WHY TWO, AND WHY HERE. The status row had one slot and filled it with whichever window
+        was furthest along, labelled "(5h)" or "(week)". That works as text because the text
+        says which window it is describing — but the row was also carrying the model name, the
+        reset time and the version, and on a narrow overlay the version was being clipped.
+        Moving the gauge onto the mark buys the row back; the catch is that an arc cannot carry
+        the label, so a single arc that silently changed meaning would be strictly worse than
+        the text it replaced. Two fixed tracks answer both at once: position IS the label, and
+        the thicker inner one is the window that ends the session you are sitting in.
+
+        Two arcs are also the honest reading of the data. The weekly window climbs slowly in
+        the background; the 5-hour one can go from a tenth to spent in an afternoon. Ranking
+        them by magnitude hid the 5-hour window for exactly as long as it sat below the weekly
+        number — which is where it is every time you sit down to work. Both are the same unit
+        (share of an allowance) on the same 0-1 scale, so drawing them together is one scale,
+        not two. The sweep runs clockwise from 12 o'clock, the direction a clock face reads,
+        which is what a window that empties and refills on a timer actually is.
+
+        WHY AN IMAGE. Tk's create_arc is not antialiased on Windows, and a 3px stroke on a 36px
+        circle comes out a visible staircase — the first cut of this was drawn with canvas
+        primitives and was unreadable at real size. Everything is rendered at _RING_SS× into
+        one PIL image, downsampled, and placed as a single canvas item, so every curve
+        (including the ✻ itself) is smooth. The photo is kept on the instance because Tk holds
+        only a weak claim on a PhotoImage — drop the Python reference and the mark goes blank.
+        """
+        c = getattr(self, "_mark", None)
+        if c is None:              # a repaint can land before the titlebar is built
+            return
+        sz = self._mark_sz
+        S = sz * _RING_SS
+        im = Image.new("RGB", (S, S), T["bg"])
+        d = ImageDraw.Draw(im)
+        arcs, track = self._ring_arcs(), self._ring_track()
+        for key, rf, wf in _RING_GEOM:
+            r, lw = S * rf, max(1, round(S * wf))
+            box = [S / 2 - r, S / 2 - r, S / 2 + r, S / 2 + r]
+            # The empty track is always drawn: an arc with nothing behind it reads as a
+            # fragment of something rather than as "this much of that".
+            d.arc(box, 0, 360, fill=track, width=lw)
+            a = arcs.get(key)
+            if a:
+                d.arc(box, -90, -90 + 360 * a[0], fill=a[1], width=lw)
+        self._draw_spark_pil(d, S)
+        self._ring_photo = ImageTk.PhotoImage(im.resize((sz, sz), Image.LANCZOS))
+        c.delete("ring")
+        c.create_image(sz / 2, sz / 2, image=self._ring_photo, tags="ring")
+
+    def _draw_spark_pil(self, d, S):
+        """The ✻ at the centre of the mark, into the same supersampled image as the rings.
+        Round tips are ellipses because PIL has no cap style; at _RING_SS× they land as the
+        same shape Tk's capstyle="round" used to give."""
+        import math
+        cx = cy = S / 2
+        r, w = S * _SPARK_R, max(1, round(S * 2 / 32))
+        for i in range(12):
+            a = math.pi * i / 6
+            r1 = r if i % 2 == 0 else r * 0.5
+            x, y = cx + r1 * math.cos(a), cy + r1 * math.sin(a)
+            d.line([cx, cy, x, y], fill=T["accent"], width=w)
+            d.ellipse([x - w / 2, y - w / 2, x + w / 2, y + w / 2], fill=T["accent"])
+
+    def _quota_resets_text(self, q):
         """When the allowance comes back, as a wall clock. A live countdown would need a timer
         redrawing a number nobody watches tick; the time you can start again is the thing you
-        actually plan around. Weekly windows can reset days out, so those name the day too."""
-        ts = (self._quota or {}).get("resets_at")
+        actually plan around. Weekly windows can reset days out, so those name the day too.
+
+        Takes the reading to describe, because its two callers want different ones: the gauge
+        shows whichever is freshest, while an announcement must quote the same event whose
+        status it is announcing — mixing them could pair "weekly allowance is used up" with
+        the 5-hour window's reset time."""
+        ts = (q or {}).get("resets_at")
         if not isinstance(ts, (int, float)) or ts <= 0:
             return ""
         try:
@@ -4504,7 +4780,10 @@ class Overlay:
             return ""
 
     def _gauge_color(self):
-        q = self._quota or {}
+        # Same reading the text came from, so colour and number can never describe different
+        # windows. A polled reading has no status, which is why _QUOTA_HOT colours by the
+        # number: an amber tier we'd have to guess at is worse than a red one we can prove.
+        q = self._gauge_quota()
         u = q.get("utilization")
         if isinstance(u, (int, float)):
             st = q.get("status")
@@ -4594,7 +4873,7 @@ class Overlay:
         if st not in ("allowed_warning", "rejected"):
             return
         win = _QUOTA_WINDOWS.get(q.get("window")) or "usage"
-        resets = self._quota_resets_text()
+        resets = self._quota_resets_text(q)
         when = f" — {resets}" if resets else ""
         if st == "rejected":
             self.add_err(f"◔ Your {win} allowance is used up{when}.")
@@ -5177,6 +5456,7 @@ class Overlay:
         elif kind == "quota":
             self._quota = payload if isinstance(payload, dict) else None
             self._refresh_statusline()
+            self._maybe_explain_ring()
             self._announce_quota()
             # The CLI saying the allowance is no longer rejected beats waiting for a clock we
             # only ever got a prediction of. A retry is only ever armed after a rejection, so
@@ -5185,6 +5465,15 @@ class Overlay:
             if r and r.get("armed") and (self._quota or {}).get("status") not in (None, "rejected"):
                 r["ready"] = True     # sticky: if we're mid-turn right now, the next tick uses it
                 self._retry_tick()
+        elif kind == "quota_poll":
+            # usage.py asked the allowance endpoint itself, so the gauge is right without
+            # having to send a message first. Display only, and on purpose: no announcement
+            # (the reading carries no status to announce) and no retry re-arm (only the CLI's
+            # own event may decide that a refused message can go back on the wire).
+            if isinstance(payload, dict):
+                self._quota_polled = payload
+                self._refresh_statusline()
+                self._maybe_explain_ring()
         elif kind == "turn_done":
             self._md_finalize()          # the turn ended → give the last line full block styling
             self._finish_turn_copy()     # then a Copy button under the reply
@@ -5352,6 +5641,11 @@ class Overlay:
             pass
         try:
             self.worker.interrupt()      # stop any in-flight turn so it can close cleanly
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_usage_poll", None):
+                self._usage_poll.stop()  # daemon anyway; this just stops it waking up mid-teardown
         except Exception:
             pass
         self.worker.shutdown()
