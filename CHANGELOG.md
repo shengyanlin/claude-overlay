@@ -3,6 +3,63 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.19.0] - 2026-09-01
+
+Two contributed PRs, both by [@Justinkao2](https://github.com/Justinkao2) — thank you
+again: [#8](https://github.com/shengyanlin/claude-overlay/pull/8) (seven features) and
+[#9](https://github.com/shengyanlin/claude-overlay/pull/9) (the allowance ring).
+
+### Added
+- **Plan-allowance ring on the ✻ mark.** The mark is now a gauge: inner arc = the
+  5-hour window, outer arc = the weekly one, drawn clockwise from 12 like the clock
+  they are. Amber at 75%, red once spent. Hovering the mark opens a panel with both
+  windows, their reset times, and context headroom in turns; the first reading is
+  introduced by a one-time system line. Rendered through PIL at 4× and downsampled
+  (Tk's `create_arc` has no antialiasing on Windows), mark grown 24→36px. The hover
+  panel is deliberately a `Label` inside the root window, not a `Toplevel` —
+  `WDA_EXCLUDEFROMCAPTURE` is not inherited, so a tooltip window would have been the
+  one part of the overlay visible in a screen share.
+- **The allowance is read directly, so the gauge is right before anything is sent**
+  (new `usage.py`). The overlay polls the same endpoint the CLI's own `/usage` screen
+  reads, once a minute, using the CLI's own OAuth token. The exception to "the overlay
+  never sees a token" is drawn narrowly and tested: the host is a module constant no
+  config or env var can redirect, the request is a GET, the token is re-read from the
+  CLI's file each poll and never stored or logged, an expired token is skipped (never
+  refreshed), and Bedrock/Vertex/API-key setups are never polled at all.
+- **Past conversations.** A sessions list (new `sessions.py`) reads the CLI's own
+  transcript store, with thumbnails, in-transcript cards, two-step delete, and
+  one-click resume.
+- **Copyable messages.** Text in user bubbles can be selected; a click copies the
+  whole message as originally sent. Statusline chips mark non-default Read-only /
+  Window / Shared modes.
+- **Compaction progress bar** with an ETA fitted from the overlay's own past runs
+  (seeded from CLI transcripts), capped at 90% and dropping the percentage on overrun.
+- **Refused sends survive.** When the allowance runs out mid-conversation the message
+  is restored to the box instead of lost, with an **opt-in** one-shot auto-resend armed
+  for when the window resets (disarms on any manual edit, send, or Clear).
+- **One-click update from the 🔔 notice** for git installs (visible console; ZIP
+  installs get instructions instead), and `update.cmd` now names its pull source,
+  pulls `--ff-only`, and refuses to run off-main or dirty — so a fork can no longer
+  show a correct notice and then no-op the pull.
+
+### Changed
+- **Screenshot dedupe is perceptual now.** Measurement showed four grabs of an
+  untouched screen produce four different SHA-256es — byte-identity never fired. The
+  dedupe now uses a 1024-bit difference hash with a measured threshold (noise ≤2 bits,
+  real change ≥4), configurable via `SHOT_DEDUPE_BITS` (0 = off).
+- The status row holds still: fixed-width `model · context NN% · version`, no reflow;
+  `~N turns` lives in the hover panel. The ring's track color is computed for WCAG
+  contrast in both themes, with a test computing the actual ratio.
+
+### Fixed
+- **The usage poller could die on its first success**: a debug line formatted a field
+  outside any try, above the queue put — one missing key killed the daemon thread and
+  the gauge silently never appeared again. The reading now goes on the queue first and
+  the log line is guarded, with a test that drives a genuine reading through the queue.
+- Shared test fixture now resets allowance state between tests (a leaked reading could
+  steal the gauge slot from the next test — the full suite only ever proved one
+  ordering).
+
 ## [1.18.0] - 2026-08-29
 
 Scroll-follow rework, contributed by [@Justinkao2](https://github.com/Justinkao2)
