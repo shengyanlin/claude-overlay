@@ -288,3 +288,51 @@ def test_a_broken_app_fails_the_deep_run(monkeypatch):
     text, ok = preflight.run(deep=True)
     assert ok is False
     assert "cannot load" in text
+
+
+# ── the model-menu line: name the offer AND where it came from ──────────────────────
+
+def _entitle(tmp_path, monkeypatch, *families):
+    import json
+    import modelresolve as mr
+    mr._ENT_MEMO["key"] = mr._ENT_MEMO["families"] = None
+    p = tmp_path / ".claude.json"
+    p.write_text(json.dumps({"modelAccessCache": [
+        {"apiName": f"claude-{f}-9", "entitled": True} for f in families]}), "utf-8")
+    monkeypatch.setattr(mr, "_CLAUDE_JSON", p)
+    return p
+
+
+def test_model_menu_line_names_the_offer_and_the_source(tmp_path, monkeypatch):
+    # "Fable is missing from my menu" has three different causes; the report has to
+    # distinguish them, so it prints what is offered, what is entitled, and from where.
+    p = _entitle(tmp_path, monkeypatch, "opus", "sonnet", "haiku")
+    line = preflight.model_menu_line()
+    assert "Fable" not in line.split("(")[0]
+    assert "entitled families: haiku, opus, sonnet" in line
+    assert str(p) in line
+
+
+def test_model_menu_line_says_when_entitlement_is_unknown(tmp_path, monkeypatch):
+    import modelresolve as mr
+    mr._ENT_MEMO["key"] = mr._ENT_MEMO["families"] = None
+    monkeypatch.setattr(mr, "_CLAUDE_JSON", tmp_path / "absent.json")
+    line = preflight.model_menu_line()
+    assert "entitlement unknown" in line and "showing all" in line
+    assert "Fable" in line          # unknown means show everything, not hide everything
+
+
+def test_model_menu_line_says_when_the_filter_is_off(tmp_path, monkeypatch):
+    import config
+    _entitle(tmp_path, monkeypatch, "opus")
+    monkeypatch.setattr(config, "MODEL_MENU_FILTER", False)
+    line = preflight.model_menu_line()
+    assert "filter OFF" in line and "Fable" in line
+
+
+def test_model_menu_line_never_raises(monkeypatch):
+    import modelresolve as mr
+    def boom(*a, **k):
+        raise RuntimeError("nope")
+    monkeypatch.setattr(mr, "entitled_families", boom)
+    assert "could not be determined" in preflight.model_menu_line()

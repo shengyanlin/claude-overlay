@@ -342,6 +342,33 @@ def _import_smoke():
         return False, f"couldn't run the import test: {e.__class__.__name__}: {e}"
 
 
+def model_menu_line():
+    """One line saying which models the switcher will offer AND why.
+
+    "Fable is missing from my menu" has three different causes — this login isn't
+    entitled to it, the CLI's entitlement record is stale, or the filter is switched off
+    and you're looking at something else entirely — and they are indistinguishable from
+    the menu itself. So the report names the offer, the source it was read from, and
+    whether the filter was even applied. Fully guarded: a diagnostic that can throw is
+    worse than one that says nothing."""
+    try:
+        import config
+        import modelresolve
+        labels = [lbl for lbl, _ in config.MODELS]
+        if not config.MODEL_MENU_FILTER:
+            return f"{', '.join(labels)}  (filter OFF - offering every family)"
+        fams = modelresolve.entitled_families()
+        offered = [lbl for lbl, _ in modelresolve.available_models(config.MODELS)]
+        src = modelresolve._CLAUDE_JSON
+        if not fams:
+            return (f"{', '.join(offered)}  (entitlement unknown - no readable "
+                    f"modelAccessCache in {src} - showing all)")
+        return (f"{', '.join(offered)}  (entitled families: "
+                f"{', '.join(sorted(fams))}, per {src})")
+    except Exception as e:                                     # pragma: no cover - defensive
+        return f"(could not be determined: {type(e).__name__}: {e})"
+
+
 def run(deep=True):
     """Produce the report and the verdict together: (text, ok).
 
@@ -354,6 +381,7 @@ def run(deep=True):
     lines = ["", "=" * 72, " Claude Overlay - environment report", "=" * 72]
     lines += environment_block()
     lines += [f"install dir  : {repo_dir()}"]
+    lines += [f"model menu   : {model_menu_line()}"]
 
     problems = check()
     ok = not any(p.level == FAIL for p in problems)
