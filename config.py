@@ -54,6 +54,18 @@ MODELS = [("Opus", "opus"), ("Opus (1M)", "opus[1m]"),
           ("Fable", "fable"), ("Fable (1M)", "fable[1m]"),
           ("Sonnet", "sonnet"), ("Haiku", "haiku")]  # click the statusline to switch
 
+# ...but a login is not entitled to every family, and MODELS above is the same list for
+# everyone. A colleague whose account has no Fable was still offered Fable, picked it, and
+# got a different model with no error at all (the CLI silently falls back on an unentitled
+# --model) — which reads as "the overlay is broken". So the menu is filtered at open time
+# to what the CLI itself would offer, read from its own entitlement record
+# (~/.claude.json's modelAccessCache; see modelresolve.entitled_families). Filtering only
+# ever REMOVES entries the record positively contradicts: if the record is missing or
+# unreadable, or the filter would empty the menu, the full list is shown. Set
+# CLAUDE_OVERLAY_MODEL_FILTER=0 (or "MODEL_MENU_FILTER": false in config.json) if you ever
+# need the unfiltered list back — e.g. an entitlement the cache hasn't caught up with yet.
+MODEL_MENU_FILTER = _env_bool("CLAUDE_OVERLAY_MODEL_FILTER", True)
+
 # Reasoning-effort ceiling for overlay sessions: "low" | "medium" | "high" | "xhigh" |
 # "max", or "" (default) to inherit whatever the CLI would use — your
 # ~/.claude/settings.json `effortLevel`, or the CLI's own default. This is the same dial
@@ -427,6 +439,7 @@ _USER_CONFIG_KEYS = {
     # typo here would otherwise surface as an opaque connect failure two screens later.
     "EFFORT": _v_choice("", "low", "medium", "high", "xhigh", "max"),
     "SKILLS": _v_skills,                       # "all" | ["name", …] | null
+    "MODEL_MENU_FILTER": _v_bool,              # false = offer every family, entitled or not
     "STRICT_MCP_CONFIG": _v_bool,
     "MCP_SERVERS": _v_mcp_servers,             # {name: {...}} — loads even under strict
     "CLI_UPDATE_CHECK": _v_bool,

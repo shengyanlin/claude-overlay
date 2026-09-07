@@ -357,7 +357,7 @@ script here *scans* that folder and uses whatever runs, no matter how it got the
 | &nbsp;&nbsp;• Capture only the active window | **⚙ → Window-only** (window only; off = every monitor) |
 | &nbsp;&nbsp;• Show / hide in screen shares | **⚙ → Shareable** (visible to Teams/Zoom/OBS; off = private, the default) |
 | &nbsp;&nbsp;• Lock Claude read-only | **⚙ → Read-only** ("plan" mode: looks and answers, changes nothing; off = the configured `PERMISSION_MODE`) |
-| Switch model | click the **statusline** (`model ▾`) |
+| Switch model | click the **statusline** (`model ▾`) — the list shows the model families **your** login can actually pick, read from the CLI's own record of them, so it can't offer you a model that would silently fall back to another one |
 | See how much allowance is left | **two arcs around the ✻ mark** — the inner one is the 5-hour window, the outer one is weekly. Both are drawn, always: the 5-hour window is the one that ends the session you're in, and it spends most of its life sitting below the weekly number, so showing only whichever is furthest along would hide it for exactly as long as it matters. Filled in from your account the moment the overlay opens, so it's there **before** you send anything, and refreshed every minute while it sits idle; amber as you approach a limit, red once it's gone. It speaks up once per transition, and a message refused for allowance is put back in the box rather than lost |
 | See the exact numbers | **hover the ✻ mark** — a small panel drops under it with both allowance windows, their reset times, and the context headroom in turns (extrapolated from what recent ones cost). No unlabelled gauge explains itself; this is how you ask it |
 | Retry when the allowance returns | a refused message offers **⏱ Send it automatically at &lt;time&gt;** — opt-in, one click, and it stands down the moment you type something else, send by hand, or Clear |
@@ -396,8 +396,8 @@ to change, using the constant names below — for example:
 }
 ```
 
-Overridable: `WORKING_DIR`, `MODEL`, `EFFORT`, `PERMISSION_MODE`, `SKILLS`,
-`STRICT_MCP_CONFIG`, `CLI_UPDATE_CHECK`, `AUTO_SCREENSHOT_DEFAULT`, `SHOT_SCOPE`,
+Overridable: `WORKING_DIR`, `MODEL`, `MODEL_MENU_FILTER`, `EFFORT`, `PERMISSION_MODE`,
+`SKILLS`, `STRICT_MCP_CONFIG`, `CLI_UPDATE_CHECK`, `AUTO_SCREENSHOT_DEFAULT`, `SHOT_SCOPE`,
 `SHOT_FORMAT`, `SHOT_JPEG_QUALITY`, `SHOT_DEDUPE_BITS`, `HIDE_SCREENSHOT_TOOL`, `THEME`,
 `SHOW_IN_SCREEN_SHARE_DEFAULT`, `TASKBAR_BUTTON`, `HOTKEY`, `WINDOW_ALPHA`,
 `CORNER_RADIUS`, `ORB_SIZE`, `FONT_SANS` / `FONT_SERIF` / `FONT_MONO`.
@@ -415,9 +415,18 @@ The settings themselves:
 - `MODEL` — defaults to `"opus"`, a **family alias for the latest Opus**, so a future
   Opus release is adopted automatically. Use `"opus[1m]"` for the 1M-context variant, or
   `"fable"` / `"sonnet"` / `"haiku"` — every alias tracks the newest model of its family,
-  and the in-app switcher lists them all (the statusline shows the concrete version each
-  alias resolved to, e.g. `claude-opus-4-8`). Don't use `None`: the Agent SDK resolves
-  `None` to an older model, not the CLI's interactive default.
+  and the in-app switcher lists the ones your login can pick (the statusline shows the
+  concrete version each alias resolved to, e.g. `claude-opus-4-8`). Don't use `None`: the
+  Agent SDK resolves `None` to an older model, not the CLI's interactive default.
+- `MODEL_MENU_FILTER` — `true` by default: the model switcher hides families your account
+  isn't entitled to, which it reads from the same record the CLI builds its own `/model`
+  picker from (`modelAccessCache` in `~/.claude.json`). Without this the menu offered
+  every family to everyone, and choosing one you don't have looks like nothing happened —
+  the CLI does not error on an unentitled `--model`, it quietly runs your default model
+  instead. Filtering only removes what that record positively contradicts: if it's
+  missing or unreadable, or filtering would empty the menu, you get the full list. Set it
+  to `false` (or `CLAUDE_OVERLAY_MODEL_FILTER=0`) if you've just been granted a model the
+  record hasn't caught up with — any `claude -p` run refreshes it too.
 - `EFFORT` — reasoning-effort ceiling for overlay sessions: `"low"`, `"medium"`,
   `"high"`, `"xhigh"`, `"max"`, or `""` (default) to inherit your CLI's setting
   (`effortLevel` in `~/.claude/settings.json`, or the CLI default). The same dial as the

@@ -123,6 +123,7 @@ try:
     from win32utils import _user32, _gdi32
     from worker import ClaudeWorker
     import authstate
+    import modelresolve
     import sessions
     import usage
 except Exception as _e:
@@ -5277,10 +5278,23 @@ class Overlay:
                 pass
         return f"✦ Compacted{el} — conversation history summarized; keep going."
 
+    def _menu_models(self):
+        """The models to offer in the switcher: MODELS minus the families this login has no
+        access to. Hardcoding the full list meant offering Fable to a colleague whose CLI
+        has no Fable — and picking it raised no error, because the CLI silently falls back
+        to the account default, so the overlay just appeared to ignore the click. Falls back
+        to the full list whenever entitlement can't be read (see modelresolve)."""
+        if not MODEL_MENU_FILTER:
+            return list(MODELS)
+        try:
+            return modelresolve.available_models(MODELS)
+        except Exception:
+            return list(MODELS)   # the switcher must work even if this reading breaks
+
     def _model_menu(self, e):
         m = tk.Menu(self.root, tearoff=0, bg=T["field"], fg=T["text"],
                     activebackground=T["accent"], activeforeground=T["on_accent"], bd=0)
-        for lbl, val in MODELS:
+        for lbl, val in self._menu_models():
             m.add_command(label=lbl, command=lambda v=val: self._switch_model(v))
         try:
             m.tk_popup(e.x_root, e.y_root)

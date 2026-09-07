@@ -7,6 +7,8 @@ off-Windows."""
 import json
 import time
 
+import pytest
+
 import modelresolve as mr
 
 
@@ -246,3 +248,130 @@ def test_cli_version_none_when_unavailable(monkeypatch):
     monkeypatch.setattr(mr, "_find_cli", lambda: "claude")
     monkeypatch.setattr(mr, "_run_cli", lambda cli, args, timeout: None)
     assert mr.cli_version() is None
+
+
+# ── entitlement: which families this login may pick (menu filtering) ─────────────────
+
+MODELS = [("Opus", "opus"), ("Opus (1M)", "opus[1m]"),
+          ("Fable", "fable"), ("Fable (1M)", "fable[1m]"),
+          ("Sonnet", "sonnet"), ("Haiku", "haiku")]
+
+
+def _claude_json(tmp_path, entries, name=".claude.json"):
+    """Write a .claude.json carrying a modelAccessCache and return its path."""
+    p = tmp_path / name
+    p.write_text(json.dumps({"modelAccessCache": entries, "junk": {"other": 1}}), "utf-8")
+    return p
+
+
+def _ent(api, yes=True):
+    return {"apiName": api, "entitled": yes}
+
+
+@pytest.fixture(autouse=True)
+def _clear_ent_memo():
+    """The entitlement memo is process-global; a leaked entry would make the next test read
+    another test's file."""
+    mr._ENT_MEMO["key"] = mr._ENT_MEMO["families"] = None
+    yield
+    mr._ENT_MEMO["key"] = mr._ENT_MEMO["families"] = None
+
+
+def test_family_of_handles_both_naming_eras():
+    # 'claude-3-opus-...' puts the family third, 'claude-opus-4-8' second — both appear in
+    # a real modelAccessCache, so the family is matched per segment, not by position.
+    assert mr._family_of("claude-3-opus-20240229") == "opus"
+    assert mr._family_of("claude-opus-4-1-20250805-claude-ai") == "opus"
+    assert mr._family_of("claude-haiku-4-5-20251001") == "haiku"
+    assert mr._family_of("claude-fable-5") == "fable"
+    assert mr._family_of("claude-sonnet-5") == "sonnet"
+    assert mr._family_of("gpt-4o") is None
+    assert mr._family_of(None) is None
+
+
+def test_entitled_families_reads_the_cache(tmp_path):
+    p = _claude_json(tmp_path, [_ent("claude-opus-5"), _ent("claude-sonnet-5"),
+                                _ent("claude-fable-5", False)])
+    assert mr.entitled_families(p) == frozenset({"opus", "sonnet"})
+
+
+def test_only_explicit_true_entitles(tmp_path):
+    # A missing / non-boolean flag is not a grant.
+    p = _claude_json(tmp_path, [_ent("claude-opus-5"), {"apiName": "claude-fable-5"},
+                                {"apiName": "claude-haiku-4-5", "entitled": "true"}])
+    assert mr.entitled_families(p) == frozenset({"opus"})
+
+
+def test_unknown_when_file_or_cache_is_missing_or_odd(tmp_path):
+    assert mr.entitled_families(tmp_path / "nope.json") is None          # no file
+    (tmp_path / "a.json").write_text("not json {{{", "utf-8")
+    assert mr.entitled_families(tmp_path / "a.json") is None             # unparseable
+    (tmp_path / "b.json").write_text(json.dumps({"other": 1}), "utf-8")
+    assert mr.entitled_families(tmp_path / "b.json") is None             # no cache key
+    assert mr.entitled_families(_claude_json(tmp_path, [], "c.json")) is None   # empty list
+    (tmp_path / "d.json").write_text(json.dumps({"modelAccessCache": "x"}), "utf-8")
+    assert mr.entitled_families(tmp_path / "d.json") is None             # wrong type
+    # Entries present but none entitled and none recognisable -> still 'unknown', never
+    # 'nothing available' (the caller would otherwise render an empty menu).
+    p = _claude_json(tmp_path, [_ent("claude-opus-5", False)], "e.json")
+    assert mr.entitled_families(p) is None
+
+
+def test_memo_is_keyed_on_file_identity_and_mtime(tmp_path):
+    p = _claude_json(tmp_path, [_ent("claude-opus-5")])
+    assert mr.entitled_families(p) == frozenset({"opus"})
+    # Rewriting the file (the CLI does this constantly) must be picked up, not memoized past.
+    p.write_text(json.dumps({"modelAccessCache": [_ent("claude-fable-5")]}), "utf-8")
+    os_stat_bump(p)
+    assert mr.entitled_families(p) == frozenset({"fable"})
+
+
+def os_stat_bump(p):
+    """Force a distinguishable mtime even on a coarse filesystem clock."""
+    import os as _os
+    st = p.stat()
+    _os.utime(p, ns=(st.st_atime_ns + 10 ** 9, st.st_mtime_ns + 10 ** 9))
+
+
+def test_available_models_hides_unentitled_families(tmp_path):
+    # The reported bug: a login with no Fable was still offered Fable (both entries).
+    p = _claude_json(tmp_path, [_ent("claude-opus-5"), _ent("claude-sonnet-5"),
+                                _ent("claude-haiku-4-5-20251001"),
+                                _ent("claude-fable-5", False)])
+    got = mr.available_models(MODELS, p)
+    assert [lbl for lbl, _ in got] == ["Opus", "Opus (1M)", "Sonnet", "Haiku"]
+
+
+def test_available_models_keeps_everything_when_entitlement_unknown(tmp_path):
+    assert mr.available_models(MODELS, tmp_path / "nope.json") == MODELS
+
+
+def test_available_models_never_returns_empty(tmp_path):
+    # Our reading contradicting the whole menu means the reading is wrong; locking the user
+    # out of the switcher entirely is the worse failure, so show everything.
+    p = _claude_json(tmp_path, [_ent("claude-penguin-9")])
+    assert mr.available_models(MODELS, p) == MODELS
+
+
+def test_available_models_keeps_unclassifiable_specs(tmp_path):
+    p = _claude_json(tmp_path, [_ent("claude-opus-5")])
+    models = [("Opus", "opus"), ("Pinned", "claude-sonnet-4-6"), ("Inherit", "inherit"),
+              ("Weird", None), ("Short",)]
+    assert mr.available_models(models, p) == models
+
+
+def test_probe_rejects_a_silent_fallback_to_another_family(monkeypatch):
+    # `claude --model fable` on a login without Fable exits 0 having run something else.
+    # Pinning that id would run a model the user never chose, so it must not resolve.
+    monkeypatch.setattr(mr, "_run_cli", lambda cli, args, timeout: json.dumps(
+        {"modelUsage": {"claude-sonnet-5": {}}, "model": "claude-sonnet-5"}))
+    assert mr._probe_concrete("claude", "fable") is None
+
+
+def test_unentitled_alias_passes_through_unpinned(monkeypatch, tmp_path):
+    monkeypatch.setattr(mr, "_CACHE_PATH", tmp_path / "c.json")
+    monkeypatch.setattr(mr, "_find_cli", lambda: "claude")
+    monkeypatch.setattr(mr, "cli_signature", lambda cli: "claude|1|2")
+    monkeypatch.setattr(mr, "_run_cli", lambda cli, args, timeout: json.dumps(
+        {"modelUsage": {"claude-sonnet-5": {}}}))
+    assert mr.resolve_model("fable[1m]") == "fable[1m]"      # the original spec, unchanged
