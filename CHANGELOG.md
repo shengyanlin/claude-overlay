@@ -3,6 +3,41 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.19.1] - 2026-09-07
+
+From a field report: the model switcher offered Fable to someone whose account has no
+Fable, and choosing it appeared to do nothing — which reads as a broken overlay.
+
+### Fixed
+- **The model switcher now offers only the models your login can actually pick.** The
+  menu was one hardcoded row per family, the same list for everyone, while model access
+  is per account. Worse, the failure was silent by construction: `claude --model` does
+  **not** error on a model you aren't entitled to — it quietly runs your default model
+  and exits 0 — so the click changed nothing visible and reported nothing. The overlay
+  now reads the same record the CLI builds its own `/model` picker from
+  (`modelAccessCache` in `~/.claude.json`) and hides what isn't yours. Nothing changes
+  if your account has every family.
+
+  The filter only removes what a readable record positively contradicts. A missing file,
+  unparseable JSON, an absent or empty list, a reading that finds no families, a filter
+  that would empty the menu, or an error anywhere in the reading all mean *show
+  everything* — that record is a cache and can lag a fresh grant by one CLI run (any
+  `claude -p` refreshes it), so hiding a model you really have is the worse failure. Set
+  `MODEL_MENU_FILTER` to `false` (or `CLAUDE_OVERLAY_MODEL_FILTER=0`) for the day the
+  cache is behind.
+- **Asking for a model you don't have no longer pins the session to a different one.**
+  When the startup resolve probed a family alias and the CLI silently fell back, the
+  overlay took the fallback model's id and pinned the streaming session to it — ask for
+  Fable, get pinned to Sonnet, with the statusline dutifully reporting Sonnet. It now
+  declines to resolve when nothing of the family it asked for ran, and passes the bare
+  alias through unpinned instead.
+
+### Added
+- **`Diagnose.cmd` says which models the menu will offer, and why** — the offer, the
+  families your login is entitled to, and the file they were read from (or "entitlement
+  unknown … showing all", or "filter OFF"). "Fable is missing from my menu" has three
+  causes that look identical from the menu; now they don't.
+
 ## [1.19.0] - 2026-09-01
 
 Two contributed PRs, both by [@Justinkao2](https://github.com/Justinkao2) — thank you
