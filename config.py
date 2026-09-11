@@ -248,6 +248,13 @@ COMPACT_IDLE_TIMEOUT = 600  # /compact is one big summarization round-trip that 
                             # for a while (≈30s even on a small context); bound it generously
 MAX_PASTE_SOURCES = 8       # cap how many files one paste fans out into
 MAX_PENDING_IMAGES = 16     # cap total queued attachments (a hostile clipboard can't pile up)
+QUEUE_MESSAGES = True       # Enter while a reply is streaming LINES THE MESSAGE UP (the
+                            # Claude Code CLI's behaviour) instead of interrupting the turn:
+                            # you can type two or three follow-ups ahead and they go out one
+                            # by one as each reply finishes. Stop lives on the round button
+                            # (and Esc). False restores the old meaning of Enter mid-turn:
+                            # interrupt the reply.
+MAX_QUEUED = 10             # cap the line-up; past this Enter says so and keeps your text
 MAX_PASTE_PIXELS = 32_000_000   # reject a pasted image above this pixel count BEFORE decode/
                             # thumbnail — a "decompression bomb" PNG decodes to a huge bitmap
                             # (Pillow only *warns*, doesn't raise, below ~178M px)
@@ -440,6 +447,7 @@ _USER_CONFIG_KEYS = {
     "EFFORT": _v_choice("", "low", "medium", "high", "xhigh", "max"),
     "SKILLS": _v_skills,                       # "all" | ["name", …] | null
     "MODEL_MENU_FILTER": _v_bool,              # false = offer every family, entitled or not
+    "QUEUE_MESSAGES": _v_bool,                 # false = Enter mid-turn interrupts (old behaviour)
     "STRICT_MCP_CONFIG": _v_bool,
     "MCP_SERVERS": _v_mcp_servers,             # {name: {...}} — loads even under strict
     "CLI_UPDATE_CHECK": _v_bool,

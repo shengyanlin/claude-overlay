@@ -349,8 +349,9 @@ script here *scans* that folder and uses whatever runs, no matter how it got the
 | Action | How |
 |---|---|
 | Send message | `Enter` (or click the **↑** button) |
+| Type ahead while Claude answers | just keep going — `Enter` mid-reply **queues** the message (like the Claude Code CLI) instead of interrupting; queued messages show above the box and go out one per finished reply, in order. Each row's **✕** hands its text back to the box |
 | New line | `Shift+Enter` |
-| Stop a running reply | click **Stop** (the ↑ becomes ■ while busy) |
+| Stop a running reply | click **Stop** (the ↑ becomes ■ while busy) or press `Esc` — either also drops the queued line-up, listing the texts in the transcript and putting the first back in the box |
 | Paste an image | **Ctrl+V** (click **📎** to clear) |
 | Toggle auto-screenshot | **◉ / ○ Auto-shot** (orange = on) |
 | Settings menu | click **⚙** — Window-only, Shareable, Read-only (✓ = on); the gear turns orange while Read-only is on |
@@ -396,7 +397,8 @@ to change, using the constant names below — for example:
 }
 ```
 
-Overridable: `WORKING_DIR`, `MODEL`, `MODEL_MENU_FILTER`, `EFFORT`, `PERMISSION_MODE`,
+Overridable: `WORKING_DIR`, `MODEL`, `MODEL_MENU_FILTER`, `QUEUE_MESSAGES`, `EFFORT`,
+`PERMISSION_MODE`,
 `SKILLS`, `STRICT_MCP_CONFIG`, `CLI_UPDATE_CHECK`, `AUTO_SCREENSHOT_DEFAULT`, `SHOT_SCOPE`,
 `SHOT_FORMAT`, `SHOT_JPEG_QUALITY`, `SHOT_DEDUPE_BITS`, `HIDE_SCREENSHOT_TOOL`, `THEME`,
 `SHOW_IN_SCREEN_SHARE_DEFAULT`, `TASKBAR_BUTTON`, `HOTKEY`, `WINDOW_ALPHA`,
@@ -427,6 +429,11 @@ The settings themselves:
   missing or unreadable, or filtering would empty the menu, you get the full list. Set it
   to `false` (or `CLAUDE_OVERLAY_MODEL_FILTER=0`) if you've just been granted a model the
   record hasn't caught up with — any `claude -p` run refreshes it too.
+- `QUEUE_MESSAGES` — `true` by default: `Enter` while a reply is streaming queues the
+  message (shown above the input box, sent in order as each reply finishes — the Claude
+  Code CLI's type-ahead behaviour). Set it to `false` to restore the old meaning of
+  `Enter` mid-reply: interrupt. Stopping (the ■ button or `Esc`) always drops the
+  line-up, with the texts listed in the transcript so nothing is silently lost.
 - `EFFORT` — reasoning-effort ceiling for overlay sessions: `"low"`, `"medium"`,
   `"high"`, `"xhigh"`, `"max"`, or `""` (default) to inherit your CLI's setting
   (`effortLevel` in `~/.claude/settings.json`, or the CLI default). The same dial as the

@@ -433,6 +433,14 @@ def _binding_window(windows):
     return dict(windows[best[0]], window=best[0]) if best else None
 
 
+_QUEUE_POLL_MS = 400              # how often a blocked line-up re-checks whether it may flush
+                                  # (turn still streaming, compaction, a held allowance, a dead
+                                  # login). Event hooks do the normal-path work; this poll only
+                                  # exists so a hold that clears without an event can't strand
+                                  # queued messages forever.
+_QUEUE_ROWS_SHOWN = 3             # queued-message rows drawn above the input box; the rest
+                                  # collapse into one "＋N more queued" line so a long line-up
+                                  # can't push the input off a short window.
 _RETRY_POLL_MS = 60_000           # how often an armed retry checks the clock. A single long
                                   # after() would be the obvious choice and the wrong one: Tk
                                   # timers don't run while the machine sleeps, so a laptop
@@ -533,6 +541,15 @@ class Overlay:
                                         # the allowance to come back (see _offer_retry)
         self._retry_btn = None          # the in-chat arm/cancel button for it
         self._retry_after = None        # pending after() id for the poll tick
+        self._queue: list = []          # messages typed while a reply was streaming, each a
+                                        # dict from _collect_send; sent one per finished turn
+                                        # (the CLI's type-ahead queue). See _send_or_queue.
+        self._queue_rows: list = []     # the row widgets currently drawn above the input box
+        self._queue_after = None        # pending after() id for the line-up's poll tick
+        self._queue_hold = None         # "rate" → a refused allowance holds the flush (the
+                                        # quota event releases it); a dead login holds via
+                                        # the live _auth_dead flag instead
+        self._queue_held = False        # the hold has been announced + rows restyled ⏸
         self._claude_header = False
         self._thinking_active = False   # a thinking block is open in the current turn
         # streaming-Markdown renderer state (per turn): the current unfinished answer line
@@ -1409,14 +1426,20 @@ class Overlay:
         wrap.pack(fill="x", side="bottom")
         self.input_wrap = wrap
         self.in_h = self.px(62)
+        # The line-up strip: queued messages render here, directly above the input box
+        # (packed with before=self.canvas only while the queue is non-empty).
+        self.queue_frame = tk.Frame(wrap, bg=T["bg"])
         self.canvas = tk.Canvas(wrap, bg=T["bg"], height=self.in_h, highlightthickness=0)
         self.canvas.pack(fill="x", padx=self.px(12), pady=self.px(2))
+        # Width changes move the truncation point of every queued row — re-clip on resize.
+        wrap.bind("<Configure>", self._refresh_queue, add="+")
         self.entry = tk.Text(self.canvas, bg=T["field"], fg=T["text"], bd=0, height=2,
                              wrap="word", font=self.f_body, insertbackground=T["accent"],
                              highlightthickness=0, padx=0, pady=0)
         self.entry_win = self.canvas.create_window(0, 0, window=self.entry, anchor="nw")
         self.entry.bind("<Return>", self._on_return)
         self.entry.bind("<KP_Enter>", self._on_return)
+        self.entry.bind("<Escape>", self._on_escape)
         self.entry.bind("<Control-v>", self._on_paste)
         self.entry.bind("<Control-V>", self._on_paste)
         self.entry.bind("<Shift-Insert>", self._on_paste)
@@ -2253,6 +2276,10 @@ class Overlay:
             f.configure(size=-max(self.px(7), int(round(self.px(base) * self.zoom))))
         try:
             self._layout_input()
+        except Exception:
+            pass
+        try:
+            self._refresh_queue()  # the small font just changed size → re-clip queued rows
         except Exception:
             pass
         self._rezoom_embeds()      # redraw embedded canvases (bubbles/chips/tables/Copy) at new zoom
@@ -3873,8 +3900,19 @@ class Overlay:
     def _on_return(self, e):
         if e.state & 0x0001:
             return
-        self._send_or_stop()
+        self._send_or_queue()
         return "break"
+
+    def _on_escape(self, e=None):
+        """Esc in the box: Stop the streaming reply (which also drops the line-up — see
+        _send_or_stop); with nothing streaming, clear any queued messages instead."""
+        if self.busy:
+            self._send_or_stop()
+            return "break"
+        if self._queue:
+            self._drop_queue(note="⏹ Cleared")
+            return "break"
+        return None
 
     # ── the CLI's login ──
     _AUTH_FIX = "claude auth login"      # the one command that repairs it, in a terminal
@@ -3940,12 +3978,51 @@ class Overlay:
         return True
 
     def _send_or_stop(self):
+        """The round button (and Esc): send when idle, STOP while a reply streams. Stopping
+        also drops the line-up — the turn_done that follows an interrupt would otherwise
+        fire the next queued message straight into a conversation the user just halted,
+        which reads as "Stop didn't work"."""
         if self.busy:
             self.worker.interrupt()
             self._set_status("stopping…")
+            self._drop_queue(note="⏹ Stopped")
             return
         if self._auth_blocks_send():     # BEFORE anything is consumed (text, shot, attachments)
             return
+        item = self._collect_send()
+        if item is None:
+            return
+        self._queue_hold = None          # a deliberate send outranks a rate hold: the user
+                                         # is choosing to try the wire again right now
+        self._deliver(item)
+
+    def _send_or_queue(self):
+        """Enter: send — or, while a reply is streaming, line the message up the way the
+        Claude Code CLI does, so typing ahead never interrupts the turn in flight. Queued
+        messages go out one per finished turn, in order (see _queue_tick). Enter never
+        interrupts; Stop lives on the round button and Esc."""
+        if not (self.busy and QUEUE_MESSAGES):
+            self._send_or_stop()
+            return
+        if self._auth_blocks_send():     # queueing onto a dead login would just hold forever
+            return
+        if len(self._queue) >= MAX_QUEUED:
+            self.add_err(f"⏳ The line-up is full ({MAX_QUEUED} messages) — "
+                         "your text is still in the box.")
+            return
+        item = self._collect_send()
+        if item is None:
+            return
+        self._queue.append(item)
+        self._refresh_queue()
+        self._queue_kick()               # covers the race where the turn ended between the
+                                         # keypress and here — otherwise turn_done kicks
+
+    def _collect_send(self):
+        """Consume the box + attachments + a screen grab into one send-ready payload, or
+        None when there is nothing to send. The screenshot is taken HERE — at the moment
+        the user hit Enter — not when a queued message finally goes out: the screen they
+        were looking at while typing is the one the message is about."""
         text = self._entry_text()
         shots = None
         if self.auto_shot:
@@ -3959,17 +4036,28 @@ class Overlay:
         self._precaptured = None
         images = list(self.pending_images)
         if not text and not shots and not images:
-            return
+            return None
         self.pending_shot = None
         self.pending_images = []
         self._refresh_attach()
         self.entry.delete("1.0", "end")
         self._ph_active = False
+        self._cancel_retry()               # sending (or queueing) by hand IS the retry —
+                                           # whether this is the armed message or a different
+                                           # one, the schedule has been overtaken and must
+                                           # not fire later on its own
+        return {"text": text, "shots": shots, "images": images,
+                "auto": bool(self.auto_shot)}
+
+    def _deliver(self, item):
+        """Hand one collected payload to the worker — the second half of what the send
+        button used to do inline; the line-up re-enters here as each turn ahead finishes.
+        Dedupe runs NOW, not at collect time: it compares against the baseline the model
+        verifiably holds, and for a queued message that baseline can change while it waits
+        (the turn ahead may attach its own screenshots)."""
+        text, shots, images = item["text"], item["shots"], item["images"]
         self._last_sent = (text, images)   # a turn refused for allowance never reached Claude;
                                            # _restore_draft hands the text back (see "result")
-        self._cancel_retry()               # sending by hand IS the retry — whether this is the
-                                           # armed message or a different one, the schedule has
-                                           # been overtaken and must not fire later on its own
         # Auto-screenshots only: drop any capture that the model already has — the same bytes,
         # or (far more often, since a live desktop never re-encodes identically) the same
         # picture. Re-attaching buys nothing and costs real latency (measured 2026-08:
@@ -3978,7 +4066,7 @@ class Overlay:
         # it" and is never deduped. Legacy "read" mode isn't either: its old file may already
         # be pruned from disk, so "refer to the previous one" can dangle.
         unchanged = []
-        if self.auto_shot and shots and IMAGE_INPUT == "inline":
+        if item.get("auto") and shots and IMAGE_INPUT == "inline":
             shots, unchanged = self._dedupe_shots(shots)
         n = (len(shots) if shots else 0) + len(images)
         label = text if text else "(look at my screens)"
@@ -3999,6 +4087,167 @@ class Overlay:
         else:
             self.worker.ask(self._build_prompt(text, shots, images), [])
         self._set_busy(True)
+
+    # ── the type-ahead line-up (the CLI's message queue) ──
+    def _queue_kick(self):
+        """Nudge the line-up: schedule one _queue_tick shortly. An after() rather than an
+        inline call so a kick from inside an event batch (turn_done is one of several
+        events a finished turn delivers) lets the whole batch drain before the next
+        message goes out — flushing synchronously at "result" would race the trailing
+        turn_done into marking the NEW turn idle."""
+        if not self._queue:
+            return
+        if self._queue_after is not None:
+            try:
+                self.root.after_cancel(self._queue_after)
+            except Exception:
+                pass
+            self._queue_after = None
+        try:
+            self._queue_after = self.root.after(50, self._queue_tick)
+        except Exception:
+            self._queue_after = None
+
+    def _queue_tick(self):
+        """Flush ONE queued message if nothing blocks it, else keep polling. One per tick
+        on purpose: the next flush waits for this turn's turn_done, which is what keeps
+        the transcript ordered user → reply → user → reply."""
+        if self._queue_after is not None:
+            try:
+                self.root.after_cancel(self._queue_after)
+            except Exception:
+                pass
+            self._queue_after = None
+        if not self._queue:
+            return
+        reason = None
+        if self._auth_dead:
+            reason = "the CLI's login is dead (sign in again and they'll go)"
+        elif self._queue_hold == "rate":
+            reason = "the allowance refused the last message; they go when it reopens"
+        if reason:
+            if not self._queue_held:      # announce a hold once per onset, not per tick
+                self._queue_held = True
+                self.add_sys(f"⏸ {len(self._queue)} queued message(s) on hold — {reason}.")
+                self._refresh_queue()
+            self._queue_after = self.root.after(_QUEUE_POLL_MS, self._queue_tick)
+            return
+        if self._queue_held:
+            self._queue_held = False
+            self._refresh_queue()
+        if self.busy or self._compacting or self._discard_pending:
+            self._queue_after = self.root.after(_QUEUE_POLL_MS, self._queue_tick)
+            return
+        item = self._queue.pop(0)
+        self._refresh_queue()
+        self._deliver(item)
+
+    def _drop_queue(self, note=None):
+        """Empty the line-up. With a note, the texts aren't thrown away silently: they're
+        listed in the transcript (where they can be copied back), and the first one goes
+        back into the box if it's free. Returns how many were dropped."""
+        if not self._queue:
+            return 0
+        dropped, self._queue = self._queue, []
+        self._queue_held = False
+        self._queue_hold = None
+        self._refresh_queue()
+        if note:
+            lines = "\n".join("    • " + self._one_line(q["text"] or "(look at my screens)", 90)
+                              for q in dropped)
+            self.add_sys(f"{note} — {len(dropped)} queued message(s) were not sent:\n{lines}")
+            first = dropped[0]["text"]
+            if first and not self._entry_text():
+                self._ph_out()
+                self.entry.insert("1.0", first)
+                self._ph_active = False
+                self.entry.configure(fg=T["text"])
+        return len(dropped)
+
+    def _drop_queued(self, item):
+        """The row's ✕. Not just a discard: the text goes back into an EMPTY box, so the
+        natural gesture — queue it, spot the typo, click ✕, fix, Enter — costs nothing.
+        A box with something in it outranks the reclaimed text, which is simply dropped."""
+        self._queue = [q for q in self._queue if q is not item]
+        if not self._queue:
+            self._queue_held = False
+            self._queue_hold = None
+        self._refresh_queue()
+        if item["text"] and not self._entry_text():
+            self._ph_out()
+            self.entry.insert("1.0", item["text"])
+            self._ph_active = False
+            self.entry.configure(fg=T["text"])
+
+    @staticmethod
+    def _one_line(s, n):
+        s = " ".join(str(s).split())
+        return s if len(s) <= n else s[:n] + "…"
+
+    def _queue_row_text(self, item, glyph):
+        """One row's label, measure-clipped to the strip's width: a Label never wraps, and
+        an over-long request could otherwise push the window wider (or clip the ✕ off the
+        edge, taking the remove affordance with it)."""
+        body = " ".join((item["text"] or "(look at my screens)").split())
+        n = (len(item["shots"]) if item["shots"] else 0) + len(item["images"])
+        tail = ((f"  🖼×{n}" if n > 1 else "  🖼") if n else "")
+        try:
+            w = self.input_wrap.winfo_width()
+        except Exception:
+            w = 0
+        avail = max(self.px(120), (w if w > 1 else self.px(420)) - self.px(90))
+        if self.f_small.measure(f"{glyph} {body}{tail}") <= avail:
+            return f"{glyph} {body}{tail}"
+        while len(body) > 1 and self.f_small.measure(f"{glyph} {body}…{tail}") > avail:
+            body = body[:max(1, int(len(body) * 0.9))]
+        return f"{glyph} {body}…{tail}"
+
+    def _refresh_queue(self, _e=None):
+        """Rebuild the line-up strip above the input box: one dimmed row per queued message,
+        each with its own ✕, capped at _QUEUE_ROWS_SHOWN rows plus a "＋N more" line.
+        Labels rather than canvases: they re-measure themselves when the shared small font
+        zooms, and there are at most four of them. Hidden entirely while the queue is empty."""
+        frame = getattr(self, "queue_frame", None)
+        if frame is None:
+            return
+        for w in self._queue_rows:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._queue_rows = []
+        if not self._queue:
+            try:
+                frame.pack_forget()
+            except Exception:
+                pass
+            return
+        try:
+            frame.pack(fill="x", side="top", before=self.canvas,
+                       padx=self.px(24), pady=(self.px(2), 0))
+        except Exception:
+            return
+        glyph = "⏸" if self._queue_held else "⏳"
+        shown = self._queue[:_QUEUE_ROWS_SHOWN]
+        for item in shown:
+            row = tk.Frame(frame, bg=T["bg"])
+            row.pack(fill="x")
+            x = tk.Label(row, text="✕", bg=T["bg"], fg=T["faint"], font=self.f_small,
+                         cursor="hand2")
+            x.pack(side="right", padx=(self.px(6), 0))
+            x.bind("<Button-1>", lambda e, it=item: self._drop_queued(it))
+            x.bind("<Enter>", lambda e, w=x: w.configure(fg=T["accent"]))
+            x.bind("<Leave>", lambda e, w=x: w.configure(fg=T["faint"]))
+            lbl = tk.Label(row, text=self._queue_row_text(item, glyph), bg=T["bg"],
+                           fg=T["muted"], font=self.f_small, anchor="w")
+            lbl.pack(side="left")
+            self._queue_rows.append(row)
+        more = len(self._queue) - len(shown)
+        if more:
+            lbl = tk.Label(frame, text=f"＋{more} more queued", bg=T["bg"], fg=T["faint"],
+                           font=self.f_small, anchor="w")
+            lbl.pack(fill="x")
+            self._queue_rows.append(lbl)
 
     @staticmethod
     def _shot_key(s):
@@ -4396,6 +4645,9 @@ class Overlay:
                                         # (the quota reading itself survives: the allowance is
                                         # the account's, not this conversation's)
         self._cancel_retry()            # …and its scheduled retry must not fire into the new one
+        self._drop_queue(note="🔄 Cleared")  # queued messages belong to the discarded
+                                        # conversation; the note lands in the fresh transcript
+                                        # (the chat was wiped above) so the texts survive
         self._refresh_statusline()
         # Clear = deliberate discard: forget the session AND its persisted record, so
         # the next launch can't offer to resume a conversation the user threw away.
@@ -5479,6 +5731,12 @@ class Overlay:
             if r and r.get("armed") and (self._quota or {}).get("status") not in (None, "rejected"):
                 r["ready"] = True     # sticky: if we're mid-turn right now, the next tick uses it
                 self._retry_tick()
+            # The same signal releases a held line-up: the CLI itself no longer reports the
+            # allowance as rejected, so queued messages may go back on the wire.
+            if self._queue_hold == "rate" and \
+                    (self._quota or {}).get("status") not in (None, "rejected"):
+                self._queue_hold = None
+                self._queue_kick()
         elif kind == "quota_poll":
             # usage.py asked the allowance endpoint itself, so the gauge is right without
             # having to send a message first. Display only, and on purpose: no announcement
@@ -5501,6 +5759,8 @@ class Overlay:
             if not self._discard_pending:
                 self._persist_session()  # this conversation is now the resumable one
                                          # (skipped for a turn Cleared mid-flight)
+            self._queue_kick()           # turn_done is always a turn's LAST event (worker
+                                         # emits it in a finally), so the line-up may flush
         elif kind == "session":
             if not self._discard_pending:   # ignore a stale id from a Cleared conversation
                 self._session_id = str(payload)
@@ -5558,6 +5818,8 @@ class Overlay:
             # Compaction may summarize the previous screenshot right out of the context;
             # "screen unchanged, keep using it" would then point at nothing. Attach fresh.
             self._forget_sent_shots()
+            self._queue_kick()           # compaction ends without a turn_done; messages
+                                         # queued during it flush here
         elif kind == "auto_compacted":
             # Same as compact_done, but for the CLI's AUTOMATIC mid-stream compaction —
             # there is no banner/animation for it, only the cache consequence.
@@ -5586,6 +5848,11 @@ class Overlay:
                 if "rate_limit" in str(payload.get("subtype") or "") and self._restore_draft():
                     self.add_sys("↩ Your message is back in the box.")
                     self._offer_retry((self._last_sent or ("", []))[0])
+                if "rate_limit" in str(payload.get("subtype") or "") and self._queue:
+                    self._queue_hold = "rate"   # flushing the line-up into a closed allowance
+                                                # would burn every message the same way; the
+                                                # quota event releases the hold the moment the
+                                                # CLI stops saying "rejected"
                 # This turn's screenshots may never have reached the model — drop their
                 # staged hashes so the next send re-attaches instead of saying "unchanged".
                 # (Hashes already COMMITTED by earlier clean turns stay: an errored turn

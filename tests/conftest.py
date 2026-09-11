@@ -109,7 +109,7 @@ def _clean_overlay(ov):
     # Cancel any after() timers a prior test may have scheduled (zoom re-render, region
     # re-apply, compaction animation, precapture) so none fires mid-next-test.
     for _attr in ("_rezoom_after", "_round_after", "_compact_anim_after",
-                  "_precapture_after"):
+                  "_precapture_after", "_queue_after"):
         _tid = getattr(ov, _attr, None)
         if _tid is not None:
             try:
@@ -122,6 +122,9 @@ def _clean_overlay(ov):
             ov.toggle_collapse()        # back to expanded
     except Exception:
         pass
+    ov._queue = []                      # BEFORE reset(): a leaked line-up would otherwise be
+    ov._queue_hold = None               # dropped-with-a-note into the freshly wiped chat and
+    ov._queue_held = False              # leave the next test a non-empty transcript
     try:
         ov.reset()                      # clears chat + md state + badge + compact banner
     except Exception:
@@ -146,6 +149,10 @@ def _clean_overlay(ov):
     ov.pending_images = []
     ov.pending_shot = None
     ov._precaptured = None
+    try:
+        ov._refresh_queue()             # the line-up strip must not stay packed above the input
+    except Exception:
+        pass
     ov._sent_shot_hashes = {}           # screenshot dedupe memory must not leak across tests
     ov._pending_shot_hashes = {}        # nor the in-flight (uncommitted) staging dict
     ov._discard_pending = False         # reset() sets it True; a real run clears it on the
