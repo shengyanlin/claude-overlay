@@ -3,6 +3,33 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.20.0] - 2026-09-11
+
+Type ahead. Enter while Claude is answering no longer cuts the reply off — it lines
+the message up, the way the Claude Code CLI does.
+
+### Added
+- **A type-ahead message queue.** `Enter` mid-reply queues the message instead of
+  interrupting: keep typing two or three follow-ups and they go out one per finished
+  reply, in order. Queued messages show as dimmed ⏳ rows directly above the input box
+  (up to three, then "＋N more queued"); each row's **✕** hands its text back to an
+  empty box — queue it, spot the typo, ✕, fix, Enter. The auto-screenshot is taken at
+  the moment you hit Enter, not when the message finally goes out: the screen you were
+  looking at while typing is the one the message is about. Screenshot dedupe still runs
+  at send time, against whatever the model actually holds by then.
+- **`Esc` stops a streaming reply** (the round button still does too). Stopping — or
+  Clear — also drops the line-up, deliberately: the end-of-turn that follows an
+  interrupt would otherwise fire the next queued message straight into a conversation
+  you just halted, which reads as "Stop didn't work". Nothing is lost silently: the
+  dropped texts are listed in the transcript (copyable), and the first goes back into
+  the box if it's free. `Esc` with nothing streaming clears the queue.
+- **The queue holds itself when sending would only fail.** A message refused for
+  allowance pauses the line-up (⏸) until the CLI itself stops reporting the allowance
+  as rejected — flushing into a closed window would burn every queued message the same
+  way. A signed-out CLI holds it too, and it resumes on its own once you're signed in.
+- **`QUEUE_MESSAGES`** in `config.json` — set `false` to restore the old meaning of
+  `Enter` mid-reply: interrupt.
+
 ## [1.19.1] - 2026-09-07
 
 From a field report: the model switcher offered Fable to someone whose account has no
