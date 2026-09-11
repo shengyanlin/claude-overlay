@@ -438,7 +438,7 @@ _QUEUE_POLL_MS = 400              # how often a blocked line-up re-checks whethe
                                   # login). Event hooks do the normal-path work; this poll only
                                   # exists so a hold that clears without an event can't strand
                                   # queued messages forever.
-_QUEUE_ROWS_SHOWN = 3             # queued-message rows drawn above the input box; the rest
+_QUEUE_ROWS_SHOWN = 6             # queued-message rows drawn above the input box; the rest
                                   # collapse into one "＋N more queued" line so a long line-up
                                   # can't push the input off a short window.
 _RETRY_POLL_MS = 60_000           # how often an armed retry checks the clock. A single long
