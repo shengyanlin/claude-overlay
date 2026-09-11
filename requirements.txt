@@ -1,3 +1,22 @@
+# Floors, not pins - and this file is what setup.cmd / update.cmd actually install.
+#
+# It used to say the same thing while both scripts ran
+# `pip install --upgrade claude-agent-sdk pillow keyboard` with the versions hardcoded, so
+# this file constrained nobody. That was the bug: not the absence of a ceiling, but that
+# nothing read the file. Fixed by installing from here; the floors below are unchanged.
+#
+# Deliberately NOT pinned:
+#  - claude-agent-sdk drives the locally installed `claude` CLI, which updates itself on
+#    its own schedule. Freezing one half of a pair where the other half keeps moving
+#    causes incompatibility rather than preventing it.
+#  - CI installs from this file on a clean runner, so a floor means every run tests the
+#    NEWEST SDK and `preflight.py` proves the app still loads against it. A pin would make
+#    CI test a version no new user would ever get, which is worse than no check at all.
+#  - Nothing in 0.2.x has ever broken this app. The real requirement is a floor: worker.py
+#    needs `StreamEvent`, first exported in 0.1.49.
+#
+# If a future SDK release does break something, the fix is a ceiling added in response to
+# it - with the failure named in a comment here - not a standing freeze.
 claude-agent-sdk>=0.2.87
 pillow>=10.0
 keyboard>=0.13.5

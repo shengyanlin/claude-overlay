@@ -7,12 +7,15 @@ import ctypes
 import ctypes.wintypes as wt
 import json
 import os
+import shutil
 import subprocess
 import sys
 
 from config import TASKBAR_BUTTON, APP_ID, APP_ICON
 
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+_CREATE_NEW_CONSOLE = 0x00000010 if sys.platform == "win32" else 0
+_REPO_DIR = os.path.dirname(os.path.abspath(__file__))   # this file lives in the app folder
 
 def set_dpi_awareness():
     """Make the process DPI-aware so 1 Tk pixel == 1 physical pixel (crisp, no
@@ -299,6 +302,68 @@ def relaunch_overlay(script_path):
     return p.pid
 
 
+def can_self_update(repo=None):
+    """True when update.cmd could actually update THIS install in place: the app folder is a git
+    clone and git is on PATH. A ZIP download has nothing to pull -- update.cmd would only print
+    the "re-download the ZIP" instructions -- so the UI asks this BEFORE offering an update
+    button, rather than handing the user one whose whole job is to open a console and say no.
+    Never raises; a False here just means the user is told to update the manual way."""
+    try:
+        repo = repo or _REPO_DIR
+        return (os.path.exists(os.path.join(repo, "update.cmd"))
+                and os.path.exists(os.path.join(repo, ".git"))    # a worktree's .git is a FILE
+                and shutil.which("git") is not None)
+    except Exception:
+        return False
+
+
+def run_overlay_update(repo=None):
+    """Run the app folder's update.cmd IN ITS OWN CONSOLE WINDOW and wait for it. Returns
+    (ok, message); ok only for exit code 0. Never raises. Call this off the UI thread.
+
+    WHY A VISIBLE CONSOLE, not a captured silent run. update.cmd is the one sanctioned updater
+    (pull -> packages -> a preflight that proves the new code still loads), and every failure
+    path inside it ends in `pause` with the fix on screen -- no git, not a clone, a pull that
+    conflicts with local edits, no Python, pip blocked by a proxy. Capturing that output would
+    leave us either re-stating those instructions here (the exact drift that once split
+    requirements.txt from a hand-written package list) or reporting "update failed" with nothing
+    the user can act on. So the console IS the progress and error UI; we watch only the exit
+    code, which update.cmd propagates through both of its re-exec hops.
+
+    WHY OV_UPDATE_AUTO. update.cmd's success exit used to end in `pause`, so this wait() only
+    returned once somebody pressed a key in the console -- meanwhile the caller's button sat on
+    "Updating..." and an update that had already worked looked hung. The env var tells update.cmd
+    it was started by the app rather than double-clicked, and it skips THAT pause only. Its
+    failure paths still pause on purpose: the console is the error UI, and a window that closes
+    itself takes the fix with it.
+
+    WHY STILL NO TIMEOUT. A failing update legitimately waits at a `pause` for as long as the
+    user takes to read it, and a slow pip on a slow link can take minutes; any timeout we picked
+    would eventually report a finished update as a failure.
+
+    The overlay does NOT need to be closed first: Python already holds the current modules in
+    memory, so pulling underneath a running instance is safe -- the new code simply doesn't take
+    effect until a restart, which is what the caller offers once this returns ok."""
+    repo = repo or _REPO_DIR
+    script = os.path.join(repo, "update.cmd")
+    if not os.path.exists(script):
+        return (False, "update.cmd is missing from the app folder")
+    try:
+        # cmd /c, because CreateProcess cannot exec a .cmd shim directly. CREATE_NEW_CONSOLE
+        # because under pythonw there is no console to inherit -- without one the updater's
+        # output, and every `pause` prompt in it, would go nowhere.
+        env = dict(os.environ)
+        env["OV_UPDATE_AUTO"] = "1"          # see WHY OV_UPDATE_AUTO above
+        p = subprocess.Popen(["cmd", "/c", script], cwd=repo, env=env,
+                             creationflags=_CREATE_NEW_CONSOLE)
+        rc = p.wait()
+    except Exception as e:
+        return (False, f"couldn't run update.cmd ({type(e).__name__})")
+    if rc == 0:
+        return (True, "")
+    return (False, f"update.cmd stopped with exit code {rc} - its window says why")
+
+
 # Win32 region calls — set argtypes so 64-bit handles aren't truncated.
 _gdi32, _user32 = ctypes.windll.gdi32, ctypes.windll.user32
 _gdi32.CreateRoundRectRgn.restype = wt.HRGN
@@ -422,6 +487,134 @@ def virtual_screen_metrics():
                 g(SM_CXVIRTUALSCREEN), g(SM_CYVIRTUALSCREEN))
     except Exception:
         return None
+
+
+# ── active-window capture (SHOT_SCOPE="window") ────────────────────────────────
+# Everything needed to answer "which window is the user actually working in, and what
+# rectangle of the screen does it cover?" — used when screenshots are scoped to the
+# active window instead of every monitor.
+_user32.IsWindow.argtypes = [wt.HWND]
+_user32.IsWindow.restype = wt.BOOL
+_user32.IsWindowVisible.argtypes = [wt.HWND]
+_user32.IsWindowVisible.restype = wt.BOOL
+_user32.IsIconic.argtypes = [wt.HWND]
+_user32.IsIconic.restype = wt.BOOL
+_user32.GetWindowRect.argtypes = [wt.HWND, ctypes.c_void_p]
+_user32.GetWindowRect.restype = wt.BOOL
+_user32.GetWindowTextLengthW.argtypes = [wt.HWND]
+_user32.GetWindowTextLengthW.restype = ctypes.c_int
+_user32.GetWindowTextW.argtypes = [wt.HWND, ctypes.c_wchar_p, ctypes.c_int]
+_user32.GetWindowTextW.restype = ctypes.c_int
+_user32.GetShellWindow.restype = wt.HWND
+_user32.GetDesktopWindow.restype = wt.HWND
+_kernel32 = ctypes.windll.kernel32
+_kernel32.GetCurrentProcessId.restype = wt.DWORD
+GA_ROOT = 2
+# DWMWA_EXTENDED_FRAME_BOUNDS is the window's VISIBLE frame — unlike GetWindowRect it
+# excludes the drop shadow and the invisible resize borders, so the capture doesn't
+# include a strip of whatever sits behind the window. dwmapi guarded: it exists on
+# every supported Windows, but a load failure must degrade to GetWindowRect, not crash.
+DWMWA_EXTENDED_FRAME_BOUNDS = 9
+try:
+    _dwmapi = ctypes.windll.dwmapi
+    _dwmapi.DwmGetWindowAttribute.argtypes = [wt.HWND, wt.DWORD, ctypes.c_void_p, wt.DWORD]
+    _dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+except Exception:
+    _dwmapi = None
+
+
+def window_is_own(hwnd):
+    """True when the window belongs to THIS process (the overlay itself — including the
+    collapsed orb): never a capture target, we want what the user is working in."""
+    try:
+        pid = wt.DWORD(0)
+        tid = _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)) if hwnd else 0
+        if not tid or not pid.value:
+            return True   # lookup failed → can't tell whose window this is
+        return pid.value == _kernel32.GetCurrentProcessId()
+    except Exception:
+        return True     # can't tell → treat as our own so it's never captured by mistake
+
+
+def window_capturable(hwnd):
+    """A window that still makes sense to screenshot: exists, visible, not minimized
+    (a minimized window's rect is a meaningless off-screen stub)."""
+    try:
+        return bool(hwnd and _user32.IsWindow(hwnd) and _user32.IsWindowVisible(hwnd)
+                    and not _user32.IsIconic(hwnd))
+    except Exception:
+        return False
+
+
+def foreground_capture_window():
+    """The top-level foreground window as a capture target, or None when the foreground
+    is unusable: this process (the user is typing in the overlay), the desktop/shell
+    (nothing focused), or a window that's gone/minimized. The caller falls back to the
+    last tracked external window, then to full-screen capture."""
+    try:
+        fg = _user32.GetForegroundWindow()
+        if not fg:
+            return None
+        fg = _user32.GetAncestor(fg, GA_ROOT) or fg
+        if fg in (_user32.GetShellWindow(), _user32.GetDesktopWindow()):
+            return None
+        if window_is_own(fg) or not window_capturable(fg):
+            return None
+        return fg
+    except Exception:
+        return None
+
+
+def window_title(hwnd):
+    """The window's title bar text ('' on failure) — labels the shot for the model."""
+    try:
+        n = _user32.GetWindowTextLengthW(hwnd)
+        if n <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(n + 1)
+        _user32.GetWindowTextW(hwnd, buf, n + 1)
+        return buf.value
+    except Exception:
+        return ""
+
+
+def clamp_bbox(rect, vbox):
+    """Intersect a window rect (l,t,r,b) with the virtual-desktop box (x,y,w,h) so a
+    half-dragged-offscreen window grabs only its visible part; None when the visible
+    overlap is degenerate (<8px a side — nothing worth sending). Pure math, no Win32."""
+    if not rect:
+        return None
+    l, t, r, b = rect
+    if vbox:
+        x, y, w, h = vbox
+        l, t = max(l, x), max(t, y)
+        r, b = min(r, x + w), min(b, y + h)
+    if r - l < 8 or b - t < 8:
+        return None
+    return (l, t, r, b)
+
+
+def window_bbox(hwnd):
+    """Screen-space (l,t,r,b) of a window suitable for ImageGrab(all_screens=True):
+    DWM extended frame bounds (visible frame, no shadow) with GetWindowRect as the
+    fallback, clipped to the virtual desktop. None when it can't be determined."""
+    rect = None
+    if _dwmapi is not None:
+        rc = wt.RECT()
+        try:
+            if _dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                             ctypes.byref(rc), ctypes.sizeof(rc)) == 0:
+                rect = (rc.left, rc.top, rc.right, rc.bottom)
+        except Exception:
+            rect = None
+    if rect is None:
+        rc = wt.RECT()
+        try:
+            if _user32.GetWindowRect(hwnd, ctypes.byref(rc)):
+                rect = (rc.left, rc.top, rc.right, rc.bottom)
+        except Exception:
+            rect = None
+    return clamp_bbox(rect, virtual_screen_metrics())
 
 
 def _mon_rect(m):

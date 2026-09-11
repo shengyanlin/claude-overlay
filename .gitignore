@@ -32,3 +32,10 @@ Thumbs.db
 # Inbound contribution archives (kept locally as provenance only - may carry a
 # contributor's private email / unsanitized patch; never commit to the public repo)
 *-submission.zip
+
+# Pre-staged installer artifacts for machines whose proxy refuses the download
+# (see offline/README.md). The folder and its README are tracked; the binaries are not --
+# they are tens of MB, they go stale, and every user should fetch the build for their own
+# architecture rather than inherit whichever one happened to get committed.
+offline/*.zip
+offline/*.tar.gz

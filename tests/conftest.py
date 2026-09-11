@@ -15,8 +15,16 @@ shown: no flash, no focus steal). Skips cleanly if Tk has no display.
 import os
 import queue
 import sys
+import tempfile
 
 import pytest
+
+# Isolate the whole suite from THIS machine's personal config.json overrides: the unit
+# tests assert the COMMITTED defaults, and the UI suite must not inherit a personal
+# theme/permission mode. Point the override loader at a path that can't exist — set
+# BEFORE the first `import config` anywhere (conftest imports before test modules).
+os.environ["CLAUDE_OVERLAY_CONFIG"] = os.path.join(
+    tempfile.gettempdir(), "claude_overlay_test_no_user_config", "config.json")
 
 # Belt-and-suspenders for the one Tk init (and any stray second root): pin the Tcl/Tk
 # library dirs so the interpreter always finds them.
@@ -34,10 +42,11 @@ class FakeWorker:
     """Stand-in for ClaudeWorker: stores the UI queue, records calls for assertions,
     starts no thread and connects to nothing."""
 
-    def __init__(self, ui_queue):
+    def __init__(self, ui_queue, permission_mode=None):
         self.ui = ui_queue
         self.req = queue.Queue()
         self.calls = []
+        self.permission_mode = permission_mode   # launch mode the Overlay asked for
 
     def _rec(self, name, *a):
         self.calls.append((name, a))
@@ -47,6 +56,8 @@ class FakeWorker:
     def reset(self):            self._rec("reset")
     def compact(self):          self._rec("compact")
     def set_model(self, *a):    self._rec("set_model", *a)
+    def resume(self, *a):       self._rec("resume", *a)
+    def set_permission_mode(self, *a):  self._rec("set_permission_mode", *a)
     def interrupt(self):        self._rec("interrupt")
     def shutdown(self):         self._rec("shutdown")
     def join(self, *a, **k):    self._rec("join")
@@ -61,6 +72,17 @@ def _overlay_singleton():
     mp.setattr(co, "ClaudeWorker", FakeWorker)
     mp.setattr(co.Overlay, "_register_hotkey", lambda self: None)
     mp.setattr(co.Overlay, "_check_for_update", lambda self: None)
+    # No usage-endpoint polling: the suite must not reach the network, and must not read
+    # this machine's real OAuth token. The Overlay still BUILDS its Poller, so the wiring
+    # stays under test; only the thread never starts. Patched on the Overlay rather than on
+    # usage.Poller because this fixture is session-scoped — stubbing the class here would
+    # leave it stubbed for every later unit test of the class itself.
+    mp.setattr(co.Overlay, "_start_usage_poll", lambda self: None)
+    # Point the persisted-UI-state store at a throwaway path: the suite must neither
+    # read this machine's real toggle state nor overwrite it from toggle tests.
+    import tempfile
+    from pathlib import Path as _Path
+    mp.setattr(co, "STATE_FILE", _Path(tempfile.mkdtemp(prefix="ov_state_")) / "state.json")
     try:
         ov = co.Overlay()
     except Exception as e:
@@ -87,7 +109,7 @@ def _clean_overlay(ov):
     # Cancel any after() timers a prior test may have scheduled (zoom re-render, region
     # re-apply, compaction animation, precapture) so none fires mid-next-test.
     for _attr in ("_rezoom_after", "_round_after", "_compact_anim_after",
-                  "_precapture_after"):
+                  "_precapture_after", "_queue_after"):
         _tid = getattr(ov, _attr, None)
         if _tid is not None:
             try:
@@ -100,6 +122,9 @@ def _clean_overlay(ov):
             ov.toggle_collapse()        # back to expanded
     except Exception:
         pass
+    ov._queue = []                      # BEFORE reset(): a leaked line-up would otherwise be
+    ov._queue_hold = None               # dropped-with-a-note into the freshly wiped chat and
+    ov._queue_held = False              # leave the next test a non-empty transcript
     try:
         ov.reset()                      # clears chat + md state + badge + compact banner
     except Exception:
@@ -110,17 +135,42 @@ def _clean_overlay(ov):
         pass
     # View / per-turn state reset() doesn't cover:
     ov.auto_shot = co.AUTO_SCREENSHOT_DEFAULT
+    ov.window_shot = (co.SHOT_SCOPE == "window")
     ov.share_visible = co.SHOW_IN_SCREEN_SHARE_DEFAULT
+    ov.read_only = (co.PERMISSION_MODE == "plan")
     ov.overlay_name = ""
     ov._model = None
     ov._ctx_pct = None
+    ov._quota = None                    # allowance readings are per-test: a leaked one would
+    ov._quota_polled = None             # take the gauge slot away from the next test's context
+    ov._quota_said = None
+    ov._ring_explained = False          # the ring introduces itself once; a leaked flag would
+                                        # rob the next test of the introduction it is watching
     ov.pending_images = []
     ov.pending_shot = None
     ov._precaptured = None
+    try:
+        ov._refresh_queue()             # the line-up strip must not stay packed above the input
+    except Exception:
+        pass
+    ov._sent_shot_hashes = {}           # screenshot dedupe memory must not leak across tests
+    ov._pending_shot_hashes = {}        # nor the in-flight (uncommitted) staging dict
+    ov._discard_pending = False         # reset() sets it True; a real run clears it on the
+                                        # worker's reset_done, which the fixture never delivers
     ov._capture_busy = False
     ov._paste_busy = False
+    ov._auth_dead = False               # credential-watchdog state: a gate test must not leak
+    ov._auth_told = False               # a "login is dead" verdict into the next test
+    ov._auth_checked = 0.0
     ov._send_hover = False
     ov._thinking_active = False
+    ov._follow = True                   # scroll-follow is a mode; a test that scrolls away
+    ov._unread = False                  # must not leave the next test unable to auto-scroll
+    ov._sb_last = 1.0
+    try:
+        ov._update_jump()               # …and must not leave the jump pill placed on screen
+    except Exception:
+        pass
     try:
         ov._set_busy(False)             # busy flag + Send button image + busy_lbl text, together
     except Exception:

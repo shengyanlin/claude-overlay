@@ -4,6 +4,8 @@ Drives the REAL methods on the `overlay` fixture (session-wide, hidden Tk root,
 FakeWorker that records calls) and asserts on widget state / instance attributes /
 the FakeWorker call log.
 """
+import types
+
 import pytest
 import tkinter as tk
 
@@ -195,21 +197,242 @@ def test_finish_turn_copy_is_idempotent(overlay):
     )
 
 
-def test_copy_btn_puts_text_on_clipboard(overlay):
-    """Clicking the Copy button stores the raw markdown text on the clipboard."""
+def test_copy_btn_puts_text_on_clipboard(overlay, monkeypatch):
+    """Clicking the Copy button replaces the clipboard with that message's raw markdown.
+
+    Two things this deliberately does NOT do, both learned the hard way:
+
+    It does not synthesise a <Button-1>. Tk discards a synthesised button event aimed at a
+    withdrawn widget, and this whole suite runs withdrawn on purpose -- so the handler
+    never ran, and the old assertion compared the expected string against whatever was on
+    the MACHINE's clipboard. It passed because an earlier run of this same test had left
+    that exact string there, and went red the moment somebody copied something else: it
+    reported on the developer's clipboard and never on the Copy button.
+
+    It also does not write to the real clipboard. Tk hands the Windows clipboard out by
+    delayed rendering, so everything it owns is dropped when the interpreter exits -- a
+    suite that copies for real ends by wiping whatever the developer had copied, and no
+    amount of save/restore inside the test can put it back. Recording the calls tests the
+    same contract (clear, then append THIS message's snapshot) and costs the developer
+    nothing.
+    """
     raw = "**hi** there"
+    calls = []
+    monkeypatch.setattr(overlay.root, "clipboard_clear",
+                        lambda *a, **k: calls.append(("clear",)))
+    monkeypatch.setattr(overlay.root, "clipboard_append",
+                        lambda t, *a, **k: calls.append(("append", t)))
+
     btn = overlay._copy_btn(raw)
     overlay.root.update_idletasks()
-    # Retrieve the on_click callback bound to <Button-1> and call it directly.
-    handlers = btn.bind("<Button-1>")
-    # handlers is a Tcl script string; invoke via the widget's event_generate to trigger it.
-    btn.event_generate("<Button-1>", x=1, y=1)
-    overlay.root.update()
-    try:
-        got = overlay.root.clipboard_get()
-    except tk.TclError:
-        pytest.skip("Clipboard not available in this environment")
-    assert got == raw, f"Clipboard expected {raw!r}, got {got!r}"
+    btn._on_click(None)
+
+    # No root.update() here, deliberately. on_click schedules after(1200, restore), which
+    # sets _copied back to False so the button stops saying "Copied" -- and pumping the
+    # event loop lets that fire if the call happens to take longer than 1.2 s, which it
+    # occasionally does. Both assertions are on plain Python state, so there is nothing to
+    # pump for, and not pumping removes the race rather than widening the window.
+    assert btn._copied is True, "the Copy handler did not run"
+    assert calls == [("clear",), ("append", raw)], (
+        f"expected the clipboard to be replaced with {raw!r}, got {calls!r}")
+
+
+# ── user bubble click-to-copy ─────────────────────────────────────────────────
+#
+# Your own messages are DRAWN on a Canvas (create_text), not inserted as text, so Tk has
+# no selection model for them -- they can never be drag-selected the way Claude's replies
+# can. Clicking the bubble copies it instead. These tests pin that down, and follow
+# test_copy_btn_puts_text_on_clipboard's two rules: call the handler directly (a
+# synthesised <Button-1> is dropped on the withdrawn widgets this suite uses) and record
+# the clipboard calls instead of writing to the real clipboard.
+
+def _record_clipboard(overlay, monkeypatch):
+    calls = []
+    monkeypatch.setattr(overlay.root, "clipboard_clear",
+                        lambda *a, **k: calls.append(("clear",)))
+    monkeypatch.setattr(overlay.root, "clipboard_append",
+                        lambda t, *a, **k: calls.append(("append", t)))
+    return calls
+
+
+def test_user_bubble_click_copies_its_text(overlay, monkeypatch):
+    """Clicking your own message bubble replaces the clipboard with that message."""
+    calls = _record_clipboard(overlay, monkeypatch)
+
+    bub = overlay._user_bubble("what did I ask again?")
+    overlay.root.update_idletasks()
+    bub._on_click(None)
+
+    assert bub._copied is True, "the bubble's click handler did not run"
+    assert calls == [("clear",), ("append", "what did I ask again?")], (
+        f"expected the message on the clipboard, got {calls!r}")
+
+
+def test_user_bubble_copies_raw_not_the_clipped_echo(overlay, monkeypatch):
+    """The bubble copies the text as TYPED, not the lossy echo that is drawn.
+
+    _clip_bubble injects a space after every 50 non-whitespace characters so canvas word
+    wrap stays linear, and truncates past 2000 chars. Both are display-only concessions --
+    copying what is on screen would hand back text that no longer round-trips. This uses an
+    unbroken run long enough to trip the space injection, so a regression that copies the
+    drawn string fails here rather than silently corrupting long pastes (URLs, JSON, IDs).
+    """
+    raw = "x" * 120                       # one unbroken run → _clip_bubble will inject spaces
+    assert " " in overlay._clip_bubble(raw), "precondition: _clip_bubble must mangle this input"
+    calls = _record_clipboard(overlay, monkeypatch)
+
+    bub = overlay._user_bubble(raw)
+    overlay.root.update_idletasks()
+    bub._on_click(None)
+
+    assert calls == [("clear",), ("append", raw)], (
+        f"expected the unmangled {len(raw)}-char original, got {calls!r}")
+
+
+def test_user_bubble_copies_full_text_past_the_truncation_cap(overlay, monkeypatch):
+    """A message longer than the 2000-char display cap still copies in full."""
+    raw = "word " * 600                   # 3000 chars → _clip_bubble truncates the echo
+    calls = _record_clipboard(overlay, monkeypatch)
+
+    bub = overlay._user_bubble(raw)
+    overlay.root.update_idletasks()
+    bub._on_click(None)
+
+    assert calls[-1] == ("append", raw), (
+        f"expected all {len(raw)} chars, got {len(calls[-1][1])}")
+
+
+def test_add_user_bubble_is_clickable(overlay, monkeypatch):
+    """The bubble add_user() actually puts in the transcript carries the copy handler.
+
+    _user_bubble() is reachable directly, so the tests above would still pass if add_user
+    had been left wired to something else. This walks the embedded window it really created.
+    """
+    calls = _record_clipboard(overlay, monkeypatch)
+
+    overlay.add_user("a real turn")
+    overlay.root.update_idletasks()
+    bubbles = [overlay.chat.nametowidget(n) for n in overlay.chat.window_names()]
+    bubbles = [b for b in bubbles if getattr(b, "_on_click", None) and hasattr(b, "_copied")]
+    assert bubbles, "add_user() embedded no widget with a copy handler"
+
+    bubbles[-1]._on_click(None)
+    assert calls == [("clear",), ("append", "a real turn")], (
+        f"expected the sent message on the clipboard, got {calls!r}")
+
+
+# ── user bubble partial selection ─────────────────────────────────────────────
+#
+# Whole-bubble copy was only half the gap: Claude's replies are real text in the Text
+# widget, so you can drag-select one sentence out of them. These cover the canvas-side
+# equivalent -- Tk canvas text items DO have a selection model (select_from/select_to),
+# it just has to be driven by hand. Tests call _select_chars rather than synthesising
+# <B1-Motion>, for the same withdrawn-widget reason as the copy-button test above.
+
+def _render_of(overlay, canvas):
+    """The render() closure Ctrl +/− would call for this bubble."""
+    for c, render in overlay._zoomables:
+        if c is canvas:
+            return render
+    raise AssertionError("bubble was never registered as zoomable")
+
+
+def test_user_bubble_selection_yields_that_slice(overlay):
+    """_select_chars(a, b) selects shown[a:b+1] -- Tk canvas selection is inclusive."""
+    bub = overlay._user_bubble("copy only this part please")
+    overlay.root.update_idletasks()
+
+    bub._select_chars(10, 18)
+    assert bub._sel_text() == "this part", f"got {bub._sel_text()!r}"
+
+
+def test_user_bubble_selection_is_a_real_tk_selection(overlay):
+    """The highlight is on the canvas, not just Python bookkeeping.
+
+    _sel_text() slicing a string would pass even if nothing were visibly selected, so this
+    asserts Tk itself reports the message's text item as the selection owner -- that is what
+    makes the highlight appear.
+    """
+    bub = overlay._user_bubble("some words here")
+    overlay.root.update_idletasks()
+
+    assert bub.select_item() is None, "precondition: nothing selected yet"
+    bub._select_chars(0, 3)
+    assert bub.select_item() == bub._item, "Tk does not report the bubble text as selected"
+
+
+def test_user_bubble_ctrl_c_copies_only_the_selection(overlay, monkeypatch):
+    """With part of the bubble highlighted, Ctrl+C copies that part, not the whole message."""
+    calls = _record_clipboard(overlay, monkeypatch)
+    bub = overlay._user_bubble("copy only this part please")
+    overlay.root.update_idletasks()
+
+    bub._select_chars(10, 18)
+    bub._on_ctrl_c(None)
+
+    assert calls == [("clear",), ("append", "this part")], (
+        f"expected just the selected words, got {calls!r}")
+
+
+def test_user_bubble_ctrl_c_without_a_selection_copies_everything(overlay, monkeypatch):
+    """Ctrl+C on an unselected bubble falls back to the whole (raw, unclipped) message."""
+    raw = "x" * 120                       # long unbroken run → the drawn echo is mangled
+    calls = _record_clipboard(overlay, monkeypatch)
+    bub = overlay._user_bubble(raw)
+    overlay.root.update_idletasks()
+
+    bub._on_ctrl_c(None)
+
+    assert calls == [("clear",), ("append", raw)], (
+        f"expected the whole unmangled message, got {calls!r}")
+
+
+def test_selecting_in_one_bubble_clears_the_other(overlay):
+    """Only one bubble may show a highlight; canvas selection is per-canvas so nothing does
+    this for us, and without it old highlights stay lit as you select in newer messages."""
+    first = overlay._user_bubble("first message")
+    second = overlay._user_bubble("second message")
+    overlay.root.update_idletasks()
+
+    first._select_chars(0, 4)
+    assert first.select_item() == first._item, "precondition: first bubble is selected"
+
+    overlay._bubble_sel_clear(keep=second)      # what second's <ButtonPress-1> does
+    second._select_chars(0, 5)
+
+    assert first.select_item() is None, "the first bubble kept its highlight"
+    assert first._sel is None, "the first bubble kept its selection range"
+    assert second.select_item() == second._item, "the second bubble is not selected"
+
+
+def test_clicking_the_transcript_clears_a_bubble_selection(overlay):
+    """Selecting Claude's text in the transcript drops the bubble highlight, so the window
+    never shows two selections at once."""
+    bub = overlay._user_bubble("my message")
+    overlay.root.update_idletasks()
+    bub._select_chars(0, 1)
+    assert bub.select_item() == bub._item, "precondition: bubble is selected"
+
+    overlay._bubble_sel_clear()                 # what the chat Text's <Button-1> does
+
+    assert bub.select_item() is None, "bubble stayed highlighted after clicking the transcript"
+    assert overlay._sel_bubble is None
+
+
+def test_user_bubble_selection_survives_a_re_render(overlay):
+    """Zoom / resize rebuild the bubble with delete("all"), which drops the canvas selection.
+    render() re-applies it, otherwise a Ctrl +/- (or any resize) mid-selection silently loses
+    what you had highlighted.
+    """
+    bub = overlay._user_bubble("copy only this part please")
+    overlay.root.update_idletasks()
+    bub._select_chars(10, 18)
+
+    _render_of(overlay, bub)()                  # what Ctrl +/− triggers
+    overlay.root.update_idletasks()
+
+    assert bub._sel_text() == "this part", f"selection lost across re-render: {bub._sel_text()!r}"
+    assert bub.select_item() == bub._item, "highlight not re-applied to the rebuilt text item"
 
 
 # ── rename ────────────────────────────────────────────────────────────────────
@@ -340,3 +563,53 @@ def test_ensure_on_screen_relocates_stranded_window(overlay, monkeypatch):
         assert 5000 <= nx <= 7000 and 5000 <= ny <= 6960
     finally:
         overlay.root.geometry(before)            # don't leave the shared window off-screen
+
+
+def _ev(x, y):
+    """Minimal stand-in for a Tk mouse event: the bubble handlers only read .x / .y."""
+    return types.SimpleNamespace(x=int(x), y=int(y))
+
+
+def _char_xy(bub, idx):
+    """Canvas coords inside character `idx` of the bubble's text item. Measured off the item's
+    own anchor and font so it stays right at any zoom / window width (the bubble hugs the right
+    edge, so its x moves). Callers keep to short single-line messages that will not wrap."""
+    x, y = bub.coords(bub._item)
+    f = bub._overlay_fonts[0]
+    return x + f.measure(bub._shown[:idx]) + 1, y + f.metrics("linespace") / 2
+
+
+def test_user_bubble_drag_selects_and_does_not_copy_everything(overlay, monkeypatch):
+    """The real mouse path: press + move + release highlights a range and leaves the
+    clipboard alone, so a drag-select does not get clobbered by the click-to-copy shortcut
+    firing on the same button release."""
+    calls = _record_clipboard(overlay, monkeypatch)
+    bub = overlay._user_bubble("copy only this part please")
+    overlay.root.update_idletasks()
+
+    sx, sy = _char_xy(bub, 10)
+    ex, ey = _char_xy(bub, 19)
+    bub._on_press(_ev(sx, sy))
+    bub._on_motion(_ev(ex, ey))
+    bub._on_release(_ev(ex, ey))
+
+    assert bub._sel == (10, 19), f"drag landed on the wrong characters: {bub._sel!r}"
+    assert bub._sel_text() == "this part ", f"got {bub._sel_text()!r}"
+    assert calls == [], f"a drag must not copy on release, got {calls!r}"
+
+    bub._on_ctrl_c(None)                        # ...and Ctrl+C then takes just that
+    assert calls == [("clear",), ("append", "this part ")], f"got {calls!r}"
+
+
+def test_user_bubble_plain_click_still_copies_everything(overlay, monkeypatch):
+    """Press + release with no movement keeps the whole-message shortcut."""
+    calls = _record_clipboard(overlay, monkeypatch)
+    bub = overlay._user_bubble("a short message")
+    overlay.root.update_idletasks()
+
+    x, y = _char_xy(bub, 3)
+    bub._on_press(_ev(x, y))
+    bub._on_release(_ev(x, y))
+
+    assert calls == [("clear",), ("append", "a short message")], (
+        f"expected the plain click to copy the whole message, got {calls!r}")

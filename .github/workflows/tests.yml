@@ -8,6 +8,14 @@ on:
   push:
     branches: [main]   # PR branches are covered by pull_request; avoids a double run per PR push
   pull_request:
+  # requirements.txt floors claude-agent-sdk rather than pinning it, so a clean runner
+  # installs whatever PyPI published today and preflight proves the app still loads
+  # against it. On push/PR alone that check only fires when someone happens to commit --
+  # which means a breaking SDK release would be discovered by whoever runs update.cmd
+  # next. Weekly, it is discovered here instead.
+  schedule:
+    - cron: "0 6 * * 1"   # Mondays 06:00 UTC
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -26,10 +34,16 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
 
       - name: Byte-compile all modules
-        run: python -m py_compile config.py debuglog.py win32utils.py worker.py claude_overlay.py
+        run: python -m py_compile config.py debuglog.py win32utils.py worker.py claude_overlay.py crashreport.py preflight.py modelresolve.py cliupdate.py authstate.py usage.py
 
       - name: Import smoke test (no window, no connect)
         run: python -c "import claude_overlay; print('import OK', claude_overlay.__version__)"
+
+      # The same check a user gets from Diagnose.cmd. Runs the app's own environment
+      # report and fails the build if it says the app can't start - so the diagnostic
+      # is exercised on every push instead of only on the day someone needs it.
+      - name: Preflight (environment report)
+        run: python preflight.py
 
       - name: Run unit tests
         run: python -m pytest

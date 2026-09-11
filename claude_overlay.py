@@ -15,27 +15,119 @@ Run:   pythonw claude_overlay.py     (no console)
 import asyncio
 import base64
 import ctypes
+import hashlib
 import ctypes.wintypes as wt
 import json
+import math
 import os
 import re
+import statistics
 import sys
 import threading
 import time
 import queue
 from pathlib import Path
 
-import tkinter as tk
-from tkinter import font as tkfont
+# Before anything that can fail: give a startup crash somewhere to go. The launcher runs
+# this under pythonw, which has no console — so without a reporter installed first, every
+# import below can kill the process with no window, no message and no log. That is the
+# "I updated it, now double-clicking does nothing" bug: not a mystery, just an invisible
+# ImportError. crashreport is stdlib-only precisely so it still works when the imports it
+# is protecting are the broken thing.
+try:
+    import crashreport
+except Exception as _boot_err:
+    # crashreport.py itself is missing — which means this file was copied over an older
+    # install on its own. That used to be the documented way to update from the ZIP, and
+    # it stopped working when the app was split into modules: claude_overlay.py now needs
+    # its siblings. Handled inline, with no imports beyond ctypes, because the reporter
+    # that would normally say this is exactly the file that isn't there.
+    _msg = ("Claude Overlay is missing part of itself (crashreport.py), so it can't "
+            "start.\n\nThis happens when only claude_overlay.py was replaced during an "
+            "update. The app is a folder of files now, not a single script.\n\nFix: "
+            "re-download the whole folder — run update.cmd (git), or unzip ALL files "
+            "from the latest ZIP over this one.\n\nFolder:\n"
+            + os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import ctypes as _ct
+        _ct.windll.user32.MessageBoxW(None, _msg, "Claude Overlay", 0x10 | 0x10000)
+    except Exception:
+        pass
+    try:
+        sys.stderr and sys.stderr.write(_msg + "\n")
+    except Exception:
+        pass
+    raise SystemExit(1)
 
-from PIL import Image, ImageGrab, ImageDraw, ImageChops, ImageFilter, ImageTk
+crashreport.install()
 
-from config import *
-from config import __version__
-from debuglog import dbg, DEBUG_LOG
-from win32utils import *
-from win32utils import _user32, _gdi32
-from worker import ClaudeWorker
+
+def _report_import_failure(exc):
+    """Turn a failed startup import into a message that names the fix.
+
+    The raw traceback is necessary but not sufficient: "ModuleNotFoundError: PIL" tells
+    a developer everything and a colleague nothing. preflight turns it into which
+    interpreter is running, what's missing from it, and the one command that repairs it —
+    so the dialog is actionable without a round trip to whoever maintains this."""
+    detail = ""
+    try:
+        import preflight
+        detail = preflight.summary(preflight.check()) + "\n\n"
+    except Exception:
+        pass
+    # Ahead of the traceback, because the dialog is capped and read top-down: the person
+    # seeing it is not the person who can use a stack trace, and the per-problem pip
+    # commands above still assume a terminal. The two double-clickable files repair the
+    # environment AND prove the app loads before claiming success — so name them first.
+    detail += ("Quickest fix: double-click update.cmd (or setup.cmd) in the app folder - "
+               "either one reinstalls what is missing into the Python the launcher "
+               "actually runs, and verifies the app loads before reporting success.\n\n")
+    try:
+        import traceback as _tb
+        detail += "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
+    except Exception:
+        detail += repr(exc)
+    crashreport.report(
+        f"Claude Overlay couldn't start: {exc.__class__.__name__}: {exc}", detail,
+        app_version=_file_version())
+    # As the launched app there is nothing left to do but say so and leave. When merely
+    # IMPORTED (CI's import smoke, the tests, preflight's subprocess check) the exception
+    # must keep propagating — swallowing it would turn a red build green.
+    if __name__ == "__main__":
+        os._exit(1)
+    raise exc
+
+
+def _file_version():
+    """config.__version__ without importing config — config may be what failed."""
+    try:
+        import re as _re
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.py"),
+                   encoding="utf-8").read()
+        m = _re.search(r'^__version__\s*=\s*"([^"]+)"', src, _re.M)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
+try:
+    import tkinter as tk
+    from tkinter import font as tkfont
+
+    from PIL import Image, ImageGrab, ImageDraw, ImageChops, ImageFilter, ImageTk
+
+    from config import *
+    from config import __version__
+    from debuglog import dbg, DEBUG_LOG
+    from win32utils import *
+    from win32utils import _user32, _gdi32
+    from worker import ClaudeWorker
+    import authstate
+    import modelresolve
+    import sessions
+    import usage
+except Exception as _e:
+    _report_import_failure(_e)
 
 # ───────────────────────────── the overlay UI ─────────────────────────────
 PLACEHOLDER = "Reply to Claude…"
@@ -65,6 +157,312 @@ def _ensure_shot_dir():
         SHOT_DIR = Path(tempfile.gettempdir())
 
 
+def _load_state():
+    """Best-effort read of the tiny persisted UI state (STATE_FILE). Any problem —
+    missing, unreadable, not a dict, absurdly large — yields {} so startup can't break."""
+    try:
+        if STATE_FILE.stat().st_size > 64 * 1024:   # sanity cap; ours is tens of bytes
+            return {}
+        data = json.loads(STATE_FILE.read_text("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_state(**updates):
+    """Merge updates into STATE_FILE (temp file + os.replace, so a crash mid-write can't
+    leave truncated JSON behind). Best-effort: persisting a toggle must never break the UI."""
+    try:
+        state = _load_state()
+        state.update(updates)
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state), "utf-8")
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        pass
+
+
+# ── predicting how long a /compact will take ──────────────────────────────────
+# The CLI streams NOTHING while it compacts (see COMPACT_IDLE_TIMEOUT) — no percentage, no
+# stage events — so real progress is unknowable. What IS knowable is how long compactions
+# of a given size have taken before: every one leaves a `compact_boundary` line carrying
+# compactMetadata.preTokens + durationMs. We remember our own runs in STATE_FILE and, on a
+# machine that hasn't compacted through the overlay yet, mine the CLI's transcripts, so
+# even the first run can show an honest estimate instead of an unlabelled spinner.
+_COMPACT_HIST_MAX = 10            # rolling window of remembered runs
+_COMPACT_SCAN_FILES = 12          # newest transcripts only, when seeding from the CLI's logs
+_COMPACT_ETA_MIN = 10.0
+_COMPACT_ETA_MAX = 900.0
+_COMPACT_ETA_Q = 0.80             # aim the estimate here, not at the middle (see _compact_predict)
+_COMPACT_ETA_PAD = 0.15           # …and never less than this much headroom, however tight the fit
+
+
+def _compact_history():
+    """Remembered (pre_tokens, duration_sec) pairs from this overlay's own compactions."""
+    raw = _load_state().get("compact_runs")
+    out = []
+    if isinstance(raw, list):
+        for it in raw[-_COMPACT_HIST_MAX:]:
+            try:
+                pre, dur = int(it[0]), float(it[1])
+            except Exception:
+                continue          # hand-edited / older-format entry — just skip it
+            if pre > 0 and dur > 0:
+                out.append((pre, dur))
+    return out
+
+
+def _compact_history_add(pre_tokens, duration_sec):
+    """Append one completed run, keeping only the most recent _COMPACT_HIST_MAX."""
+    try:
+        pre, dur = int(pre_tokens), float(duration_sec)
+    except Exception:
+        return
+    if pre <= 0 or dur <= 0:
+        return
+    runs = _compact_history() + [(pre, round(dur, 1))]
+    _save_state(compact_runs=[list(r) for r in runs[-_COMPACT_HIST_MAX:]])
+
+
+def _compact_samples_from_transcripts():
+    """(pre_tokens, duration_sec) pairs recovered from the CLI's own session logs. Purely
+    best-effort — an unreadable file or a malformed line is skipped, [] on any failure."""
+    out = []
+    try:
+        files = sorted(sessions.TRANSCRIPT_ROOT.glob("*/*.jsonl"),
+                       key=lambda f: f.stat().st_mtime, reverse=True)[:_COMPACT_SCAN_FILES]
+    except Exception:
+        return out
+    for f in files:
+        try:
+            with f.open(encoding="utf-8", errors="replace") as fh:
+                for ln in fh:
+                    if "compact_boundary" not in ln:   # cheap reject before the JSON parse
+                        continue
+                    try:
+                        md = json.loads(ln).get("compactMetadata") or {}
+                    except Exception:
+                        continue
+                    pre, ms = md.get("preTokens"), md.get("durationMs")
+                    if isinstance(pre, (int, float)) and isinstance(ms, (int, float))                             and pre > 0 and ms > 0:
+                        out.append((int(pre), ms / 1000.0))
+        except Exception:
+            continue              # log rotated away mid-read, permissions, etc.
+    return out
+
+
+def _compact_quantile(values, q):
+    """Linearly-interpolated quantile. statistics.quantiles() wants n ≥ 2 and returns cut
+    points between groups; here a single sample has to work too, so do it by hand."""
+    vs = sorted(values)
+    if not vs:
+        return 0.0
+    if len(vs) == 1:
+        return vs[0]
+    pos = q * (len(vs) - 1)
+    lo = min(int(pos), len(vs) - 2)
+    return vs[lo] + (vs[lo + 1] - vs[lo]) * (pos - lo)
+
+
+def _compact_predict(samples, pre_tokens):
+    """Predicted /compact duration in seconds, or None when there's nothing to go on.
+
+    Measured runs (61k tokens → 96s, 283k → 167s) say duration is mostly a FIXED cost plus a
+    small per-token term, so scaling straight off the context size would badly underestimate
+    small compactions. With two or more differently-sized samples we least-squares fit
+    duration = a + b·tokens; otherwise we fall back to the median duration, which ignores
+    size but still beats having no estimate at all.
+
+    Both of those are CENTRE estimates, which by construction half of all runs overshoot —
+    and overshooting reads far worse than finishing early, because the bar stalls with no way
+    to say how much longer. So aim at the _COMPACT_ETA_Q quantile instead: pad the fit by the
+    spread of its own residuals, the median by the spread of the durations. Two samples make
+    the fit pass exactly through both points and three make it nearly so, so a residual-based
+    pad alone would be ~0 exactly when confidence is lowest — hence the _COMPACT_ETA_PAD floor."""
+    pts = [(p, d) for p, d in samples if p > 0 and d > 0]
+    if not pts:
+        return None
+    clamp = lambda v: min(_COMPACT_ETA_MAX, max(_COMPACT_ETA_MIN, v))
+    pad = lambda base, spread: clamp(base + max(spread, base * _COMPACT_ETA_PAD))
+    if isinstance(pre_tokens, (int, float)) and pre_tokens > 0 and len(pts) >= 2:
+        xs, ys = [p for p, _ in pts], [d for _, d in pts]
+        mx, my = statistics.fmean(xs), statistics.fmean(ys)
+        var = sum((x - mx) ** 2 for x in xs)
+        if var > 0:               # zero ⇒ every sample the same size, no slope to fit
+            b = sum((x - mx) * (y - my) for x, y in pts) / var
+            a = my - b * mx
+            resid = [y - (a + b * x) for x, y in pts]
+            return pad(a + b * pre_tokens, _compact_quantile(resid, _COMPACT_ETA_Q))
+    ds = [d for _, d in pts]
+    med = statistics.median(ds)
+    return pad(med, _compact_quantile(ds, _COMPACT_ETA_Q) - med)
+
+
+# ── telling two screenshots apart ─────────────────────────────────────────────
+# Auto-shot attaches a capture to EVERY message, and each one costs ~1.5-2.5k vision tokens
+# that then sit in the context for the rest of the conversation — on a long session the
+# screenshots, not the words, are what fills the window. Byte-equality is nearly useless
+# against that: four consecutive grabs of a screen nobody touched produced four different
+# sha256s (measured 2026-08 — a live desktop is never bit-for-bit still), so the cheap test
+# almost never fires and every message pays for a picture the model already has. So compare
+# what the capture LOOKS like instead, with a difference hash over a luma grid — each bit
+# says "this cell is brighter than the one to its right". At 32 cells wide a caret or a clock
+# digit averages away to far less than one cell (the same four grabs were 0 bits apart),
+# while anything worth re-sending moves whole regions and flips bits by the dozen. A finer
+# grid doesn't sharpen the distinction — 48 and 64 wide were measured too, and a localized
+# change stays localized at every resolution — so the coarsest one wins on cost.
+_SHOT_HASH_SIDE = 32              # 32×32 left-to-right comparisons = 1024 bits of fingerprint
+
+
+def _shot_phash(path):
+    """1024-bit perceptual fingerprint of an image file, or None if it can't be read.
+
+    None means "no opinion", never "unchanged": callers fall back to byte-equality rather
+    than guess, because a wrong "unchanged" points the model at an image it was never sent."""
+    try:
+        with Image.open(path) as im:
+            # BOX = plain area averaging. A sharper filter (LANCZOS) rings around edges and
+            # would let a one-pixel caret swing a whole cell — the opposite of what's wanted.
+            g = im.convert("L").resize((_SHOT_HASH_SIDE + 1, _SHOT_HASH_SIDE), Image.BOX)
+        px = g.tobytes()          # mode "L" → one unpadded byte per pixel, row-major
+        w = _SHOT_HASH_SIDE + 1
+        bits = 0
+        for y in range(_SHOT_HASH_SIDE):
+            row = y * w
+            for x in range(_SHOT_HASH_SIDE):
+                bits = (bits << 1) | (px[row + x] > px[row + x + 1])
+        return bits
+    except Exception:
+        return None
+
+
+def _shot_looks_same(a, b):
+    """True when two fingerprints differ by at most SHOT_DEDUPE_BITS of the 1024."""
+    if a is None or b is None or SHOT_DEDUPE_BITS <= 0:
+        return False
+    return bin(a ^ b).count("1") <= SHOT_DEDUPE_BITS
+
+
+# ── how fast the context window is being spent ────────────────────────────────
+# A bare "context 46%" answers a question nobody asks. What people want to know is whether
+# they can keep going, and the unit they spend is the turn — so track where the window stood
+# at the end of each recent turn and quote the slope in turns remaining.
+_CTX_RATE_TURNS = 6               # rolling window the burn rate is averaged over
+_CTX_WARN_PCT = 70.0              # amber, and a one-time note suggesting an early compaction
+_CTX_HOT_PCT = 85.0               # red, and a second, louder note
+
+
+# ── how much of the allowance is left ─────────────────────────────────────────
+# The gauge above measures the size of the CONVERSATION. What actually ends a session is the
+# 5-hour/weekly allowance, and the two are unrelated: every message spends from the
+# allowance, but Clear and /compact hand the context reading back while the spend stays
+# spent. So a window that never rises past a few percent can sit next to an allowance that's
+# nearly gone — which is precisely how you get cut off with no warning, and why the context
+# number can't be the one on display. The CLI knows the real figure and emits it on every
+# status transition (RateLimitEvent → the worker's "quota"); the statusline gives it the slot
+# and lends it back to context only when context is itself over its warning line, so the row
+# never carries two percentages competing to be the one you should worry about.
+_QUOTA_WINDOWS = {"five_hour": "5h", "seven_day": "week", "seven_day_opus": "week/opus",
+                  "seven_day_sonnet": "week/sonnet", "overage": "overage"}
+_QUOTA_HOT = 0.90                 # colour by the number shown, even if the CLI still says
+                                  # "allowed" — a grey 94% reads as nothing being wrong
+_QUOTA_WARN = 0.75                # the ring's amber step. The text gauge can wait for the
+                                  # CLI's own "allowed_warning" because it prints a number you
+                                  # read; an arc has no number, so it has to earn attention
+                                  # before it is nearly spent or it says nothing until too late.
+
+
+def _mix(a, b, t):
+    """Blend two #rrggbb colours, t of the way from a to b."""
+    x, y = (int(a[i:i + 2], 16) for i in (1, 3, 5)), (int(b[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02X%02X%02X" % tuple(round(p + (q - p) * t) for p, q in zip(x, y))
+
+
+def _contrast(a, b):
+    """WCAG contrast ratio between two #rrggbb colours — used to prove a gauge is visible
+    rather than to assume it, after a track at 1.2:1 shipped as a blank mark."""
+    def lum(h):
+        c = [int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        c = [v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4 for v in c]
+        return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    p, q = lum(a), lum(b)
+    return (max(p, q) + 0.05) / (min(p, q) + 0.05)
+
+
+# Radii and stroke widths as fractions of a 32px mark, the size they were tuned at; the mark
+# is drawn at _MARK_PX and these scale with it. Inner track is the 5-hour window and is the
+# thicker of the two — it is the one that ends the session you are sitting in.
+_RING_GEOM = (("five_hour", 10.5 / 32, 3 / 32), ("week", 14.5 / 32, 2 / 32))
+_SPARK_R = 5.75 / 32           # small enough to leave clear air inside the 5h track:
+                               # when that arc goes amber it is T["accent"], the same
+                               # colour as the mark, and touching arc and mark merge
+_RING_SS = 4                      # supersample factor, then downsample: Tk's create_arc has
+                                  # no antialiasing on Windows and a 3px arc on a 36px circle
+                                  # comes out a visible staircase
+_MARK_PX = 36                     # two legible arcs plus a readable ✻ need this much room;
+                                  # the titlebar is 44px tall, so this is the largest that fits
+
+
+def _binding_window(windows):
+    """The one window that earns the statusline's single text slot: whichever is furthest
+    along, because the binding constraint is the limit you reach first and the rest are noise
+    until they overtake it. Ties go to five_hour — at equal percentages it is the one that can
+    end the session you are sitting in right now.
+
+    This rule used to live in usage.reading(), which applied it before the UI ever saw the
+    data. That was the wrong altitude twice over: it is a decision about what to SHOW, and
+    collapsing to it in the data layer threw away the other windows — including the 5-hour one
+    the ring now draws, which by definition is the one being discarded during the whole early
+    stretch when it sits below the weekly number. Reporting is usage.py's job; choosing is ours.
+
+    Takes windows keyed by name (utilization already 0-1) and returns one of them with its
+    name folded in, or None. The result deliberately carries no `status`: a polled reading has
+    none, so _gauge_color goes on colouring by the number, which is what it already did.
+    """
+    best = None
+    for name in _QUOTA_WINDOWS:
+        w = (windows or {}).get(name)
+        if not isinstance(w, dict):
+            continue
+        u = w.get("utilization")
+        if isinstance(u, bool) or not isinstance(u, (int, float)):
+            continue
+        if best is None or u > best[1]:
+            best = (name, float(u))
+    return dict(windows[best[0]], window=best[0]) if best else None
+
+
+_QUEUE_POLL_MS = 400              # how often a blocked line-up re-checks whether it may flush
+                                  # (turn still streaming, compaction, a held allowance, a dead
+                                  # login). Event hooks do the normal-path work; this poll only
+                                  # exists so a hold that clears without an event can't strand
+                                  # queued messages forever.
+_QUEUE_ROWS_SHOWN = 6             # queued-message rows drawn above the input box; the rest
+                                  # collapse into one "＋N more queued" line so a long line-up
+                                  # can't push the input off a short window.
+_RETRY_POLL_MS = 60_000           # how often an armed retry checks the clock. A single long
+                                  # after() would be the obvious choice and the wrong one: Tk
+                                  # timers don't run while the machine sleeps, so a laptop
+                                  # closed for the afternoon would wake owing hours of delay.
+                                  # Re-reading the wall clock can't drift that way.
+
+
+def _startup_permission_mode():
+    """Decide this launch's permission state: (read_only, mode to LAUNCH the worker in).
+    The remembered Read-only toggle — a deliberate user choice, like Window-only — wins
+    over the config default; PERMISSION_MODE seeds the first launch (no saved state).
+    A remembered unlock launches straight in the full-access mode, so the session is
+    born bypass-capable when full access means bypassPermissions — a running session
+    can never be ELEVATED to bypass later (see worker._bypass_capable)."""
+    ro = (PERMISSION_MODE == "plan")
+    saved = _load_state().get("read_only")
+    if isinstance(saved, bool):
+        ro = saved
+    full = PERMISSION_MODE if PERMISSION_MODE != "plan" else "bypassPermissions"
+    return ro, ("plan" if ro else full)
+
+
 def round_rect(c, x1, y1, x2, y2, r, **kw):
     pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
            x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
@@ -75,14 +473,41 @@ class Overlay:
     def __init__(self):
         self.ui_q: "queue.Queue" = queue.Queue()
         _ensure_shot_dir()          # before the worker, so a bad TEMP can't crash us mid-startup
-        self.worker = ClaudeWorker(self.ui_q)
+        # Resolve the remembered Read-only toggle BEFORE the worker exists: the session
+        # must be LAUNCHED in the remembered mode (a plan-launched session can't be
+        # elevated to bypassPermissions at run time, only started in it).
+        self.read_only, _launch_mode = _startup_permission_mode()
+        self.worker = ClaudeWorker(self.ui_q, permission_mode=_launch_mode)
         self.worker.start()
 
         self.auto_shot = AUTO_SCREENSHOT_DEFAULT
+        self.window_shot = (SHOT_SCOPE == "window")   # True → capture only the active window
+        if not SHOT_SCOPE_FORCED:                     # remembered toggle choice survives a
+            self.window_shot = bool(_load_state().get("window_shot", self.window_shot))
+                                                      # relaunch; an explicit env var beats it
         self.share_visible = SHOW_IN_SCREEN_SHARE_DEFAULT   # True → overlay shows in screen shares
+        # self.read_only was set above (worker launch); the toggle flips it via the
+        # worker (confirmed async) and each confirmed change is persisted.
+        self._full_mode = (PERMISSION_MODE if PERMISSION_MODE != "plan"
+                           else "bypassPermissions")  # what Read-only OFF returns to: the
+                                                      # configured mode — unless that IS plan,
+                                                      # then the CLI default full-access mode
         self.pending_shot = None
         self.pending_images: list = []
         self._precaptured = None        # (shots, monotonic_ts) grabbed while typing
+        self._sent_shot_hashes: dict = {}  # capture-target key → (sha256, perceptual hash) of
+                                        # the last shot the model VERIFIABLY has in context;
+                                        # lets auto-screenshot skip re-attaching a screen that
+                                        # hasn't visibly changed (see _dedupe_shots). Cleared
+                                        # whenever the context may have lost the image
+                                        # (clear/compact — explicit OR the CLI's automatic one
+                                        # — reconnect, resume fallback, any error).
+        self._pending_shot_hashes: dict = {}  # hashes of shots attached to the IN-FLIGHT turn;
+                                        # promoted into _sent_shot_hashes only when that turn
+                                        # returns a clean result. A turn that errors or is
+                                        # stopped may never have shown the image to the model —
+                                        # committing eagerly would make the next send dedupe
+                                        # against an image the model never saw.
         self._precapture_after = None   # pending debounce timer id
         self._capture_busy = False      # a background precapture grab is in flight
         self._paste_busy = False        # a background clipboard paste is in flight
@@ -96,6 +521,35 @@ class Overlay:
         self._toggle_request = False
         self._model = None
         self._ctx_pct = None
+        self._ctx_tokens = None         # absolute context size, for pricing a would-be /compact
+        self._ctx_hist: list = []       # context % at the end of each of the last few turns →
+                                        # burn rate → how many turns of headroom are left
+        self._ctx_warned = 0.0          # highest warning tier already announced; reset with the
+                                        # conversation and after a compaction wins the room back
+        self._ctx_sample_due = False    # a turn ended; the next usage refresh is its data point
+        self._quota = None              # last rate-limit reading the CLI reported (see "quota")
+        self._quota_polled = None       # last reading usage.py fetched itself (see "quota_poll").
+                                        # Kept apart from _quota, not merged into it: this one is
+                                        # fresher and so wins the DISPLAY, while everything that
+                                        # speaks or sends still reads the CLI's own event above.
+        self._quota_said = None         # status already announced, so each transition speaks once
+        self._ring_explained = False    # the ring names itself once, when there is finally
+                                        # something to point at (see _maybe_explain_ring)
+        self._last_sent = None          # (text, images) of the last message handed to the worker,
+                                        # so a refusal that never reached Claude can give it back
+        self._retry = None              # {"at", "text", "armed"} — a refused message waiting for
+                                        # the allowance to come back (see _offer_retry)
+        self._retry_btn = None          # the in-chat arm/cancel button for it
+        self._retry_after = None        # pending after() id for the poll tick
+        self._queue: list = []          # messages typed while a reply was streaming, each a
+                                        # dict from _collect_send; sent one per finished turn
+                                        # (the CLI's type-ahead queue). See _send_or_queue.
+        self._queue_rows: list = []     # the row widgets currently drawn above the input box
+        self._queue_after = None        # pending after() id for the line-up's poll tick
+        self._queue_hold = None         # "rate" → a refused allowance holds the flush (the
+                                        # quota event releases it); a dead login holds via
+                                        # the live _auth_dead flag instead
+        self._queue_held = False        # the hold has been announced + rows restyled ⏸
         self._claude_header = False
         self._thinking_active = False   # a thinking block is open in the current turn
         # streaming-Markdown renderer state (per turn): the current unfinished answer line
@@ -110,6 +564,10 @@ class Overlay:
         # several turn_done/result events emitting more than one button per assistant turn.
         self._turn_raw = ""
         self._turn_copy_added = False
+        # Each user bubble owns its own canvas, and canvas text selection is per-canvas, so
+        # nothing clears bubble A when you start selecting in bubble B. Track the bubble that
+        # currently holds a selection and clear it by hand, or old highlights pile up.
+        self._sel_bubble = None
         self._last_pump = time.monotonic()   # hang-watchdog heartbeat
         self._pump_logged = 0.0              # throttle the periodic "pump alive" debug line
         self._drag = (0, 0)
@@ -120,11 +578,34 @@ class Overlay:
         self._update_available = None     # set to the newer version string if one exists
         self._cli_update_shown = False    # show the "CLI is out of date" notice at most once/session
         self._cli_update_btn_ref = None   # the in-chat Update button, so its result can restyle it
+        self._ov_update_shown = False     # show the "a newer overlay exists" notice at most once
+        self._ov_update_btn_ref = None    # the in-chat Update-overlay button, same restyle path
+        self._session_id = None           # the CLI's id for the current conversation (worker
+                                          # events); persisted per completed turn so the NEXT
+                                          # launch can offer to resume — see _persist_session
+        self._resume_btn = None           # the in-chat "Resume last conversation" button while
+                                          # it's still actionable, so events can restyle it
+        self._discard_pending = False     # True from a Clear click until the worker's reset_done
+                                          # drains: a turn's (session / turn_done) batch already
+                                          # queued before the click must not re-set _session_id or
+                                          # re-persist the record and resurrect the discarded chat
         self._restarting = False          # guard: one self-restart (relaunch + quit) at a time
         self._mapping = False             # re-entrancy guard for the <Map> taskbar re-assert
         self._fronting = False            # re-entrancy guard for _raise_to_front (focus churn)
         self._vscreen_sig = None          # last virtual-desktop bounding box (display-topology sig)
         self._vscreen_checked = 0.0       # throttle the topology watchdog to ~1.5s in _poll
+        self._last_ext_fg = None          # last EXTERNAL foreground hwnd — the window the user was
+                                          # working in before focusing the overlay; the "window"
+                                          # capture scope targets it whenever the overlay has focus
+        self._fg_checked = 0.0            # throttle that tracking to ~0.5s in _poll
+        # The `claude` CLI's login can die in a way NOTHING here can repair: a refresh
+        # rejected with invalid_grant makes the CLI blank its own stored credentials, after
+        # which every message fails until the user signs in again (see authstate.py). These
+        # track that state so it's announced once — not per message — and so a send isn't
+        # allowed to consume a typed prompt and its attachments into a turn that cannot work.
+        self._auth_dead = False           # last known "stored login is provably unusable"
+        self._auth_checked = 0.0          # throttle the credential watchdog in _poll
+        self._auth_told = False           # the notice has been shown for the CURRENT death
         # Per-overlay custom name (session-only, set by clicking the titlebar "Claude"). Shown
         # in the titlebar + window title when expanded, and as a small pill UNDER the orb when
         # collapsed — so several overlays open at once (one per task) are tellable apart at a
@@ -144,6 +625,8 @@ class Overlay:
         self._compact_anim_after = None   # pending animation timer id
         self._compact_t0 = 0.0            # monotonic start (for the elapsed-seconds counter)
         self._compact_frame = 0
+        self._compact_pre = None          # context size (tokens) this run is compacting
+        self._compact_eta = None          # predicted duration in s; None → no basis to guess
 
         self._build()
         self._register_hotkey()
@@ -202,6 +685,15 @@ class Overlay:
         # Collapsed-orb name pill: a fixed-size label (NOT registered for zoom — it only shows
         # while collapsed, where the chat-text zoom is irrelevant). Kept as a ref so Tk won't GC it.
         self.f_pill  = tkfont.Font(family=self.sans, size=-self.px(13), weight="bold")
+        # Status-bar icon font: the native Windows symbol face renders a crisp, monochrome
+        # settings gear (U+E713 — the same glyph Windows uses in its own Settings UI) that
+        # colors cleanly with the theme, far nicer than the thin U+2699 the body font makes.
+        # Falls back to that plain glyph if neither Windows icon font is present.
+        _icon_fam = next((f for f in ("Segoe Fluent Icons", "Segoe MDL2 Assets") if f in avail), None)
+        if _icon_fam:
+            self.f_icon, self.gear_glyph = mk(_icon_fam, 13), "\uE713"
+        else:
+            self.f_icon, self.gear_glyph = self.f_small, "⚙"
 
         self._build_titlebar()
         self.hairline = tk.Frame(self.root, bg=T["border"], height=1)
@@ -214,6 +706,19 @@ class Overlay:
         self._build_edges()        # invisible drag strips on every edge/corner → resize
         self._bind_zoom()          # Ctrl +/- and Ctrl+wheel → live text zoom
         self._intro()
+        # A remembered Read-only choice silently overriding the config default is a
+        # SAFETY state — say so up front, so a launch never surprises.
+        if self.read_only != (PERMISSION_MODE == "plan"):
+            self.add_sys("🔒 Read-only restored from your last session — flip the "
+                         "Read-only toggle off for full access." if self.read_only else
+                         "⚡ Full access restored from your last session (you had "
+                         "switched Read-only off). Flip it back on any time.")
+        # Anything the per-machine config.json couldn't apply (typo'd key, wrong type,
+        # unreadable file) must be SEEN — a silently-skipped PERMISSION_MODE would
+        # launch a full-access session the user believed was read-only.
+        for w in USER_CONFIG_WARNINGS:
+            self.add_sys(f"⚠ {USER_CONFIG_FILE.name}: {w}")
+        self._maybe_offer_resume()
 
         self.root.after(130, lambda: (self.root.focus_force(), self.entry.focus_set()))
         self.root.bind("<Configure>", self._on_configure)
@@ -224,7 +729,18 @@ class Overlay:
         self.root.after(220, self._install_taskbar_button)
         self.root.after(1200, self._check_for_update)
         self.root.after(1500, self._check_cli_update)
+        self._usage_poll = usage.Poller(self.ui_q)
+        self._start_usage_poll()
         self._start_hang_watchdog()    # diagnostic: dumps all-thread stacks if the UI pump stalls
+
+    def _start_usage_poll(self):
+        """Start the allowance poll, so the gauge has a number before the first message.
+
+        Its own method purely so the test suite can neuter it on the Overlay it builds
+        (no network, and this machine's real token never read) WITHOUT patching
+        usage.Poller itself — the session-wide Overlay fixture would otherwise leave the
+        class stubbed for every later unit test of that class."""
+        self._usage_poll.start()
 
     def _start_hang_watchdog(self):
         """Diagnostic (active only when CLAUDE_OVERLAY_DEBUG_LOG is set): a daemon thread that,
@@ -469,6 +985,12 @@ class Overlay:
         try:
             hwnd = self._hwnd()
             fg = _user32.GetForegroundWindow()
+            try:                              # the hotkey moment is the freshest possible
+                hw = foreground_capture_window()   # answer to "which window was the user in?"
+                if hw:                             # — record it before we steal the foreground
+                    self._last_ext_fg = hw
+            except Exception:
+                pass
             cur = _user32.GetWindowThreadProcessId(fg, None) if fg else 0
             me = _user32.GetWindowThreadProcessId(hwnd, None)
             attached = bool(cur and cur != me and _user32.AttachThreadInput(cur, me, True))
@@ -532,10 +1054,28 @@ class Overlay:
         self.titlebar = bar
         bar.pack_propagate(False)
         self._bind_drag(bar)
-        sz = self.px(24)
+        sz = self.px(_MARK_PX)
         mark = tk.Canvas(bar, width=sz, height=sz, bg=T["bg"], highlightthickness=0)
-        mark.pack(side="left", padx=(self.px(14), self.px(7)))
-        self._draw_spark(mark, sz / 2, sz / 2, self.px(9))
+        mark.pack(side="left", padx=(self.px(10), self.px(7)))
+        # The whole mark — allowance arcs AND the ✻ — is one supersampled image rather than
+        # Tk canvas primitives, so every curve is antialiased. See _paint_quota_ring.
+        self._mark, self._mark_sz = mark, sz
+        self._paint_quota_ring()
+        # The ring can carry the numbers but not their name. A pointer cursor says it answers
+        # to something, and <Enter> is where the answer arrives — see _quota_hover_text.
+        mark.configure(cursor="hand2")
+        mark.bind("<Enter>", self._mark_enter, add="+")
+        mark.bind("<Leave>", self._mark_leave, add="+")
+        # Deliberately a child of root rather than a Toplevel. The capture exclusion that keeps
+        # the overlay out of screen shares - and out of the screenshots we send Claude - is set
+        # on the root HWND (see _apply_share_visibility) and a new top-level window does not
+        # inherit it: the panel would show up in a Teams share while the overlay itself did not,
+        # and would land inside our own grabs, because capture() skips its withdraw dance
+        # whenever the exclusion is active. A placed child inherits all of that for nothing.
+        self._usage_panel = tk.Label(self.root, text="", bg=T["tool_bg"], fg=T["text"],
+                                     font=self.f_mono, justify="left", anchor="w",
+                                     padx=self.px(10), pady=self.px(8),
+                                     highlightthickness=1, highlightbackground=T["border"])
         self._bind_drag(mark)
         # The title doubles as the rename target: click it (without dragging) to edit this
         # overlay's name; dragging it still moves the window (moved-detection, like the orb).
@@ -658,6 +1198,14 @@ class Overlay:
         self._sb_first, self._sb_last = 0.0, 1.0
         self._sb_drag = None
         self._sb_hover = False
+        # Scroll-follow state. Following the end is a MODE the user turns off by scrolling up
+        # (and back on by scrolling to the end), not something re-derived from the view on every
+        # insert - see _sync_follow.
+        self._follow = True
+        self._unread = False
+        self._jump = None
+        self._jump_shown = False
+        self._jump_unread_drawn = None
         self.scrollbar = tk.Canvas(wrap, width=self._sb_w, bg=T["bg"], highlightthickness=0,
                                    cursor="arrow", takefocus=0)
         # inset by the resize-edge thickness (px 6) so the right-edge resize strip (which is
@@ -680,7 +1228,11 @@ class Overlay:
         self.chat.configure(yscrollcommand=self._sb_set)
         self.chat.bind("<MouseWheel>", self._on_wheel)
         self.chat.bind("<Key>", self._readonly_keys)
+        # Starting a selection in the transcript drops any user-bubble highlight, so the window
+        # never shows two selections at once. add="+" so Text's own click bindings still run.
+        self.chat.bind("<Button-1>", lambda e: self._bubble_sel_clear(), add="+")
         self.chat.bind("<Configure>", self._on_chat_configure, add="+")
+        self._build_jump()
 
         m = self.f_body.measure("0") * 5
         self.chat.tag_configure("uh", foreground=T["muted"], font=self.f_chip,
@@ -734,6 +1286,7 @@ class Overlay:
         except Exception:
             self._sb_first, self._sb_last = 0.0, 1.0
         self._sb_redraw()
+        self._update_jump()      # the view moved -> the jump pill may need to appear/disappear
 
     def _sb_geom(self):
         """Return (height, thumb_top_px, thumb_bottom_px) honouring a minimum thumb size, or
@@ -772,6 +1325,7 @@ class Overlay:
         else:                                              # clicked the track → jump there
             self._sb_drag = (y1 - y0) / 2
             self.chat.yview_moveto(max(0.0, min(1.0, (e.y - self._sb_drag) / h)))
+        self._sync_follow()
         self._sb_redraw()
 
     def _sb_motion(self, e):
@@ -781,20 +1335,111 @@ class Overlay:
         if h <= 1:
             return
         self.chat.yview_moveto(max(0.0, min(1.0, (e.y - self._sb_drag) / h)))
+        self._sync_follow()
+
+    # -- scroll-follow + "jump to latest" --
+    def _at_bottom(self):
+        try:
+            return self.chat.yview()[1] > 0.999
+        except Exception:
+            return True
+
+    def _sync_follow(self):
+        """Re-derive follow from the view after a USER scroll gesture (wheel, scrollbar drag,
+        keyboard): scrolled up -> stop following, scrolled back to the end -> resume. This is the
+        ONLY thing that turns following off, so content-driven drift (a throttled giant line, an
+        embedded table, a resize) can no longer strand a reply below the fold."""
+        self._follow = self._at_bottom()
+        if self._follow:
+            self._unread = False
+        self._update_jump()
+
+    def _scroll_follow(self):
+        """Called after appending content: keep the end in view while following, otherwise note
+        that unseen output arrived so the jump pill can say so."""
+        if self._follow:
+            try:
+                self.chat.see("end")
+            except Exception:
+                pass
+        else:
+            self._unread = True
+            self._update_jump()
+
+    def _jump_to_end(self, e=None):
+        self._follow = True
+        self._unread = False
+        try:
+            self.chat.see("end")
+        except Exception:
+            pass
+        self._update_jump()
+        return "break"
+
+    def _build_jump(self):
+        """A small pill floated over the bottom-right of the chat, visible only once you have
+        scrolled away from the end. Without it, output streaming in below the fold gives no sign
+        at all that it arrived."""
+        self._jump = tk.Canvas(self.chat_wrap, bg=T["bg"], highlightthickness=0,
+                               cursor="hand2", takefocus=0)
+        self._jump.bind("<Button-1>", self._jump_to_end)
+        self._jump.bind("<MouseWheel>", self._fwd_wheel)   # must not swallow the scroll
+
+    def _render_jump(self):
+        cv = self._jump
+        if cv is None or not self._widget_alive(cv):
+            return
+        txt = "\u2193 New output" if self._unread else "\u2193 Latest"
+        f = self.f_chip
+        w = f.measure(txt) + self.px(22)
+        h = f.metrics("linespace") + self.px(10)
+        cv.configure(width=w, height=h)
+        cv.delete("all")
+        bg = T["accent"] if self._unread else T["tool_bg"]
+        fg = T["bg"] if self._unread else T["text"]
+        round_rect(cv, 0, 0, w - 1, h - 1, (h - 1) / 2, fill=bg, outline="")
+        cv.create_text(w / 2, h / 2, text=txt, fill=fg, font=f)
+
+    def _update_jump(self):
+        """Show/hide the pill. Uses the cached scrollbar fraction (free - yscrollcommand already
+        handed it to us) rather than yview(), which is O(line length) on a giant streamed line."""
+        cv = getattr(self, "_jump", None)
+        if cv is None:
+            return
+        want = not self._follow and self._sb_last < 0.999
+        try:
+            if want:
+                if not self._jump_shown or self._jump_unread_drawn != self._unread:
+                    self._render_jump()
+                    self._jump_unread_drawn = self._unread
+                if not self._jump_shown:
+                    cv.place(relx=1.0, rely=1.0, anchor="se",
+                             x=-(self._sb_w + self.px(14)), y=-self.px(10))
+            elif self._jump_shown:
+                cv.place_forget()
+        except Exception:
+            pass
+        self._jump_shown = want
 
     def _build_input(self):
         wrap = tk.Frame(self.root, bg=T["bg"])
         wrap.pack(fill="x", side="bottom")
         self.input_wrap = wrap
         self.in_h = self.px(62)
+        # The line-up strip: queued messages render here, directly above the input box
+        # (packed with before=self.canvas only while the queue is non-empty).
+        self.queue_frame = tk.Frame(wrap, bg=T["bg"])
         self.canvas = tk.Canvas(wrap, bg=T["bg"], height=self.in_h, highlightthickness=0)
         self.canvas.pack(fill="x", padx=self.px(12), pady=self.px(2))
+        # Width changes move the truncation point of every queued row — re-clip on resize.
+        wrap.bind("<Configure>", self._refresh_queue, add="+")
         self.entry = tk.Text(self.canvas, bg=T["field"], fg=T["text"], bd=0, height=2,
                              wrap="word", font=self.f_body, insertbackground=T["accent"],
                              highlightthickness=0, padx=0, pady=0)
         self.entry_win = self.canvas.create_window(0, 0, window=self.entry, anchor="nw")
         self.entry.bind("<Return>", self._on_return)
         self.entry.bind("<KP_Enter>", self._on_return)
+        self.entry.bind("<Escape>", self._on_escape)
         self.entry.bind("<Control-v>", self._on_paste)
         self.entry.bind("<Control-V>", self._on_paste)
         self.entry.bind("<Shift-Insert>", self._on_paste)
@@ -815,16 +1460,37 @@ class Overlay:
         self.toggle_screen.pack(side="left", padx=(self.px(16), self.px(2)), pady=pad)
         self.toggle_screen.bind("<Button-1>", lambda e: self.toggle_auto())
         self._paint_screen_toggle()
-        self.toggle_share = tk.Label(st, bg=T["bg"], font=self.f_small, cursor="hand2")
-        self.toggle_share.pack(side="left", padx=(self.px(8), self.px(2)), pady=pad)
-        self.toggle_share.bind("<Button-1>", lambda e: self.toggle_screen_share())
-        self._paint_share_toggle()
         self._chip(st, "Compact", self.compact_now)
         self._chip(st, "Clear", self.reset)
+        # The Window-only / Shareable / Read-only toggles used to sit inline here, which
+        # crowded the bar. They now live behind a single ⚙ settings menu (see _gear_menu).
+        # The gear turns the accent color while Read-only is ON, so that safety state stays
+        # visible at a glance without opening the menu.
+        self.gear = tk.Label(st, text=self.gear_glyph, bg=T["bg"], font=self.f_icon, cursor="hand2")
+        self.gear.pack(side="left", padx=(self.px(10), self.px(2)), pady=pad)
+        self.gear.bind("<Button-1>", self._gear_menu)
+        self.gear.bind("<Enter>", lambda e: self.gear.configure(fg=T["accent"]))
+        self.gear.bind("<Leave>", lambda e: self._paint_gear())
+        self._paint_gear()
         self.attach_lbl = tk.Label(st, text="", bg=T["bg"], fg=T["accent"],
                                    font=self.f_small, cursor="hand2")
         self.attach_lbl.pack(side="left", padx=self.px(6), pady=pad)
         self.attach_lbl.bind("<Button-1>", lambda e: self._clear_attachments())
+        # Mode chips sit between the ⚙ and the attachment label (hence `before=` in
+        # _paint_modes). One per setting that is NOT at its quiet default, so the strip is
+        # empty on a stock overlay and anything visible means "this one is behaving
+        # differently" — the reason the old always-on inline toggles were removed was that
+        # they crowded the bar even when they had nothing to say. The ⚙ menu still spells
+        # all three out with checkmarks; clicking a chip opens it.
+        self.mode_lbls = {}
+        for key in self.MODE_CHIPS:
+            lbl = tk.Label(st, bg=T["bg"], font=self.f_small, cursor="hand2")
+            lbl.bind("<Button-1>", self._gear_menu)
+            self.mode_lbls[key] = lbl
+        # Resizing changes whether the spelled-out chips still fit, so re-decide on every
+        # layout pass. add="+" leaves any other <Configure> handler on the bar intact.
+        st.bind("<Configure>", self._paint_modes, add="+")
+        self._paint_modes()
         self.grip = tk.Label(st, text="◢", bg=T["bg"], fg=T["faint"], font=self.f_small,
                              cursor="size_nw_se")
         self.grip.pack(side="right", padx=(0, self.px(8)), pady=pad)
@@ -837,8 +1503,17 @@ class Overlay:
         self.statusline_frame = sl
         self.statusline = tk.Label(sl, text="connecting…", bg=T["bg"], fg=T["faint"],
                                    font=self.f_small, anchor="w", cursor="hand2")
-        self.statusline.pack(side="left", padx=(self.px(16), self.px(6)), pady=(0, self.px(6)))
+        self.statusline.pack(side="left", padx=(self.px(16), 0), pady=(0, self.px(6)))
         self.statusline.bind("<Button-1>", self._model_menu)
+        # The context gauge is its OWN label so it can go amber/red on its own: recolouring one
+        # line to warn about one number would have dragged the model name and version with it.
+        # It also keeps the model menu's click target on the model, where it belongs.
+        self.ctx_lbl = tk.Label(sl, text="", bg=T["bg"], fg=T["faint"],
+                                font=self.f_small, anchor="w")
+        self.ctx_lbl.pack(side="left", padx=(self.px(9), 0), pady=(0, self.px(6)))
+        self.ver_lbl = tk.Label(sl, text="", bg=T["bg"], fg=T["faint"],
+                                font=self.f_small, anchor="w")
+        self.ver_lbl.pack(side="left", padx=(self.px(9), self.px(6)), pady=(0, self.px(6)))
         self.busy_lbl = tk.Label(sl, text="", bg=T["bg"], fg=T["accent"],
                                  font=self.f_small, anchor="e")
         self.busy_lbl.pack(side="right", padx=(0, self.px(16)), pady=(0, self.px(6)))
@@ -1173,16 +1848,6 @@ class Overlay:
             self.toggle_collapse()   # click the bubble → expand
 
     # ── small widgets ──
-    def _draw_spark(self, c, cx, cy, r):
-        import math
-        for i in range(12):
-            a = math.pi * i / 6
-            r1 = r if i % 2 == 0 else r * 0.5
-            c.create_line(cx, cy, cx + r1 * math.cos(a), cy + r1 * math.sin(a),
-                          fill=T["accent"], width=max(2, self.px(2)), capstyle="round")
-        d = max(2, self.px(2))
-        c.create_oval(cx - d, cy - d, cx + d, cy + d, fill=T["accent"], outline="")
-
     def _title_btn(self, parent, text, cmd):
         b = tk.Label(parent, text=text, bg=T["bg"], fg=T["muted"], font=self.f_small,
                      cursor="hand2", width=3)
@@ -1205,11 +1870,106 @@ class Overlay:
         self.toggle_screen.configure(text=("◉  Auto-shot" if on else "○  Auto-shot"),
                                      fg=(T["accent"] if on else T["muted"]))
 
+    def _paint_gear(self):
+        # The ⚙ settings menu holds Window-only / Shareable / Read-only. It carries no
+        # per-toggle text on the bar; instead it turns the accent color while Read-only is
+        # ON, so that safety lock stays visible without opening the menu. Guarded so the
+        # paint helpers below are safe to call before the gear exists / in headless tests.
+        if not hasattr(self, "gear"):
+            return
+        self.gear.configure(fg=(T["accent"] if self.read_only else T["muted"]))
+        self._paint_modes()
+
+    # Chip text + colour + the value worth showing, per mode attribute. The "worth showing"
+    # value is the NON-default one in each case: Read-only locks the session, Window-only
+    # narrows what gets captured, and Shareable means the overlay is visible in screen shares
+    # (stock is excluded — see SHOW_IN_SCREEN_SHARE_DEFAULT). Read-only takes the accent
+    # because it is the safety state, matching what the gear colour already signals.
+    MODE_CHIPS = {
+        "read_only":     ("⊘", "Read-only", "accent", True),
+        "window_shot":   ("▣", "Window",    "muted",  True),
+        "share_visible": ("◈", "Shared",    "muted",  True),
+    }
+
+    def _modes_fit(self, labels):
+        """Is there room on the bar for the spelled-out chips, or must they go glyph-only?
+        Overlays get kept narrow (all three chips spelled out want ~1.5x the default width),
+        and a clipped chip is worse than a terse one: pack just drops it off the edge, so the
+        mode would go from mislabelled to invisible. Measured against everything else already
+        on the bar. No feedback loop — the mode labels are excluded from `used`, so the answer
+        can't change as a result of acting on it."""
+        st = getattr(self, "status_frame", None)
+        avail = st.winfo_width() if st is not None else 0
+        if avail <= 1:
+            return True          # not laid out yet; <Configure> re-runs this once it is
+        mine = set(self.mode_lbls.values())
+        used = sum(w.winfo_reqwidth() + self.px(12) for w in st.pack_slaves() if w not in mine)
+        need = sum(self.f_small.measure(t) + self.px(10) for t in labels)
+        return used + need <= avail
+
+    def _paint_modes(self, _e=None):
+        """Re-pack the mode strip from current state. Everything is unpacked and re-packed in
+        MODE_CHIPS order rather than toggled individually, so the chips keep a stable
+        left-to-right order however they were switched on. Guarded so the paint helpers stay
+        safe to call before the status bar exists / in headless tests."""
+        if not getattr(self, "mode_lbls", None):
+            return
+        on = [k for k in self.MODE_CHIPS
+              if getattr(self, k, None) == self.MODE_CHIPS[k][3]]
+        full = self._modes_fit([f"{self.MODE_CHIPS[k][0]} {self.MODE_CHIPS[k][1]}" for k in on])
+        for lbl in self.mode_lbls.values():
+            lbl.pack_forget()
+        for key in on:
+            glyph, label, colour, _ = self.MODE_CHIPS[key]
+            self.mode_lbls[key].configure(text=(f"{glyph} {label}" if full else glyph),
+                                          fg=T[colour])
+            self.mode_lbls[key].pack(side="left", padx=(self.px(6), 0), pady=self.px(4),
+                                     before=self.attach_lbl)
+
+    def _active_modes(self):
+        """The chip texts currently on the bar, in bar order. Split out so a test can assert on
+        what is shown without reaching into Tk's pack internals."""
+        return [self.mode_lbls[k].cget("text") for k in self.MODE_CHIPS
+                if getattr(self, k, None) == self.MODE_CHIPS[k][3]]
+
+    # Window-only / Shareable / Read-only moved into the ⚙ menu; their state is shown by
+    # the checkmarks in _gear_items and (for Read-only) the gear color. These three keep
+    # their old names so every existing caller (the toggle handlers, _apply_permission_mode)
+    # just refreshes the gear.
+    def _paint_window_toggle(self):
+        self._paint_gear()
+
     def _paint_share_toggle(self):
-        # ON (◉, accent) = the overlay shows up in screen shares; OFF (○, muted) = hidden/private.
-        on = self.share_visible
-        self.toggle_share.configure(text=("◉  Shareable" if on else "○  Shareable"),
-                                    fg=(T["accent"] if on else T["muted"]))
+        self._paint_gear()
+
+    def _paint_ro_toggle(self):
+        self._paint_gear()
+
+    def _gear_items(self):
+        """The (label, command) rows of the ⚙ settings menu. A ✓ prefixes each setting
+        that is currently ON. Split out from _gear_menu so it's unit-testable without
+        popping a real Tk menu. Read-only reflects the CONFIRMED state (it flips only after
+        the worker confirms), so the checkmark never claims a lock that isn't live."""
+        def row(on, name):
+            return ("✓  " + name) if on else ("      " + name)
+        return [
+            (row(self.window_shot, "Window-only"), self.toggle_window_shot),
+            (row(self.share_visible, "Shareable"), self.toggle_screen_share),
+            (row(self.read_only, "Read-only"), self.toggle_read_only),
+            ("      Past conversations…", self.show_sessions),
+        ]
+
+    def _gear_menu(self, e):
+        # Same popup pattern as the model switcher (_model_menu): build fresh on each open
+        # so the checkmarks reflect current state, then tk_popup at the click point.
+        m = tk.Menu(self.root, tearoff=0, bg=T["field"], fg=T["text"],
+                    activebackground=T["accent"], activeforeground=T["on_accent"], bd=0)
+        for lbl, cmd in self._gear_items():
+            m.add_command(label=lbl, command=cmd)
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
 
     # ── rounded input layout ──
     def _layout_input(self, e=None):
@@ -1518,6 +2278,10 @@ class Overlay:
             self._layout_input()
         except Exception:
             pass
+        try:
+            self._refresh_queue()  # the small font just changed size → re-clip queued rows
+        except Exception:
+            pass
         self._rezoom_embeds()      # redraw embedded canvases (bubbles/chips/tables/Copy) at new zoom
 
     @staticmethod
@@ -1564,6 +2328,8 @@ class Overlay:
                 pass
             live.append((c, render))
         self._zoomables = live
+        self._jump_unread_drawn = None      # font scaled -> the pill must be re-measured
+        self._update_jump()
 
     def _on_chat_configure(self, e):
         """The chat's embedded canvases (user bubbles, tables) are sized to the chat width when
@@ -1730,6 +2496,7 @@ class Overlay:
         if (e.state & 0x4) and e.keysym.lower() in ("c", "a"):
             return
         if e.keysym in ("Up", "Down", "Left", "Right", "Prior", "Next", "Home", "End"):
+            self.root.after_idle(self._sync_follow)   # keyboard scrolling is a user gesture too
             return
         return "break"
 
@@ -1766,10 +2533,8 @@ class Overlay:
 
     def _ins(self, text, *tags):
         text = "" if text is None else str(text)   # Tk insert rejects None
-        at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", text, tags)
-        if at_bottom:
-            self.chat.see("end")
+        self._scroll_follow()
         self._prune_chat()
 
     def add_user(self, text):
@@ -1777,7 +2542,8 @@ class Overlay:
         self._turn_raw = ""              # a new turn starts → fresh assistant-answer buffer
         self._turn_copy_added = False
         self._set_task_badge(False)      # a new task → clear any stale "done" badge on the orb
-        at_bottom = self.chat.yview()[1] > 0.999
+        self._follow = True              # you just sent something → follow the reply again
+        self._unread = False
         self.chat.insert("end", "\n")
         self.chat.window_create("end", window=self._user_bubble(text), pady=self.px(3))
         self.chat.insert("end", "\n")
@@ -1787,8 +2553,7 @@ class Overlay:
             pass
         self._claude_header = False
         self._thinking_active = False    # new turn → next thinking re-inserts its label
-        if at_bottom:
-            self.chat.see("end")
+        self._scroll_follow()
         self._prune_chat()
 
     @staticmethod
@@ -1816,30 +2581,189 @@ class Overlay:
         """A right-aligned rounded chat bubble (drawn on a full-width canvas). render() recomputes
         the whole box from a body font at the *current* zoom, so it grows/shrinks with Ctrl +/−
         like the flowing text — recomputing the box each time means the bigger font never overflows
-        a stale fixed size (the reason this used to be frozen). Registered with _register_zoomable."""
-        text = self._clip_bubble(text)
-        c = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0)
+        a stale fixed size (the reason this used to be frozen). Registered with _register_zoomable.
+
+        Click-to-copy: the bubble is a Canvas, so the text in it is *drawn*, not text — Tk has no
+        selection model for canvas items, which is why you can never drag-select your own message
+        the way you can Claude's (that side is real text in the Text widget). Clicking the bubble
+        copies it instead. It copies `raw`, captured BEFORE _clip_bubble, because the echo you see
+        is lossy on purpose: truncated at 2000 chars and with spaces injected into long unbroken
+        runs to keep canvas wrapping linear. Copying what's drawn would hand back mangled text."""
+        raw = "" if text is None else str(text)   # pre-clip original → this is what the clipboard gets
+        shown = self._clip_bubble(text)
+        c = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0, cursor="xterm", takefocus=0,
+                      selectbackground=T["accent"], selectforeground=T["on_accent"])
+        c._copied = False
+        c._shown = shown        # a partial selection yields a slice of THIS, i.e. of what is drawn
+        c._item = None          # the text item; selection and index lookups both target it
+        c._sel = None           # (anchor, last) inclusive char indices, kept across a re-render
+        st = {"hover": False, "anchor": None, "moved": False}
+
+        def paint():
+            """Hover / '✓ Copied' feedback WITHOUT a full redraw. render() starts with
+            delete("all"), which drops the canvas text selection — and hover fires while you
+            are mid-drag, so repainting that way would erase the selection as you made it."""
+            lit = c._copied or st["hover"]
+            try:
+                c.itemconfigure(c._rect, fill=T["sel"] if lit else T["user_card"])
+                if c._hint is not None:
+                    c.itemconfigure(c._hint, text="✓ Copied" if c._copied else "⧉ Copy",
+                                    fill=T["accent"] if c._copied else T["faint"],
+                                    state="normal" if lit else "hidden")
+            except Exception:
+                pass
+
         def render():
+            keep = c._sel                                   # zoom/resize must not lose a selection
             c.delete("all")
             full = max(self.px(200), self.chat.winfo_width() - 2 * self.px(18))
             maxw = max(self.px(140), int(full * 0.74))
             padx, pady, rad = self.px(13), self.px(9), self.px(14)
             body_font = tkfont.Font(root=self.root, font=self.f_body)   # current zoom
-            c._overlay_fonts = [body_font]                  # keep a ref so Tk won't GC it
-            tmp = c.create_text(0, 0, text=text, font=body_font, width=maxw, anchor="nw")
+            hint_font = tkfont.Font(root=self.root, font=self.f_small)
+            c._overlay_fonts = [body_font, hint_font]       # keep refs so Tk won't GC them
+            tmp = c.create_text(0, 0, text=shown, font=body_font, width=maxw, anchor="nw")
             bb = c.bbox(tmp)
             x1, y1, x2, y2 = bb if bb else (0, 0, maxw, self.px(18))
             c.delete(tmp)
             bw, bh = (x2 - x1) + 2 * padx, (y2 - y1) + 2 * pady
             bx = full - bw                                  # hug the right edge
-            round_rect(c, bx, 1, bx + bw, bh - 1, rad, fill=T["user_card"], outline="")
-            c.create_text(bx + padx, pady, text=text, font=body_font, fill=T["text"],
-                          width=maxw, anchor="nw")
+            c._rect = round_rect(c, bx, 1, bx + bw, bh - 1, rad, fill=T["user_card"], outline="")
+            c._item = c.create_text(bx + padx, pady, text=shown, font=body_font, fill=T["text"],
+                                    width=maxw, anchor="nw")
+            # Affordance sits in the gutter LEFT of the bubble (which hugs the right edge).
+            # maxw caps the bubble at 74% of the width, so there is normally room; when a short
+            # window leaves none, the fill change alone carries the feedback rather than drawing
+            # a label over the bubble's own corner. Sized to the WIDER label so it never reflows.
+            c._hint = None
+            if bx - self.px(8) >= hint_font.measure("✓ Copied"):
+                c._hint = c.create_text(bx - self.px(8), pady + body_font.metrics("linespace") / 2,
+                                        text="⧉ Copy", font=hint_font, anchor="e",
+                                        fill=T["faint"], state="hidden")
             c.configure(width=full, height=bh)
+            paint()
+            if keep:
+                select_chars(*keep)
+
+        def select_chars(a, b):
+            """Select shown[a:b+1] (Tk canvas selection is inclusive at both ends). Also the
+            seam tests use, because Tk drops synthesised drag events on the withdrawn widgets
+            this suite runs on, so a test cannot produce a selection by faking the mouse."""
+            if c._item is None:
+                return
+            try:
+                c.select_from(c._item, a)
+                c.select_to(c._item, b)
+            except Exception:
+                return
+            c._sel = (a, b)
+            self._sel_bubble = c
+
+        def sel_text():
+            if not c._sel:
+                return None
+            a, b = sorted(c._sel)
+            return shown[a:b + 1] or None
+
+        def restore():
+            try:
+                c._copied = False
+                paint()
+            except Exception:
+                pass
+
+        def copy(payload):
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(payload)
+            except Exception:
+                pass
+            c._copied = True
+            paint()                    # paint() honours _copied → swaps in the '✓ Copied' state
+            try:
+                c.after(1200, restore)
+            except Exception:
+                pass
+
+        def hit(e):
+            return c.index(c._item, "@%d,%d" % (int(c.canvasx(e.x)), int(c.canvasy(e.y))))
+
+        def on_press(e):
+            self._bubble_sel_clear(keep=c)       # only one bubble may show a selection at a time
+            try:
+                c.select_clear()
+            except Exception:
+                pass
+            c._sel = None
+            st["moved"] = False
+            try:
+                st["anchor"] = hit(e)
+                c.focus_set()                    # so <Control-c> reaches us, as the chat Text does
+            except Exception:
+                st["anchor"] = None
+            return "break"
+
+        def on_motion(e):
+            if st["anchor"] is None or c._item is None:
+                return "break"
+            try:
+                cur = hit(e)
+            except Exception:
+                return "break"
+            if cur == st["anchor"] and not st["moved"]:
+                return "break"           # a still press is not a drag; don't flash a 1-char select
+            st["moved"] = True
+            select_chars(st["anchor"], cur)
+            return "break"
+
+        def on_release(_e):
+            if not st["moved"]:          # press+release with no drag → the whole-message shortcut
+                on_click()
+            st["anchor"] = None
+            return "break"
+
+        def on_click(_e=None):
+            """Whole-message copy. Copies `raw`, captured BEFORE _clip_bubble, because the echo
+            you see is lossy on purpose: truncated at 2000 chars and with spaces injected into
+            long unbroken runs to keep canvas wrapping linear."""
+            copy(raw)
+            return "break"
+
+        def on_ctrl_c(_e=None):
+            """Copy the highlighted part, or the whole message when nothing is highlighted.
+            A partial selection copies from the DRAWN text — that is what was highlighted."""
+            copy(sel_text() or raw)
+            return "break"
+
         render()
+        c.bind("<Enter>", lambda e: (st.update(hover=True), paint()))
+        c.bind("<Leave>", lambda e: (st.update(hover=False), paint()))
+        c.bind("<ButtonPress-1>", on_press)
+        c.bind("<B1-Motion>", on_motion)
+        c.bind("<ButtonRelease-1>", on_release)
+        c.bind("<Control-c>", on_ctrl_c)
+        c.bind("<Control-C>", on_ctrl_c)
+        # Exposed for the same reason as _copy_btn's: Tk drops a synthesised <Button-1> on a
+        # withdrawn widget and the suite runs withdrawn, so a test must call the handlers itself.
+        c._on_click, c._on_ctrl_c = on_click, on_ctrl_c
+        c._select_chars, c._sel_text = select_chars, sel_text
+        c._on_press, c._on_motion, c._on_release = on_press, on_motion, on_release
         c.bind("<MouseWheel>", self._fwd_wheel)   # embedded widget must not swallow the scroll
         self._register_zoomable(c, render)
         return c
+
+    def _bubble_sel_clear(self, keep=None):
+        """Drop the highlight on whichever user bubble currently owns one. Canvas selection is
+        per-canvas and every bubble is its own canvas, so starting a selection in one leaves the
+        previous one lit unless something clears it by hand — this is that something."""
+        prev = self._sel_bubble
+        if prev is not None and prev is not keep:
+            try:
+                prev.select_clear()
+                prev._sel = None
+            except Exception:
+                pass                      # bubble already destroyed by _prune_chat
+        self._sel_bubble = keep
 
     def _ensure_header(self):
         if not self._claude_header:
@@ -1897,23 +2821,17 @@ class Overlay:
         chunk = str(chunk)
         if not chunk:
             return
-        # Auto-scroll-follow: measure "am I at the bottom" BEFORE mutating content (an append
-        # below the fold would otherwise read as "not at bottom" and break following). yview()/
-        # see() are cheap for normal multi-line content (Tk caches per-line heights) but
-        # O(line length) on a pathological newline-free GIANT line — so only for such a giant
-        # current line do we throttle the scroll to ~25/s (a long stream of one huge line would
-        # otherwise monopolise the UI thread → the v1.1.9-class freeze). Normal replies keep the
-        # exact, correct per-delta follow.
+        # Auto-scroll-follow: driven by self._follow (see _sync_follow), NOT by re-measuring the
+        # view on every delta. Measuring was fragile — a throttled giant line, an embedded table
+        # or a resize leaves the view a hair off the end, which read as "user scrolled away" and
+        # silently stranded the rest of the reply below the fold. see() is O(line length) on a
+        # pathological newline-free GIANT line, so for such a line we still throttle the scroll to
+        # ~25/s (a long stream of one huge line would otherwise monopolise the UI thread → the
+        # v1.1.9-class freeze); _md_autoscroll_final catches up at turn end.
         giant = len(self._md_tail) > self.MD_LIVE_REPARSE_MAX
         scroll = (time.monotonic() - self._md_last_scroll) >= 0.04 if giant else True
-        at_bottom = False
-        if scroll:
-            try:
-                at_bottom = self.chat.yview()[1] > 0.999
-            except Exception:
-                at_bottom = False
-            if giant:
-                self._md_last_scroll = time.monotonic()
+        if scroll and giant:
+            self._md_last_scroll = time.monotonic()
         parts = chunk.split("\n")
         for i, part in enumerate(parts):
             if i < len(parts) - 1:                  # this part is terminated by a newline → commit
@@ -1924,11 +2842,8 @@ class Overlay:
                 self._md_commit_line(line)
             elif part:                              # the trailing, still-unfinished line
                 self._md_grow_tail(part)
-        if scroll and at_bottom:
-            try:
-                self.chat.see("end")
-            except Exception:
-                pass
+        if scroll:
+            self._scroll_follow()
         self._prune_chat()
 
     # cap live inline re-parsing on absurdly long single lines; formatting still finalizes
@@ -1956,14 +2871,9 @@ class Overlay:
 
     def _md_autoscroll_final(self):
         """One-shot scroll-to-end at turn end (a giant line's last deltas may have been throttled
-        out, leaving the view a hair off the bottom). Loose threshold so 'slightly behind due to
-        throttling' still snaps to the end, while a user who clearly scrolled up to read earlier
-        content is left alone."""
-        try:
-            if self.chat.yview()[1] > 0.90:
-                self.chat.see("end")
-        except Exception:
-            pass
+        out, leaving the view a hair off the bottom). Honours the follow flag, so a user who
+        scrolled up to read earlier content is left alone."""
+        self._scroll_follow()
         self._md_last_scroll = time.monotonic()
 
     def _md_clear_tail(self):
@@ -2247,13 +3157,11 @@ class Overlay:
             return
         self._md_finalize()              # seal the answer text streamed so far, then the tool chip
         self._ensure_header()
-        at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", "\n")
         self.chat.window_create("end", window=self._tool_chip(name, self._summ(inp, 46)),
                                 padx=self.px(16), pady=self.px(3))
         self.chat.insert("end", "\n")
-        if at_bottom:
-            self.chat.see("end")
+        self._scroll_follow()
         self._prune_chat()
 
     @staticmethod
@@ -2372,6 +3280,11 @@ class Overlay:
         c.bind("<Enter>", lambda e: show(True))
         c.bind("<Leave>", lambda e: show(False))
         c.bind("<Button-1>", on_click)
+        # Exposed so a test can exercise the real handler. Tk drops a synthesised
+        # <Button-1> on a withdrawn widget, and the whole suite runs withdrawn on
+        # purpose (no flash, no focus steal) -- so a test that "clicks" this button
+        # runs nothing and then asserts against whatever is on the machine's clipboard.
+        c._on_click = on_click
         c.bind("<MouseWheel>", self._fwd_wheel)   # embedded widget must not swallow the scroll
         self._register_zoomable(c, render)
         return c
@@ -2381,12 +3294,10 @@ class Overlay:
         No-ops on empty/whitespace text (e.g. a turn that produced only tool calls)."""
         if not (text and str(text).strip()):
             return
-        at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", "\n")
         self.chat.window_create("end", window=self._copy_btn(text), padx=self.px(16), pady=self.px(1))
         self.chat.insert("end", "\n")
-        if at_bottom:
-            self.chat.see("end")
+        self._scroll_follow()
         self._prune_chat()
 
     def _finish_turn_copy(self):
@@ -2408,6 +3319,327 @@ class Overlay:
         self._ins("\n⚠  " + ("" if text is None else str(text)) + "\n", "err")
 
     # ── "your CLI is out of date" notice + one-click update (see cliupdate.py) ──────────
+    def _maybe_offer_resume(self):
+        """On launch, if the previous run left a conversation behind (its session id is
+        persisted on every completed turn — see _persist_session), drop a one-click
+        Resume button into the chat. Only for a session from the SAME working dir (the
+        CLI stores sessions per directory) and not too old; Clear wipes the record, so
+        a deliberately discarded conversation is never offered back."""
+        if not RESUME_OFFER:
+            return
+        saved = _load_state().get("last_session")
+        if not (isinstance(saved, dict) and saved.get("id")):
+            return
+        if saved.get("cwd") != WORKING_DIR:
+            return
+        ts = saved.get("ts")
+        age = (time.time() - ts) if isinstance(ts, (int, float)) else -1
+        if not (0 <= age <= RESUME_OFFER_MAX_AGE):
+            return
+        self.add_sys(f"💬 You have a conversation from {self._age_str(age)} ago. "
+                     "Claude can pick it up where you left off:")
+        self.chat.insert("end", "\n")
+        self.chat.window_create("end", window=self._resume_btn_widget(str(saved["id"])),
+                                padx=self.px(16), pady=self.px(2))
+        self.chat.insert("end", "\n")
+        self._scroll_follow()
+
+    @staticmethod
+    def _age_str(secs):
+        """Coarse '5 min' / '3 h' / '2 d' for the resume offer — false precision would
+        just be noise."""
+        secs = max(0, int(secs))
+        if secs < 3600:
+            return f"{max(1, secs // 60)} min"
+        if secs < 86400:
+            return f"{secs // 3600} h"
+        return f"{secs // 86400} d"
+
+    def _resume_btn_widget(self, session_id):
+        """One-click 'Resume last conversation' button embedded in the chat (same
+        embedded-canvas pattern as the CLI-update button, incl. the forwarded wheel).
+        Click asks the worker to relaunch the client with --resume; the outcome comes
+        back as a ('resumed') / ('resume_failed') event that restyles this exact
+        button. Once a NEW conversation starts (first send), the button goes stale —
+        clicking it then would silently discard the messages just exchanged."""
+        c = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0, cursor="hand2",
+                      takefocus=0)
+        c._ustate = "idle"                          # idle | working | done | failed | stale
+        st = {"f": None, "w": 0, "h": 0, "rad": 0}  # current-zoom font + box, set by render()
+        labels = {"idle": "↺  Resume last conversation",
+                  "working": "Resuming…",
+                  "done": "✓  Resumed — keep going",
+                  "failed": "⚠  Couldn't resume — this is a fresh session",
+                  "stale": "↺  (a new conversation has started)"}
+
+        def draw(hover=False):
+            c.delete("all")
+            s = c._ustate
+            if s == "idle":
+                bg = T["accent_hi"] if hover else T["accent"]
+                fg = T["on_accent"]
+            elif s == "failed":
+                bg, fg = T["tool_bg"], T["err"]
+            else:                                   # working / done / stale → inert grey
+                bg, fg = T["tool_bg"], T["muted"]
+            round_rect(c, 1, 1, st["w"] - 1, st["h"] - 1, st["rad"], fill=bg, outline="")
+            c.create_text(st["w"] / 2, st["h"] / 2, text=labels[c._ustate], fill=fg,
+                          font=st["f"], anchor="center")
+
+        def render():
+            f = tkfont.Font(root=self.root, font=self.f_small)   # current zoom
+            c._overlay_fonts = [f]                               # keep a ref so Tk won't GC it
+            pad = self.px(11)
+            widest = max(f.measure(v) for v in labels.values())  # widest state → no reflow
+            st.update(f=f, h=self.px(24), rad=self.px(7), w=pad + widest + pad)
+            c.configure(width=st["w"], height=st["h"])
+            draw()
+
+        def set_state(s):
+            c._ustate = s
+            try:
+                c.configure(cursor="hand2" if s == "idle" else "arrow")
+                draw()
+            except Exception:
+                pass
+        c._set_ustate = set_state    # let the resumed/resume_failed handlers restyle it
+
+        def on_click(_e):
+            if c._ustate != "idle" or self.busy:
+                return "break"
+            set_state("working")
+            self._set_status("resuming last conversation…")
+            self.worker.resume(session_id)
+            return "break"
+        c._click = on_click          # a named handle so the routing is directly testable
+
+        render()
+        c.bind("<Enter>", lambda e: draw(hover=True))
+        c.bind("<Leave>", lambda e: draw(hover=False))
+        c.bind("<Button-1>", on_click)
+        c.bind("<MouseWheel>", self._fwd_wheel)      # embedded widget must not swallow scroll
+        self._register_zoomable(c, render)
+        self._resume_btn = c
+        return c
+
+    # ── past conversations ────────────────────────────────────────────────────
+    # Rendered as cards INSIDE the transcript, never in a window of their own. This product
+    # exists to stop you managing windows; a history browser you have to Alt+Tab to would be
+    # the exact thing it is supposed to remove. Same embedded-canvas pattern as the resume
+    # button and tool chips, so the list scrolls, zooms and gets disposed of by Clear.
+    SHORT_SESSION = 3          # fewer typed messages than this → folded away by default
+
+    def show_sessions(self):
+        """Scan this project's transcripts on a thread and post the rows back through ui_q.
+        Off-thread because a cold scan reads megabytes of JSON (a warm one is stat()-only,
+        but the first open of the day is not), and janking the UI is not acceptable in a
+        window that sits on top of whatever you were doing."""
+        if getattr(self, "_sessions_loading", False):
+            return
+        self._sessions_loading = True
+        self.add_sys("\U0001f5c2  Looking through your past conversations…")
+
+        def work():
+            try:
+                store = sessions.Store(WORKING_DIR,
+                                       cache_dir=STATE_FILE.parent / "session-cache")
+                self.ui_q.put(("sessions", (store, store.list())))
+            except Exception as ex:
+                self.ui_q.put(("sessions_failed", str(ex)))
+        threading.Thread(target=work, name="session-scan", daemon=True).start()
+
+    def _show_session_rows(self, store, rows):
+        self._sessions_loading = False
+        rows = [s for s in rows if s.id != self._session_id]     # never offer the live one
+        if not rows:
+            self.add_sys("No earlier conversations in this folder yet.")
+            return
+        long_rows = [s for s in rows if s.messages >= self.SHORT_SESSION]
+        short_rows = [s for s in rows if s.messages < self.SHORT_SESSION]
+        for s in long_rows:
+            self._add_session_card(store, s)
+        if short_rows:
+            self._add_more_sessions(store, short_rows)
+        self._scroll_follow()
+
+    def _add_session_card(self, store, session):
+        self.chat.window_create("end", window=self._session_card(store, session),
+                                padx=self.px(16), pady=self.px(2))
+        self.chat.insert("end", "\n")
+
+    def _add_more_sessions(self, store, short_rows):
+        """One row standing in for the throwaway conversations. Folded rather than hidden:
+        'short' is a guess about importance, and a guess should be reversible."""
+        mark = self.chat.index("end-1c")
+        lbl = self._chip_canvas(
+            f"… {len(short_rows)} shorter conversation{'s' if len(short_rows) != 1 else ''}")
+
+        def expand(_e=None):
+            try:
+                self.chat.delete(mark, f"{mark} lineend +1c")
+            except Exception:
+                pass
+            for s in short_rows:
+                self._add_session_card(store, s)
+            self._scroll_follow()
+            return "break"
+        lbl.bind("<Button-1>", expand)
+        lbl._on_click = expand
+        self.chat.window_create("end", window=lbl, padx=self.px(16), pady=self.px(2))
+        self.chat.insert("end", "\n")
+
+    def _chip_canvas(self, text):
+        c = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0, cursor="hand2", takefocus=0)
+        c._label = text        # drawn, not Text content, so a test cannot read it back
+        st = {}
+
+        def render():
+            f = tkfont.Font(root=self.root, font=self.f_small)
+            c._overlay_fonts = [f]
+            st["w"], st["h"] = f.measure(text) + self.px(22), self.px(22)
+            c.configure(width=st["w"], height=st["h"])
+            draw(False)
+
+        def draw(hover):
+            c.delete("all")
+            round_rect(c, 1, 1, st["w"] - 1, st["h"] - 1, self.px(6),
+                       fill=T["tool_bg"] if hover else T["bg"], outline="")
+            c.create_text(st["w"] / 2, st["h"] / 2, text=text, anchor="center",
+                          font=c._overlay_fonts[0], fill=T["muted"] if hover else T["faint"])
+        render()
+        c.bind("<Enter>", lambda e: draw(True))
+        c.bind("<Leave>", lambda e: draw(False))
+        c.bind("<MouseWheel>", self._fwd_wheel)
+        self._register_zoomable(c, render)
+        return c
+
+    def _session_thumb(self, path, box):
+        """The session's first screenshot, scaled into `box`. Returns a PhotoImage or None.
+
+        The thumbnail is the point of these cards: you recognise a conversation by what was
+        on your screen at the time far faster than by any title, and this is the only Claude
+        client that has that to show you.
+        """
+        if not path:
+            return None
+        try:
+            with Image.open(path) as im:
+                im.load()
+                im = im.convert("RGB")
+                im.thumbnail(box, Image.LANCZOS)
+                return ImageTk.PhotoImage(im)
+        except Exception:
+            return None
+
+    def _session_card(self, store, session):
+        """One conversation: thumbnail, title, subtitle, age + message count, and a ✕.
+
+        Click resumes it. ✕ arms a confirm on the card itself rather than popping a dialog —
+        a modal would steal focus from whatever you are actually working in, which is the
+        one thing this overlay must never do.
+        """
+        c = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0, cursor="hand2", takefocus=0)
+        c._state = "idle"          # idle | confirm | gone | resuming
+        st = {"w": 0, "h": 0}
+
+        def render():
+            c.delete("all")
+            f_t = tkfont.Font(root=self.root, font=self.f_small)
+            f_s = tkfont.Font(root=self.root, font=self.f_small)
+            c._overlay_fonts = [f_t, f_s]
+            full = max(self.px(220), self.chat.winfo_width() - 2 * self.px(34))
+            pad, th, tw = self.px(9), self.px(38), self.px(60)
+            st["w"], st["h"] = full, th + 2 * pad
+            c.configure(width=full, height=st["h"])
+            hover = getattr(c, "_hover", False) and c._state == "idle"
+            round_rect(c, 1, 1, full - 1, st["h"] - 1, self.px(9),
+                       fill=T["tool_bg"] if hover else T["field"], outline="")
+
+            if c._state == "gone":
+                c.create_text(full / 2, st["h"] / 2, text="✓  Deleted", anchor="center",
+                              font=f_t, fill=T["faint"])
+                return
+            if c._state == "confirm":
+                c.create_text(pad + self.px(4), st["h"] / 2, anchor="w", font=f_t,
+                              fill=T["text"], text="Delete this conversation?")
+                c.create_text(full - pad - self.px(4), st["h"] / 2, anchor="e", font=f_t,
+                              fill=T["muted"], text="Cancel", tags="no")
+                c.create_text(full - pad - f_t.measure("Cancel") - self.px(18), st["h"] / 2,
+                              anchor="e", font=f_t, fill=T["err"], text="Delete", tags="yes")
+                return
+
+            x = pad
+            photo = getattr(c, "_photo", None)
+            if photo is not None:
+                c.create_image(x, st["h"] / 2, image=photo, anchor="w")
+                x += tw + self.px(10)
+            right = full - pad - self.px(16)
+            c.create_text(x, pad + self.px(2), text=_fit(session.title, f_t, right - x),
+                          anchor="nw", font=f_t, fill=T["text"])
+            meta = f"{self._age_str(session.age)} ago  ·  {session.messages} message" \
+                   f"{'s' if session.messages != 1 else ''}"
+            sub = session.subtitle
+            c.create_text(x, pad + self.px(16), anchor="nw", font=f_s, fill=T["faint"],
+                          text=_fit(f"{meta}   {sub}" if sub else meta, f_s, right - x))
+            c.create_text(full - pad, st["h"] / 2, text="✕", anchor="e", font=f_t,
+                          fill=T["faint"], tags="del")
+
+        def _fit(text, font, width):
+            text = text or ""
+            if width <= 0 or font.measure(text) <= width:
+                return text
+            while text and font.measure(text + "…") > width:
+                text = text[:-1]
+            return text + "…"
+
+        def set_state(s):
+            c._state = s
+            c.configure(cursor="hand2" if s in ("idle", "confirm") else "arrow")
+            render()
+
+        def on_click(_e=None):
+            if c._state != "idle" or self.busy:
+                return "break"
+            set_state("resuming")
+            self._set_status("resuming that conversation…")
+            self.worker.resume(session.id)
+            return "break"
+
+        def arm(_e=None):
+            if c._state == "idle":
+                set_state("confirm")
+            return "break"
+
+        def do_delete(_e=None):
+            if c._state != "confirm":
+                return "break"
+            set_state("gone" if store.delete(session) else "idle")
+            if c._state == "idle":
+                self.add_sys("⚠ Couldn't delete that conversation — the file is in use.")
+            return "break"
+
+        c._on_click, c._arm, c._delete = on_click, arm, do_delete
+        c._cancel = lambda _e=None: (set_state("idle"), "break")[1]
+        c._photo = self._session_thumb(session.thumb, (self.px(60), self.px(38)))
+        render()
+        c.bind("<Enter>", lambda e: (setattr(c, "_hover", True), render()))
+        c.bind("<Leave>", lambda e: (setattr(c, "_hover", False), render()))
+        c.bind("<Button-1>", on_click)
+        c.tag_bind("del", "<Button-1>", arm)
+        c.tag_bind("yes", "<Button-1>", do_delete)
+        c.tag_bind("no", "<Button-1>", c._cancel)
+        c.bind("<MouseWheel>", self._fwd_wheel)
+        self._register_zoomable(c, render)
+        return c
+
+    def _persist_session(self):
+        """Record the current conversation's session id (+ when and where) so the next
+        launch can offer to resume it. Called per completed turn — cheap (a tiny JSON
+        write) and crash-safe: whatever the last finished turn was, that's resumable."""
+        if self._session_id:
+            _save_state(last_session={"id": self._session_id, "ts": time.time(),
+                                      "cwd": WORKING_DIR})
+
     def _show_cli_update_notice(self, info):
         """Render the 'CLI is behind' notice + a one-click Update button in the chat. Shown at
         most once per session (guarded), and only reached when cliupdate found the CLI behind."""
@@ -2418,29 +3650,30 @@ class Overlay:
         self.add_sys(f"🔔 Your Claude CLI is out of date (v{inst} → v{latest}). The overlay is "
                      "current, but the CLI it drives isn't — and the newest models need the "
                      "latest CLI. Update it in one click:")
-        at_bottom = self.chat.yview()[1] > 0.999
         self.chat.insert("end", "\n")
         self.chat.window_create("end", window=self._cli_update_btn(latest),
                                 padx=self.px(16), pady=self.px(2))
         self.chat.insert("end", "\n")
-        if at_bottom:
-            self.chat.see("end")
+        self._scroll_follow()
         self._prune_chat()
 
-    def _cli_update_btn(self, latest):
-        """One-click 'Update CLI' button embedded in the chat (same embedded-canvas pattern as the
-        Copy button). Click runs `npm install -g @anthropic-ai/claude-code@latest` in a background
-        thread; the button shows 'Updating…' meanwhile and the outcome arrives as a
-        ('cli_update_result', ...) event that restyles it. Forwards the wheel so it can't swallow
-        scrolling (the v1.4.1 embedded-widget trap)."""
-        latest = str(latest)
+    def _one_click_update_btn(self, labels, work, thread_name, btn_attr, result_kind):
+        """Shared builder for the in-chat one-click update buttons — the CLI's and the overlay's
+        own (same embedded-canvas pattern as the Copy button). `labels` gives the text for the four
+        states; a click while idle/error runs `work()` (zero-arg, returns (ok, msg)) on a
+        background thread named `thread_name`, records THIS canvas on `self.<btn_attr>` so the
+        result handler can restyle the button the user actually clicked, and delivers the outcome
+        as a (`result_kind`, (ok, msg)) UI event. A click while 'done' restarts the overlay —
+        neither update takes effect in this process. Forwards the wheel so it can't swallow
+        scrolling (the v1.4.1 embedded-widget trap).
+
+        One builder rather than two: what differs between the CLI button and the overlay button is
+        exactly the five arguments above. The drawing, the zoom re-render, the hover states and
+        the click routing were identical, and a second copy of them is a second place where a
+        state bug has to be found and fixed."""
         c = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0, cursor="hand2", takefocus=0)
         c._ustate = "idle"                              # idle | working | done | error
         st = {"f": None, "w": 0, "h": 0, "rad": 0}      # current-zoom font + box, set by render()
-        labels = {"idle": f"⬆  Update CLI to v{latest}",
-                  "working": "Updating…  (≈1 min)",
-                  "done": "✓  Updated — click to restart",
-                  "error": "⚠  Update failed — click to retry"}
 
         def draw(hover=False):
             c.delete("all")
@@ -2477,15 +3710,14 @@ class Overlay:
         def on_click(_e):
             if c._ustate in ("idle", "error"):          # first click, or retry after a failure
                 set_state("working")
-                self._cli_update_btn_ref = c
-                def work():
+                setattr(self, btn_attr, c)
+                def run():
                     try:
-                        from cliupdate import run_update
-                        ok, msg = run_update()
+                        ok, msg = work()
                     except Exception as e:
                         ok, msg = False, type(e).__name__
-                    self.ui_q.put(("cli_update_result", (bool(ok), str(msg))))
-                threading.Thread(target=work, name="cli-update", daemon=True).start()
+                    self.ui_q.put((result_kind, (bool(ok), str(msg))))
+                threading.Thread(target=run, name=thread_name, daemon=True).start()
             elif c._ustate == "done":                   # after a successful update → restart now
                 self._restart_overlay()
             return "break"                              # working → inert
@@ -2498,6 +3730,20 @@ class Overlay:
         c.bind("<MouseWheel>", self._fwd_wheel)          # embedded widget must not swallow scroll
         self._register_zoomable(c, render)
         return c
+
+    def _cli_update_btn(self, latest):
+        """The 'your CLI is behind' button: runs `npm install -g @anthropic-ai/claude-code@latest`
+        (cliupdate.run_update) off the UI thread, then offers a restart so the newest models load.
+        Imported inside the worker so a broken/absent cliupdate can't cost us the button."""
+        def work():
+            from cliupdate import run_update
+            return run_update()
+        return self._one_click_update_btn(
+            {"idle": f"⬆  Update CLI to v{latest}",
+             "working": "Updating…  (≈1 min)",
+             "done": "✓  Updated — click to restart",
+             "error": "⚠  Update failed — click to retry"},
+            work, "cli-update", "_cli_update_btn_ref", "cli_update_result")
 
     def _show_cli_update_result(self, payload):
         """Restyle the Update button to its final state and print a follow-up line: success →
@@ -2518,6 +3764,76 @@ class Overlay:
         else:
             self.add_err(f"CLI update didn't complete — {msg}. You can also update from a terminal: "
                          " npm install -g @anthropic-ai/claude-code@latest")
+
+    # ── "a newer overlay exists" notice + one-click update (runs update.cmd) ────────────
+
+    def _show_overlay_update_notice(self, latest):
+        """Render the 'a newer overlay is out' notice. On a git clone we can update in place, so
+        the notice carries a one-click button that runs update.cmd; a ZIP install has nothing to
+        pull, so it gets the manual instructions instead of a button that can only refuse.
+        Shown at most once per session — the check runs once at startup, but a re-render should
+        not stack a second button whose result would restyle only the newest one."""
+        if getattr(self, "_ov_update_shown", False):
+            return
+        self._ov_update_shown = True
+        head = f"🔔 Update available: v{latest} (you have v{__version__}). "
+        if not can_self_update():
+            self.add_sys(head + "Close the overlay and run update.cmd (or: git pull) to upgrade.")
+            return
+        self.add_sys(head + "Update in one click — a console window opens and shows the pull, "
+                            "the packages and the check that the new code still starts. You "
+                            "don't have to close the overlay first:")
+        self.chat.insert("end", "\n")
+        self.chat.window_create("end", window=self._ov_update_btn(latest),
+                                padx=self.px(16), pady=self.px(2))
+        self.chat.insert("end", "\n")
+        self._scroll_follow()
+        self._prune_chat()
+
+    def _ov_update_btn(self, latest):
+        """The 'update the overlay itself' button. Runs update.cmd in its own console and waits
+        for it (win32utils.run_overlay_update), then restarts — this process keeps running the
+        modules it imported at launch, so nothing pulled takes effect until it does. The 'done'
+        label reports that restart rather than asking for it; the click is still wired to
+        _restart_overlay so the button remains the way out if the automatic one can't start."""
+        def work():
+            return run_overlay_update()      # looked up at click time, so it stays patchable
+        return self._one_click_update_btn(
+            {"idle": f"⬆  Update overlay to v{latest}",
+             "working": "Updating…  (in the console window)",
+             "done": "✓  Updated — restarting…",
+             "error": "⚠  Update failed — click to retry"},
+            work, "overlay-update", "_ov_update_btn_ref", "ov_update_result")
+
+    def _show_overlay_update_result(self, payload):
+        """Restyle the Update-overlay button and print the follow-up: success → say the restart
+        is happening and do it; failure → the reason plus the manual route, since the console
+        that explained it may already be closed.
+
+        The restart is automatic because a successful update leaves the app in a state nobody
+        wants to be left in: the new code is on disk, this window is still the old one, and the
+        only thing standing between them is a click that carries no decision — declining it just
+        means running code you already replaced. _restart_overlay hands off to a detached fresh
+        instance and only quits this one once that started, so a relaunch that fails leaves the
+        window and an error rather than nothing at all."""
+        try:
+            ok, msg = payload
+        except Exception:
+            ok, msg = False, str(payload)
+        c = getattr(self, "_ov_update_btn_ref", None)
+        if c is not None:
+            try:
+                c._set_ustate("done" if ok else "error")
+            except Exception:
+                pass
+        if ok:
+            self.add_sys("✅ Overlay updated. The new code is on disk, but this window is still "
+                         "running the old one — restarting now. The fresh window offers to "
+                         "resume this conversation.")
+            self._restart_overlay()
+        else:
+            self.add_err(f"Overlay update didn't complete — {msg}. You can also update it by "
+                         "hand: double-click update.cmd in the app folder.")
 
     def _restart_overlay(self):
         """Relaunch a fresh overlay instance, then close this one — the 'click to restart' action
@@ -2556,6 +3872,14 @@ class Overlay:
         if not reason:
             sr = payload.get("stop_reason")
             reason = f"stop reason: {sr}" if sr else "no detail reported by the CLI"
+        # "Your next message is unaffected" is TRUE for a transient failure (overload, rate
+        # limit, max turns) but flatly wrong for an authentication failure: that one repeats
+        # forever, so promising otherwise sends the user off writing messages that can't be
+        # delivered. Say what actually fixes it instead.
+        if authstate.is_auth_error_text(detail) or authstate.is_auth_error_text(subtype):
+            return (f"Last turn ended with an error ({reason}). The Claude CLI's login is no "
+                    f"longer valid, so further messages will fail too — sign in again in a "
+                    f"terminal:  {self._AUTH_FIX}")
         return f"Last turn ended with an error ({reason}). Your next message is unaffected."
 
     @staticmethod
@@ -2576,14 +3900,129 @@ class Overlay:
     def _on_return(self, e):
         if e.state & 0x0001:
             return
-        self._send_or_stop()
+        self._send_or_queue()
         return "break"
 
+    def _on_escape(self, e=None):
+        """Esc in the box: Stop the streaming reply (which also drops the line-up — see
+        _send_or_stop); with nothing streaming, clear any queued messages instead."""
+        if self.busy:
+            self._send_or_stop()
+            return "break"
+        if self._queue:
+            self._drop_queue(note="⏹ Cleared")
+            return "break"
+        return None
+
+    # ── the CLI's login ──
+    _AUTH_FIX = "claude auth login"      # the one command that repairs it, in a terminal
+
+    def _auth_notice(self):
+        """The full explanation + fix, shown once per death (see _auth_watchdog)."""
+        return ("⚠ The Claude CLI's login has expired and it cleared its stored credentials, "
+                "so every message will fail until you sign in again — restarting the overlay "
+                f"cannot fix this.\n    In a terminal, run:  {self._AUTH_FIX}\n    "
+                "(if it complains, run  claude auth logout  first). The overlay notices the "
+                "new login on its own — no restart needed.")
+
+    def _auth_watchdog(self, now):
+        """Poll the CLI's stored login and announce each TRANSITION, so a dead login is
+        reported the moment it happens (or the moment the overlay is opened onto one) rather
+        than only when the user sends and loses a message. Cheap: one stat(), plus a ~1KB
+        JSON read only when the file changed. Recovery is announced too — after signing in
+        elsewhere, the user shouldn't have to guess whether the overlay noticed."""
+        if now - self._auth_checked < AUTH_CHECK_INTERVAL:
+            return
+        self._auth_checked = now
+        try:
+            dead = authstate.dead_reason() is not None
+        except Exception:
+            return                       # never let a credential read break the pump
+        if dead == self._auth_dead:
+            return
+        self._auth_dead = dead
+        if dead:
+            self._auth_told = True
+            dbg("auth", "stored login is blank — sends held back")
+            self.add_err(self._auth_notice())
+        else:
+            self._auth_told = False
+            dbg("auth", "stored login looks usable again")
+            self.add_sys("✅ Claude CLI login restored — your next message will go through.")
+
+    def _auth_blocks_send(self):
+        """True when this send must be held back because the CLI's stored login is provably
+        unusable. Nothing is consumed when it returns True, so the typed text and every
+        attachment stay exactly where they are — that is the whole point: the failing turn
+        would otherwise swallow both. Re-checked here rather than trusting the watchdog's
+        cached flag, so a death that happened seconds ago is caught on this very send."""
+        if not AUTH_GATE:
+            return False
+        # Nothing to send anyway (empty box, no auto-shot, no attachments): stay quiet and let
+        # the normal empty-send no-op happen, so Enter on an empty box can't nag about login.
+        if not (self._entry_text() or self.auto_shot or self.pending_shot or self.pending_images):
+            return False
+        try:
+            if authstate.dead_reason() is None:
+                return False
+        except Exception:
+            return False                 # no evidence → never stand in the way of a send
+        self._auth_dead = True
+        self._auth_checked = time.monotonic()      # the watchdog needn't re-announce this
+        if not self._auth_told:
+            self._auth_told = True
+            self.add_err(self._auth_notice())
+        else:
+            self.add_err("⚠ Still signed out — nothing was sent. Run "
+                         f"{self._AUTH_FIX} in a terminal; your message is still here.")
+        return True
+
     def _send_or_stop(self):
+        """The round button (and Esc): send when idle, STOP while a reply streams. Stopping
+        also drops the line-up — the turn_done that follows an interrupt would otherwise
+        fire the next queued message straight into a conversation the user just halted,
+        which reads as "Stop didn't work"."""
         if self.busy:
             self.worker.interrupt()
             self._set_status("stopping…")
+            self._drop_queue(note="⏹ Stopped")
             return
+        if self._auth_blocks_send():     # BEFORE anything is consumed (text, shot, attachments)
+            return
+        item = self._collect_send()
+        if item is None:
+            return
+        self._queue_hold = None          # a deliberate send outranks a rate hold: the user
+                                         # is choosing to try the wire again right now
+        self._deliver(item)
+
+    def _send_or_queue(self):
+        """Enter: send — or, while a reply is streaming, line the message up the way the
+        Claude Code CLI does, so typing ahead never interrupts the turn in flight. Queued
+        messages go out one per finished turn, in order (see _queue_tick). Enter never
+        interrupts; Stop lives on the round button and Esc."""
+        if not (self.busy and QUEUE_MESSAGES):
+            self._send_or_stop()
+            return
+        if self._auth_blocks_send():     # queueing onto a dead login would just hold forever
+            return
+        if len(self._queue) >= MAX_QUEUED:
+            self.add_err(f"⏳ The line-up is full ({MAX_QUEUED} messages) — "
+                         "your text is still in the box.")
+            return
+        item = self._collect_send()
+        if item is None:
+            return
+        self._queue.append(item)
+        self._refresh_queue()
+        self._queue_kick()               # covers the race where the turn ended between the
+                                         # keypress and here — otherwise turn_done kicks
+
+    def _collect_send(self):
+        """Consume the box + attachments + a screen grab into one send-ready payload, or
+        None when there is nothing to send. The screenshot is taken HERE — at the moment
+        the user hit Enter — not when a queued message finally goes out: the screen they
+        were looking at while typing is the one the message is about."""
         text = self._entry_text()
         shots = None
         if self.auto_shot:
@@ -2597,36 +4036,300 @@ class Overlay:
         self._precaptured = None
         images = list(self.pending_images)
         if not text and not shots and not images:
-            return
+            return None
         self.pending_shot = None
         self.pending_images = []
         self._refresh_attach()
         self.entry.delete("1.0", "end")
         self._ph_active = False
+        self._cancel_retry()               # sending (or queueing) by hand IS the retry —
+                                           # whether this is the armed message or a different
+                                           # one, the schedule has been overtaken and must
+                                           # not fire later on its own
+        return {"text": text, "shots": shots, "images": images,
+                "auto": bool(self.auto_shot)}
+
+    def _deliver(self, item):
+        """Hand one collected payload to the worker — the second half of what the send
+        button used to do inline; the line-up re-enters here as each turn ahead finishes.
+        Dedupe runs NOW, not at collect time: it compares against the baseline the model
+        verifiably holds, and for a queued message that baseline can change while it waits
+        (the turn ahead may attach its own screenshots)."""
+        text, shots, images = item["text"], item["shots"], item["images"]
+        self._last_sent = (text, images)   # a turn refused for allowance never reached Claude;
+                                           # _restore_draft hands the text back (see "result")
+        # Auto-screenshots only: drop any capture that the model already has — the same bytes,
+        # or (far more often, since a live desktop never re-encodes identically) the same
+        # picture. Re-attaching buys nothing and costs real latency (measured 2026-08:
+        # +0.7-2.6s TTFT per message for one monitor's inline image) plus vision tokens that
+        # stay spent for the rest of the conversation. A manual Snap is an explicit "attach
+        # it" and is never deduped. Legacy "read" mode isn't either: its old file may already
+        # be pruned from disk, so "refer to the previous one" can dangle.
+        unchanged = []
+        if item.get("auto") and shots and IMAGE_INPUT == "inline":
+            shots, unchanged = self._dedupe_shots(shots)
         n = (len(shots) if shots else 0) + len(images)
         label = text if text else "(look at my screens)"
         if n:
             label += (f"   🖼×{n}" if n > 1 else "   🖼")
+        elif unchanged:
+            label += "   🖼 unchanged"
         self.add_user(label)
+        if self._resume_btn is not None:   # a NEW conversation is starting — resuming now
+            try:                           # would silently discard it; retire the offer
+                self._resume_btn._set_ustate("stale")
+            except Exception:
+                pass
+            self._resume_btn = None
         if IMAGE_INPUT == "inline":
             paths = [s["path"] for s in (shots or [])] + list(images)
-            self.worker.ask(self._inline_text(text, shots, images), paths)
+            self.worker.ask(self._inline_text(text, shots, images, unchanged), paths)
         else:
             self.worker.ask(self._build_prompt(text, shots, images), [])
         self._set_busy(True)
 
-    def _inline_text(self, text, shots, images):
+    # ── the type-ahead line-up (the CLI's message queue) ──
+    def _queue_kick(self):
+        """Nudge the line-up: schedule one _queue_tick shortly. An after() rather than an
+        inline call so a kick from inside an event batch (turn_done is one of several
+        events a finished turn delivers) lets the whole batch drain before the next
+        message goes out — flushing synchronously at "result" would race the trailing
+        turn_done into marking the NEW turn idle."""
+        if not self._queue:
+            return
+        if self._queue_after is not None:
+            try:
+                self.root.after_cancel(self._queue_after)
+            except Exception:
+                pass
+            self._queue_after = None
+        try:
+            self._queue_after = self.root.after(50, self._queue_tick)
+        except Exception:
+            self._queue_after = None
+
+    def _queue_tick(self):
+        """Flush ONE queued message if nothing blocks it, else keep polling. One per tick
+        on purpose: the next flush waits for this turn's turn_done, which is what keeps
+        the transcript ordered user → reply → user → reply."""
+        if self._queue_after is not None:
+            try:
+                self.root.after_cancel(self._queue_after)
+            except Exception:
+                pass
+            self._queue_after = None
+        if not self._queue:
+            return
+        reason = None
+        if self._auth_dead:
+            reason = "the CLI's login is dead (sign in again and they'll go)"
+        elif self._queue_hold == "rate":
+            reason = "the allowance refused the last message; they go when it reopens"
+        if reason:
+            if not self._queue_held:      # announce a hold once per onset, not per tick
+                self._queue_held = True
+                self.add_sys(f"⏸ {len(self._queue)} queued message(s) on hold — {reason}.")
+                self._refresh_queue()
+            self._queue_after = self.root.after(_QUEUE_POLL_MS, self._queue_tick)
+            return
+        if self._queue_held:
+            self._queue_held = False
+            self._refresh_queue()
+        if self.busy or self._compacting or self._discard_pending:
+            self._queue_after = self.root.after(_QUEUE_POLL_MS, self._queue_tick)
+            return
+        item = self._queue.pop(0)
+        self._refresh_queue()
+        self._deliver(item)
+
+    def _drop_queue(self, note=None):
+        """Empty the line-up. With a note, the texts aren't thrown away silently: they're
+        listed in the transcript (where they can be copied back), and the first one goes
+        back into the box if it's free. Returns how many were dropped."""
+        if not self._queue:
+            return 0
+        dropped, self._queue = self._queue, []
+        self._queue_held = False
+        self._queue_hold = None
+        self._refresh_queue()
+        if note:
+            lines = "\n".join("    • " + self._one_line(q["text"] or "(look at my screens)", 90)
+                              for q in dropped)
+            self.add_sys(f"{note} — {len(dropped)} queued message(s) were not sent:\n{lines}")
+            first = dropped[0]["text"]
+            if first and not self._entry_text():
+                self._ph_out()
+                self.entry.insert("1.0", first)
+                self._ph_active = False
+                self.entry.configure(fg=T["text"])
+        return len(dropped)
+
+    def _drop_queued(self, item):
+        """The row's ✕. Not just a discard: the text goes back into an EMPTY box, so the
+        natural gesture — queue it, spot the typo, click ✕, fix, Enter — costs nothing.
+        A box with something in it outranks the reclaimed text, which is simply dropped."""
+        self._queue = [q for q in self._queue if q is not item]
+        if not self._queue:
+            self._queue_held = False
+            self._queue_hold = None
+        self._refresh_queue()
+        if item["text"] and not self._entry_text():
+            self._ph_out()
+            self.entry.insert("1.0", item["text"])
+            self._ph_active = False
+            self.entry.configure(fg=T["text"])
+
+    @staticmethod
+    def _one_line(s, n):
+        s = " ".join(str(s).split())
+        return s if len(s) <= n else s[:n] + "…"
+
+    def _queue_row_text(self, item, glyph):
+        """One row's label, measure-clipped to the strip's width: a Label never wraps, and
+        an over-long request could otherwise push the window wider (or clip the ✕ off the
+        edge, taking the remove affordance with it)."""
+        body = " ".join((item["text"] or "(look at my screens)").split())
+        n = (len(item["shots"]) if item["shots"] else 0) + len(item["images"])
+        tail = ((f"  🖼×{n}" if n > 1 else "  🖼") if n else "")
+        try:
+            w = self.input_wrap.winfo_width()
+        except Exception:
+            w = 0
+        avail = max(self.px(120), (w if w > 1 else self.px(420)) - self.px(90))
+        if self.f_small.measure(f"{glyph} {body}{tail}") <= avail:
+            return f"{glyph} {body}{tail}"
+        while len(body) > 1 and self.f_small.measure(f"{glyph} {body}…{tail}") > avail:
+            body = body[:max(1, int(len(body) * 0.9))]
+        return f"{glyph} {body}…{tail}"
+
+    def _refresh_queue(self, _e=None):
+        """Rebuild the line-up strip above the input box: one dimmed row per queued message,
+        each with its own ✕, capped at _QUEUE_ROWS_SHOWN rows plus a "＋N more" line.
+        Labels rather than canvases: they re-measure themselves when the shared small font
+        zooms, and there are at most four of them. Hidden entirely while the queue is empty."""
+        frame = getattr(self, "queue_frame", None)
+        if frame is None:
+            return
+        for w in self._queue_rows:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._queue_rows = []
+        if not self._queue:
+            try:
+                frame.pack_forget()
+            except Exception:
+                pass
+            return
+        try:
+            frame.pack(fill="x", side="top", before=self.canvas,
+                       padx=self.px(24), pady=(self.px(2), 0))
+        except Exception:
+            return
+        glyph = "⏸" if self._queue_held else "⏳"
+        shown = self._queue[:_QUEUE_ROWS_SHOWN]
+        for item in shown:
+            row = tk.Frame(frame, bg=T["bg"])
+            row.pack(fill="x")
+            x = tk.Label(row, text="✕", bg=T["bg"], fg=T["faint"], font=self.f_small,
+                         cursor="hand2")
+            x.pack(side="right", padx=(self.px(6), 0))
+            x.bind("<Button-1>", lambda e, it=item: self._drop_queued(it))
+            x.bind("<Enter>", lambda e, w=x: w.configure(fg=T["accent"]))
+            x.bind("<Leave>", lambda e, w=x: w.configure(fg=T["faint"]))
+            lbl = tk.Label(row, text=self._queue_row_text(item, glyph), bg=T["bg"],
+                           fg=T["muted"], font=self.f_small, anchor="w")
+            lbl.pack(side="left")
+            self._queue_rows.append(row)
+        more = len(self._queue) - len(shown)
+        if more:
+            lbl = tk.Label(frame, text=f"＋{more} more queued", bg=T["bg"], fg=T["faint"],
+                           font=self.f_small, anchor="w")
+            lbl.pack(fill="x")
+            self._queue_rows.append(lbl)
+
+    @staticmethod
+    def _shot_key(s):
+        """What a screenshot is OF: dedupe must never compare across targets (window-scope
+        vs a monitor, or monitor 0 vs 1) — identical bytes for different targets is
+        practically impossible anyway, but the keying keeps the intent explicit."""
+        return ("window",) if s.get("window") is not None else ("mon", s.get("index"))
+
+    def _dedupe_shots(self, shots):
+        """Split auto-captured shots into (changed, unchanged) against the last fingerprint
+        the model verifiably has, and stage the new ones as PENDING — they're promoted only
+        when the turn returns a clean result (see _handle "result"/"turn_done"), because a
+        turn that errors out or is stopped may never have delivered the image. Any read
+        failure counts as changed — when in doubt, attach (a stale "unchanged" pointer is
+        worse than 1s extra).
+
+        Two tests, cheapest first: identical bytes, then _shot_phash for the far more common
+        case of a screen that hasn't meaningfully changed but re-encodes differently anyway.
+        Comparison is always against the BASELINE the model holds, not against the previous
+        capture, so a screen drifting a bit per turn still re-attaches once the accumulated
+        drift matters — which is the honest reading of "has this changed since you saw it"."""
+        keep, unchanged = [], []
+        for s in shots:
+            try:
+                digest = hashlib.sha256(Path(s["path"]).read_bytes()).hexdigest()
+            except Exception:
+                keep.append(s)
+                continue
+            key = self._shot_key(s)
+            prev = self._sent_shot_hashes.get(key)
+            prev_sha, prev_look = prev if isinstance(prev, tuple) else (prev, None)
+            if prev_sha == digest:
+                unchanged.append(s)
+                continue
+            look = _shot_phash(s["path"])     # only worth decoding once the bytes differ
+            if _shot_looks_same(prev_look, look):
+                unchanged.append(s)
+                continue
+            keep.append(s)
+            self._pending_shot_hashes[key] = (digest, look)
+        return keep, unchanged
+
+    def _forget_sent_shots(self):
+        """The conversation context can no longer be trusted to contain the previously
+        sent screenshot(s) — attach fresh next time."""
+        self._sent_shot_hashes.clear()
+        self._pending_shot_hashes.clear()
+
+    def _inline_text(self, text, shots, images, unchanged=None):
         """Short text companion for inline-image turns: the model sees the images
-        directly, so we only add a one-line note about what's attached."""
+        directly, so we only add a one-line note about what's attached. Deduped
+        captures (see _dedupe_shots) become an explicit "unchanged" pointer instead —
+        the model must know it can trust the previous screenshot, or it may assume it
+        has no current view of the screen at all."""
         note = []
-        if shots:
+        if unchanged:
+            tags = ", ".join(
+                (f"the “{s['window']}” window" if s.get("window") is not None
+                 else f"monitor {s['index']}") for s in unchanged)
+            note.append(f"[My screen ({tags}) is UNCHANGED since the most recent screenshot "
+                        f"of it earlier in this conversation — keep using that one. If you "
+                        f"no longer have that screenshot in context, say so instead of "
+                        f"guessing.]")
+        if shots and shots[0].get("window") is not None:
+            note.append(f"[Attached: a live screenshot of my ACTIVE WINDOW only — "
+                        f"“{shots[0]['window']}” — not the full screen; other "
+                        f"windows and monitors are not visible to you.]")
+        elif shots:
             tags = ", ".join(f"monitor {s['index']}" + (" (primary)" if s["primary"] else "")
                              for s in shots)
             note.append(f"[Attached: a live screenshot of my screen — {tags}.]")
         if images:
             note.append(f"[Attached: {len(images)} pasted image(s).]")
-        body = text if text else ("Look at the attached screen(s)/image(s) and tell me "
-                                   "what's there / what I might want help with.")
+        if text:
+            body = text
+        elif shots or images:
+            body = ("Look at the attached screen(s)/image(s) and tell me "
+                    "what's there / what I might want help with.")
+        else:   # everything was deduped away — point at the context copy instead
+            body = ("Look at my screen (the most recent screenshot earlier in this "
+                    "conversation — it hasn't changed) and tell me what I might want "
+                    "help with.")
         return ("\n".join(note) + "\n\n" + body) if note else body
 
     def _precapture_soon(self, e=None):
@@ -2664,7 +4367,7 @@ class Overlay:
         shots = None
         try:
             mons = enumerate_monitors() or [{"rect": None, "primary": True}]
-            shots, _ = self._grab_shots(mons)
+            shots, _ = self._grab_shots_scoped(mons)
         except BaseException:
             shots = None
         finally:
@@ -2673,7 +4376,11 @@ class Overlay:
     def _build_prompt(self, text, shots, images=None):
         parts = []
         lines = []
-        if shots:
+        if shots and shots[0].get("window") is not None:
+            lines.append("My ACTIVE WINDOW was just captured — window only, NOT the full "
+                         "screen (other windows/monitors are not visible to you):")
+            lines.append(f"- Active window “{shots[0]['window']}”: {shots[0]['path']}")
+        elif shots:
             lines.append("My current display was just captured — one image per monitor:")
             for s in shots:
                 tag = "PRIMARY screen" if s["primary"] else "secondary screen"
@@ -2733,6 +4440,48 @@ class Overlay:
             pass
         return keep
 
+    def _capture_target_hwnd(self):
+        """The window a 'window'-scope capture should shoot: the current foreground
+        window when it's a usable external one, else the last external foreground
+        window _poll tracked (the app the user was in before focusing the overlay).
+        None → no usable window; the caller falls back to full-screen capture."""
+        hw = foreground_capture_window()
+        if hw:
+            return hw
+        hw = self._last_ext_fg
+        return hw if window_capturable(hw) else None
+
+    def _grab_window_shot(self):
+        """Capture ONLY the active window → ([shot], None), or (None, err) when there is
+        no usable window / the grab failed — the caller falls back to _grab_shots so a
+        capture is never silently dropped. Win32 + Pillow only, no Tk: safe on the
+        background precapture thread, like _grab_shots."""
+        try:
+            hwnd = self._capture_target_hwnd()
+            if not hwnd:
+                return None, None
+            bbox = window_bbox(hwnd)
+            if not bbox:
+                return None, None
+            img = ImageGrab.grab(bbox=bbox, all_screens=True)
+            if SHOT_MAX_EDGE and max(img.size) > SHOT_MAX_EDGE:
+                img.thumbnail((SHOT_MAX_EDGE, SHOT_MAX_EDGE), Image.LANCZOS)
+            p = self._save_shot(img, SHOT_DIR / f"shot_{int(time.time() * 1000)}_w")
+            self._prune_shots()
+            return [{"path": str(p), "primary": True, "index": 1,
+                     "window": window_title(hwnd) or "untitled window"}], None
+        except Exception as ex:
+            return None, ex
+
+    def _grab_shots_scoped(self, mons):
+        """Scope dispatcher used by both the send-time and precapture paths: the active
+        window when that scope is on AND a usable window exists, else every monitor."""
+        if self.window_shot:
+            shots, err = self._grab_window_shot()
+            if shots:
+                return shots, err
+        return self._grab_shots(mons)
+
     def _grab_shots(self, mons):
         """Pure capture: one screenshot per monitor → downscale → save. Touches NO Tk, so
         it is safe to run on a background thread (used by the precapture path). Returns
@@ -2774,7 +4523,7 @@ class Overlay:
             self.root.update()
             time.sleep(0.15)
         try:
-            shots, err = self._grab_shots(mons)
+            shots, err = self._grab_shots_scoped(mons)
         finally:
             if do_hide:
                 self.root.deiconify()
@@ -2820,6 +4569,45 @@ class Overlay:
         self.auto_shot = not self.auto_shot
         self._paint_screen_toggle()
 
+    def toggle_window_shot(self):
+        """Flip the capture scope between the active window and all screens. Like the
+        share toggle, the change is invisible on screen, so confirm it in-chat."""
+        self.window_shot = not self.window_shot
+        self._precaptured = None   # a frame grabbed under the OLD scope must not be sent
+        self._paint_window_toggle()
+        _save_state(window_shot=self.window_shot)   # deliberate choice → survives relaunch
+        if self.window_shot:
+            self.add_sys("🎯 Screenshots now capture the ACTIVE WINDOW only "
+                         "(falls back to full screen when no window is in focus).")
+        else:
+            self.add_sys("🖥 Screenshots capture all screens again (one image per monitor).")
+
+    def toggle_read_only(self):
+        """Ask the worker to flip between read-only ("plan") and the configured
+        full-access mode. Unlike the other toggles the state does NOT flip
+        optimistically: it only changes when the worker confirms the CLI accepted
+        the switch (the "permission_mode" event → _apply_permission_mode), so the
+        label never claims a safety state the agent isn't actually in."""
+        target = self._full_mode if self.read_only else "plan"
+        self._set_status("switching permissions…")
+        self.worker.set_permission_mode(target)
+
+    def _apply_permission_mode(self, mode):
+        """Worker confirmed the active permission mode: sync the toggle and, when it
+        actually changed, say so in-chat (the switch itself is invisible on screen)."""
+        ro = (mode == "plan")
+        changed = (ro != self.read_only)
+        self.read_only = ro
+        self._paint_ro_toggle()
+        if changed:
+            _save_state(read_only=ro)   # persist only CONFIRMED switches, never requests
+        if changed and ro:
+            self.add_sys("🔒 Read-only: Claude can see your screen, read files, and "
+                         "answer — but won't edit anything or run commands.")
+        elif changed:
+            self.add_sys(f"⚡ Full access ({mode}): Claude can now edit files and run "
+                         "commands without asking. Flip Read-only back on any time.")
+
     def toggle_screen_share(self):
         """Flip whether the overlay is visible in screen shares (Teams/Zoom/OBS). The change
         is invisible on your OWN screen — the window looks identical either way; it only
@@ -2849,7 +4637,32 @@ class Overlay:
         # async reset (close + reconnect) runs; the new session's true baseline arrives via the
         # worker's post-_open _emit_usage.
         self._ctx_pct = None
+        self._ctx_tokens = None
+        self._ctx_hist.clear()          # a new conversation burns at its own rate, not the old
+        self._ctx_warned = 0.0          # …and has earned the warning back
+        self._ctx_sample_due = False
+        self._last_sent = None          # a thrown-away conversation's draft must not come back
+                                        # (the quota reading itself survives: the allowance is
+                                        # the account's, not this conversation's)
+        self._cancel_retry()            # …and its scheduled retry must not fire into the new one
+        self._drop_queue(note="🔄 Cleared")  # queued messages belong to the discarded
+                                        # conversation; the note lands in the fresh transcript
+                                        # (the chat was wiped above) so the texts survive
         self._refresh_statusline()
+        # Clear = deliberate discard: forget the session AND its persisted record, so
+        # the next launch can't offer to resume a conversation the user threw away.
+        self._session_id = None
+        self._resume_btn = None          # the embedded button was just wiped with the chat
+        # Guard the window until the worker confirms the reset (reset_done): a stale
+        # (session / turn_done) batch from the turn that was in flight when Clear was
+        # clicked would otherwise re-set _session_id and re-persist the discarded record.
+        self._discard_pending = True
+        # Forget dedupe state NOW, at click time — not only when reset_done confirms. A
+        # send slipped in between (the worker is busy reconnecting, but the UI isn't busy)
+        # would otherwise dedupe against the discarded conversation and land an
+        # image-less "unchanged" prompt in the brand-new session.
+        self._forget_sent_shots()
+        _save_state(last_session=None)
         self.worker.reset()
         self._set_status("resetting…")
         # Chat was just wiped — drop the compaction banner/timer so a stray result line
@@ -2877,6 +4690,10 @@ class Overlay:
         if self.busy:
             self.add_sys("⏳ Finish (or Stop) the current reply before compacting.")
             return
+        # Forget dedupe state at click time, same reasoning as reset(): a send queued
+        # behind the compaction would otherwise dedupe against images the imminent
+        # summary may drop. (compact_done clears again — that one also covers failures.)
+        self._forget_sent_shots()
         self.worker.compact()
         self._set_status("compacting…")   # instant feedback; the animation starts on ("compacting")
 
@@ -2984,14 +4801,531 @@ class Overlay:
         self.busy_lbl.configure(text="thinking…" if busy else "")
 
     def _refresh_statusline(self):
-        p = f"{self._ctx_pct:.0f}%" if isinstance(self._ctx_pct, (int, float)) else "—"
         # version goes last so it clips first if the window is narrow; ⬆ flags an update
         ver = f"v{__version__}" + ("  ⬆" if self._update_available else "")
-        self.statusline.configure(
-            text=f"{self._model or 'Claude'} ▾   ·   context {p}   ·   {ver}", fg=T["muted"])
+        self.statusline.configure(text=f"{self._model or 'Claude'} ▾", fg=T["muted"])
+        self.ctx_lbl.configure(text=f"·   {self._gauge_text()}", fg=self._ctx_color())
+        self.ver_lbl.configure(text=f"·   {ver}", fg=T["muted"])
+        self._paint_quota_ring()
+
+    # ── the middle of the statusline ──
+    def _ctx_text(self):
+        """Context as a percentage, and nothing else.
+
+        The headroom in turns used to be appended here, which meant the row grew a second
+        clause the moment a burn rate could be read and lost it again after a compaction. The
+        one strip of chrome that should hold still was reflowing while you looked at it. The
+        figure is not gone - _usage_panel_text carries it, one hover away, and the end-of-turn
+        warning still speaks it."""
+        p = f"{self._ctx_pct:.0f}%" if isinstance(self._ctx_pct, (int, float)) else "—"
+        return f"context {p}"
+
+    def _gauge_text(self):
+        """What the row carries when the mark is not being hovered: context.
+
+        The allowance used to own this slot, with context demoted to a fallback and allowed
+        back only once it was over its own warning line - two percentages competing for one
+        place. The allowance lives on the ring now, and printing it here as well would be the
+        same number twice; on a narrow overlay that duplication is what pushed the version off
+        the end. Context is NOT duplicated by the ring: the ring is the plan allowance, context
+        is the size of THIS conversation, and the two answer different questions. So context
+        simply keeps the slot, and the competition this method used to arbitrate is gone.
+        """
+        return self._ctx_text()
+
+    def _usage_panel_text(self):
+        """Everything about usage, in one aligned block, for the panel the mark opens.
+
+        No unlabelled gauge explains itself. What makes one learnable is being able to
+        interrogate it, and the answer belongs where the asking happened - beside the mark,
+        not down in a status row that then reflows under the cursor. Both allowance windows
+        and context sit here together because they are the same question asked three ways, and
+        because context's turns figure had to leave the row to stop it moving."""
+        rows = []
+        wins = self._ring_windows()
+        for key, label in (("five_hour", "5h"), ("week", "week")):
+            u = (wins.get(key) or {}).get("utilization")
+            if isinstance(u, bool) or not isinstance(u, (int, float)):
+                continue
+            rows.append((label, f"{u * 100:.0f}%", self._quota_resets_text(wins[key])))
+        if not rows:
+            rows.append(("allowance", "—", "no reading yet"))
+        p = self._ctx_pct
+        if isinstance(p, (int, float)):
+            left = self._ctx_turns_left()
+            rows.append(("context", f"{p:.0f}%",
+                         f"~{left} turn{'' if left == 1 else 's'} left" if left is not None else ""))
+        w = max(len(r[0]) for r in rows)
+        return "\n".join(f"{a.ljust(w)}   {b:>4}   {c}".rstrip() for a, b, c in rows)
+
+    def _mark_enter(self, _e=None):
+        self._usage_panel.configure(text=self._usage_panel_text())
+        # Just under the titlebar, left-aligned with the mark it belongs to.
+        self._usage_panel.place(x=self.px(10), y=self.px(42))
+        self._usage_panel.lift()
+
+    def _mark_leave(self, _e=None):
+        self._usage_panel.place_forget()
+
+    def _maybe_explain_ring(self):
+        """Name the ring once, the first time there is something to point at.
+
+        A first-time reader has no way to guess that two arcs around a logo are a plan
+        allowance — the shape can carry the numbers but not their meaning. One sentence, said
+        once, is the only thing that closes that gap; after that the hover carries it."""
+        if self._ring_explained or not self._ring_arcs():
+            return
+        self._ring_explained = True
+        self.add_sys("◔ The ring on ✻ is your plan allowance — the inner arc is the 5-hour "
+                     "window, the outer one is weekly. Hover the mark for the numbers.")
+
+    def _gauge_quota(self):
+        """The freshest allowance reading, for DISPLAY only.
+
+        usage.py polls every minute; the CLI speaks only when its status transitions, so its
+        copy can be hours old — and while the overlay sits idle, hours old is exactly when the
+        number is worth looking at. So the poll wins the gauge whenever it has one.
+
+        It wins nothing else. _announce_quota and _offer_retry read self._quota directly and
+        deliberately: the polled reading carries no status (usage.py won't invent one from the
+        endpoint's severity vocabulary), and a warning that speaks, or a retry that puts a
+        message on the wire hours later, must come from the CLI's own event or not at all."""
+        w = (self._quota_polled or {}).get("windows")
+        if isinstance(w, dict) and w:
+            return _binding_window(w) or {}
+        return self._quota or {}
+
+    def _quota_windows(self):
+        """Every allowance window we can place on the ring, keyed by name.
+
+        The poll carries all of them. The CLI's own event carries exactly one, and only
+        sometimes names it — an unnamed one is DROPPED rather than parked on whichever track
+        is handy, because putting a weekly reading on the 5-hour arc would be a lie the user
+        has no way to see through. The statusline text still prints that number, so staying
+        silent here costs nothing.
+        """
+        w = (self._quota_polled or {}).get("windows")
+        if isinstance(w, dict) and w:
+            return w
+        q = self._quota or {}
+        u, name = q.get("utilization"), q.get("window")
+        if name in _QUOTA_WINDOWS and isinstance(u, (int, float)) and not isinstance(u, bool):
+            return {name: {"utilization": float(u), "resets_at": q.get("resets_at")}}
+        return {}
+
+    def _ring_color(self, u, quiet):
+        """Recessive until it isn't. An arc carries no number, so colour is the only channel
+        it has for urgency — hence its own amber step rather than waiting for the CLI's."""
+        if u >= _QUOTA_HOT:
+            return T["err"]
+        if u >= _QUOTA_WARN:
+            return T["accent"]
+        return quiet
+
+    def _ring_track(self):
+        """The empty part of a gauge, in a tone you can actually see.
+
+        The first cut used T["border"], which is 1.2:1 against the surface — exactly right for
+        a hairline between two panels and completely invisible as a track, so a fresh overlay
+        with no reading yet drew a mark that looked untouched. _contrast pins the replacement
+        rather than trusting the eye that missed it the first time."""
+        return _mix(T["bg"], T["faint"], 0.70)   # 1.8:1 light, 2.1:1 dark — seen, not shouted
+
+    def _ring_windows(self):
+        """The two tracks, each resolved to the one window it stands for. Shared by the ring
+        and by the hover text so a number and its label can never come from different windows."""
+        wins = self._quota_windows()
+        return {"five_hour": wins.get("five_hour"),
+                "week": _binding_window({k: v for k, v in wins.items() if k != "five_hour"})}
+
+    def _ring_arcs(self):
+        """What each track should show: {track: (fraction, colour)}, tracks with nothing to
+        say left out. Kept separate from the drawing so the numbers and colours can be tested
+        without decoding a bitmap."""
+        out = {}
+        for key, w in self._ring_windows().items():
+            u = (w or {}).get("utilization")
+            if isinstance(u, bool) or not isinstance(u, (int, float)) or u <= 0.005:
+                continue           # a hairline at 0% would read as "something is used"
+            out[key] = (min(1.0, float(u)), self._ring_color(u, T["muted"]))
+        return out
+
+    def _paint_quota_ring(self):
+        """The ✻ mark, ringed by two allowance gauges: the 5-hour window inside, the weekly
+        one outside.
+
+        WHY TWO, AND WHY HERE. The status row had one slot and filled it with whichever window
+        was furthest along, labelled "(5h)" or "(week)". That works as text because the text
+        says which window it is describing — but the row was also carrying the model name, the
+        reset time and the version, and on a narrow overlay the version was being clipped.
+        Moving the gauge onto the mark buys the row back; the catch is that an arc cannot carry
+        the label, so a single arc that silently changed meaning would be strictly worse than
+        the text it replaced. Two fixed tracks answer both at once: position IS the label, and
+        the thicker inner one is the window that ends the session you are sitting in.
+
+        Two arcs are also the honest reading of the data. The weekly window climbs slowly in
+        the background; the 5-hour one can go from a tenth to spent in an afternoon. Ranking
+        them by magnitude hid the 5-hour window for exactly as long as it sat below the weekly
+        number — which is where it is every time you sit down to work. Both are the same unit
+        (share of an allowance) on the same 0-1 scale, so drawing them together is one scale,
+        not two. The sweep runs clockwise from 12 o'clock, the direction a clock face reads,
+        which is what a window that empties and refills on a timer actually is.
+
+        WHY AN IMAGE. Tk's create_arc is not antialiased on Windows, and a 3px stroke on a 36px
+        circle comes out a visible staircase — the first cut of this was drawn with canvas
+        primitives and was unreadable at real size. Everything is rendered at _RING_SS× into
+        one PIL image, downsampled, and placed as a single canvas item, so every curve
+        (including the ✻ itself) is smooth. The photo is kept on the instance because Tk holds
+        only a weak claim on a PhotoImage — drop the Python reference and the mark goes blank.
+        """
+        c = getattr(self, "_mark", None)
+        if c is None:              # a repaint can land before the titlebar is built
+            return
+        sz = self._mark_sz
+        S = sz * _RING_SS
+        im = Image.new("RGB", (S, S), T["bg"])
+        d = ImageDraw.Draw(im)
+        arcs, track = self._ring_arcs(), self._ring_track()
+        for key, rf, wf in _RING_GEOM:
+            r, lw = S * rf, max(1, round(S * wf))
+            box = [S / 2 - r, S / 2 - r, S / 2 + r, S / 2 + r]
+            # The empty track is always drawn: an arc with nothing behind it reads as a
+            # fragment of something rather than as "this much of that".
+            d.arc(box, 0, 360, fill=track, width=lw)
+            a = arcs.get(key)
+            if a:
+                d.arc(box, -90, -90 + 360 * a[0], fill=a[1], width=lw)
+        self._draw_spark_pil(d, S)
+        self._ring_photo = ImageTk.PhotoImage(im.resize((sz, sz), Image.LANCZOS))
+        c.delete("ring")
+        c.create_image(sz / 2, sz / 2, image=self._ring_photo, tags="ring")
+
+    def _draw_spark_pil(self, d, S):
+        """The ✻ at the centre of the mark, into the same supersampled image as the rings.
+        Round tips are ellipses because PIL has no cap style; at _RING_SS× they land as the
+        same shape Tk's capstyle="round" used to give."""
+        import math
+        cx = cy = S / 2
+        r, w = S * _SPARK_R, max(1, round(S * 2 / 32))
+        for i in range(12):
+            a = math.pi * i / 6
+            r1 = r if i % 2 == 0 else r * 0.5
+            x, y = cx + r1 * math.cos(a), cy + r1 * math.sin(a)
+            d.line([cx, cy, x, y], fill=T["accent"], width=w)
+            d.ellipse([x - w / 2, y - w / 2, x + w / 2, y + w / 2], fill=T["accent"])
+
+    def _quota_resets_text(self, q):
+        """When the allowance comes back, as a wall clock. A live countdown would need a timer
+        redrawing a number nobody watches tick; the time you can start again is the thing you
+        actually plan around. Weekly windows can reset days out, so those name the day too.
+
+        Takes the reading to describe, because its two callers want different ones: the gauge
+        shows whichever is freshest, while an announcement must quote the same event whose
+        status it is announcing — mixing them could pair "weekly allowance is used up" with
+        the 5-hour window's reset time."""
+        ts = (q or {}).get("resets_at")
+        if not isinstance(ts, (int, float)) or ts <= 0:
+            return ""
+        try:
+            fmt = "%H:%M" if ts - time.time() < 20 * 3600 else "%a %H:%M"
+            return "resets " + time.strftime(fmt, time.localtime(ts))
+        except Exception:
+            return ""
+
+    def _gauge_color(self):
+        # Same reading the text came from, so colour and number can never describe different
+        # windows. A polled reading has no status, which is why _QUOTA_HOT colours by the
+        # number: an amber tier we'd have to guess at is worse than a red one we can prove.
+        q = self._gauge_quota()
+        u = q.get("utilization")
+        if isinstance(u, (int, float)):
+            st = q.get("status")
+            if st == "rejected" or u >= _QUOTA_HOT:
+                return T["err"]
+            if st == "allowed_warning":
+                return T["accent"]
+            return T["muted"]
+        return self._ctx_color()
+
+    def _ctx_color(self):
+        p = self._ctx_pct
+        if not isinstance(p, (int, float)):
+            return T["muted"]
+        if p >= _CTX_HOT_PCT:
+            return T["err"]
+        if p >= _CTX_WARN_PCT:
+            return T["accent"]
+        return T["muted"]
+
+    def _ctx_rate(self):
+        """Context percent consumed per turn over the recent window, or None when there's no
+        usable slope — fewer than two turns recorded, or a window that only went down."""
+        h = self._ctx_hist
+        if len(h) < 2:
+            return None
+        rate = (h[-1] - h[0]) / (len(h) - 1)
+        return rate if rate > 0 else None
+
+    def _ctx_turns_left(self):
+        """Whole turns of headroom at the current burn rate, or None if it can't be known.
+
+        Measured against a full window rather than the point where the CLI decides to
+        auto-compact, which we don't get told: the number is prefixed "~" and paired with a
+        warning that fires well before either, so it's a budget, not a countdown to a cliff."""
+        rate = self._ctx_rate()
+        if rate is None or not isinstance(self._ctx_pct, (int, float)):
+            return None
+        return max(0, int((100.0 - self._ctx_pct) / rate))
+
+    def _note_ctx_turn(self):
+        """Record where the context stood at the end of a turn, then warn if that's a new tier.
+
+        One sample per TURN, not per usage event: the rate worth showing is "how many more
+        messages do I get", and messages are the unit the user spends. A drop means something
+        won room back (a compaction, explicit or the CLI's own), so the old slope no longer
+        describes the new conversation — start the window over rather than average across it."""
+        p = self._ctx_pct
+        if not isinstance(p, (int, float)):
+            return
+        h = self._ctx_hist
+        if h and p < h[-1]:
+            h.clear()
+            self._ctx_warned = 0.0        # room won back → the warning is worth making again
+        h.append(float(p))
+        del h[:-_CTX_RATE_TURNS]
+        self._refresh_statusline()
+        self._maybe_warn_ctx()
+
+    def _maybe_warn_ctx(self):
+        """Say something ONCE per tier, at the end of a turn — the only moment at which
+        compacting is free. The CLI's own auto-compaction fires mid-answer, and running out
+        entirely ends the session; both are avoidable, but only if you're told in time."""
+        p = self._ctx_pct
+        if not isinstance(p, (int, float)) or self._compacting:
+            return
+        tier = _CTX_HOT_PCT if p >= _CTX_HOT_PCT else (_CTX_WARN_PCT if p >= _CTX_WARN_PCT else 0.0)
+        if not tier or tier <= self._ctx_warned:
+            return
+        self._ctx_warned = tier
+        left = self._ctx_turns_left()
+        room = f" — about {left} more turn{'' if left == 1 else 's'} at this rate" if left else ""
+        self.add_sys(f"◔ Context {p:.0f}% full{room}. {self._compact_advice()}")
+
+    def _announce_quota(self):
+        """Speak once per transition. The CLI only emits on change, but a reconnect replays
+        the current status, so remember what was already said rather than trust the stream.
+
+        This is the warning the overlay never had. Being cut off mid-task is what running out
+        of allowance feels like from the outside, and the entire value of having the number is
+        seeing it coming while there's still something to do about it."""
+        q = self._quota or {}
+        st = q.get("status")
+        if st == self._quota_said:
+            return
+        self._quota_said = st
+        if st not in ("allowed_warning", "rejected"):
+            return
+        win = _QUOTA_WINDOWS.get(q.get("window")) or "usage"
+        resets = self._quota_resets_text(q)
+        when = f" — {resets}" if resets else ""
+        if st == "rejected":
+            self.add_err(f"◔ Your {win} allowance is used up{when}.")
+        else:
+            u = q.get("utilization")
+            used = f"{u * 100:.0f}% of" if isinstance(u, (int, float)) else "close to"
+            self.add_sys(f"◔ {used} your {win} allowance is spent{when}. A smaller model "
+                         f"stretches what's left — click {self._model or 'the model'} ▾. "
+                         f"Turning Auto-shot off saves the most per message.")
+
+    def _restore_draft(self):
+        """Put a refused message back in the box.
+
+        A turn rejected for allowance never reached Claude, so the text is simply gone — and
+        it's gone at the exact moment the user has to wait hours to try again, which is the
+        worst possible time to have to remember what they were about to ask. Only fills an
+        EMPTY box: whatever they've started typing since outranks anything we kept."""
+        kept = (self._last_sent or ("", []))[0]
+        if not kept or self._entry_text():
+            return False
+        self._ph_out()
+        self.entry.insert("1.0", kept)
+        self._ph_active = False
+        self.entry.configure(fg=T["text"])
+        return True
+
+    # ── retrying when the allowance comes back ──
+    def _offer_retry(self, text):
+        """Offer to send a refused message the moment the allowance returns.
+
+        Opt-in, and deliberately so: arming this puts a message on the wire hours later,
+        quite possibly with nobody at the machine. That's a choice to make on purpose, not a
+        default to discover after the fact — so the overlay offers, and the user decides.
+
+        Needs a reset time to aim at. Without one there's nothing to schedule and the
+        restored draft stands on its own, which is still the important half."""
+        when = (self._quota or {}).get("resets_at")
+        if not isinstance(when, (int, float)) or when <= time.time() or not text:
+            return
+        self._cancel_retry()                    # never stack two offers
+        self._retry = {"at": int(when), "text": text, "armed": False}
+        self.chat.insert("end", "\n")
+        self._retry_btn = self._retry_btn_widget()
+        self.chat.window_create("end", window=self._retry_btn,
+                                padx=self.px(16), pady=self.px(2))
+        self.chat.insert("end", "\n")
+        self._scroll_follow()
+
+    def _retry_when(self):
+        r = self._retry or {}
+        ts = r.get("at")
+        if not isinstance(ts, (int, float)):
+            return ""
+        fmt = "%H:%M" if ts - time.time() < 20 * 3600 else "%a %H:%M"
+        return time.strftime(fmt, time.localtime(ts))
+
+    def _retry_btn_widget(self):
+        """Arm/cancel button for the scheduled retry — same embedded-canvas pattern as the
+        Copy and Update CLI buttons, including the wheel forward so it can't swallow scroll."""
+        c = tk.Canvas(self.chat, bg=T["bg"], highlightthickness=0, cursor="hand2", takefocus=0)
+        c._ustate = "idle"                         # idle | armed | sent | off
+        st = {"f": None, "w": 0, "h": 0, "rad": 0}
+        when = self._retry_when()
+        labels = {"idle":  f"⏱  Send it automatically at {when}",
+                  "armed": f"⏱  Waiting for {when} — click to cancel",
+                  "sent":  "✓  Sent when the allowance came back",
+                  "off":   "Cancelled — send it yourself whenever"}
+
+        def draw(hover=False):
+            c.delete("all")
+            s = c._ustate
+            if s == "idle":
+                bg = T["accent_hi"] if hover else T["accent"]
+                fg = T["on_accent"]
+            elif s == "armed":
+                bg, fg = (T["hover"] if hover else T["tool_bg"]), T["accent"]
+            else:                                  # sent / off → inert
+                bg, fg = T["tool_bg"], T["muted"]
+            round_rect(c, 1, 1, st["w"] - 1, st["h"] - 1, st["rad"], fill=bg, outline="")
+            c.create_text(st["w"] / 2, st["h"] / 2, text=labels[c._ustate], fill=fg,
+                          font=st["f"], anchor="center")
+
+        def render():
+            f = tkfont.Font(root=self.root, font=self.f_small)
+            c._overlay_fonts = [f]
+            pad = self.px(11)
+            widest = max(f.measure(v) for v in labels.values())   # widest state → no reflow
+            st.update(f=f, h=self.px(24), rad=self.px(7), w=pad + widest + pad)
+            c.configure(width=st["w"], height=st["h"])
+            draw()
+
+        def set_state(s):
+            c._ustate = s
+            try:
+                c.configure(cursor="hand2" if s in ("idle", "armed") else "arrow")
+                draw()
+            except Exception:
+                pass
+        c._set_ustate = set_state
+
+        def on_click(_e):
+            if c._ustate == "idle":
+                self._arm_retry()
+            elif c._ustate == "armed":
+                self._cancel_retry(note="⏱ Auto-send cancelled.")
+            return "break"                         # sent / off → inert
+        c._click = on_click
+
+        render()
+        c.bind("<Enter>", lambda e: draw(hover=True))
+        c.bind("<Leave>", lambda e: draw(hover=False))
+        c.bind("<Button-1>", on_click)
+        c.bind("<MouseWheel>", self._fwd_wheel)
+        self._register_zoomable(c, render)
+        return c
+
+    def _arm_retry(self):
+        if not self._retry:
+            return
+        self._retry["armed"] = True
+        self._set_retry_state("armed")
+        self.add_sys(f"⏱ Armed — your message goes out when the allowance resets "
+                     f"(about {self._retry_when()}). Type anything else and it stands down.")
+        self._retry_tick()
+
+    def _set_retry_state(self, state):
+        btn = self._retry_btn
+        if btn is not None:
+            try:
+                btn._set_ustate(state)
+            except Exception:
+                pass
+
+    def _cancel_retry(self, note=None):
+        """Stand down. Called on Clear, on a manual send, when the draft stops matching, and
+        from the button itself — anything that means the user has taken the wheel back."""
+        if self._retry_after is not None:
+            try:
+                self.root.after_cancel(self._retry_after)
+            except Exception:
+                pass
+            self._retry_after = None
+        was_armed = bool((self._retry or {}).get("armed"))
+        if self._retry is not None:
+            self._set_retry_state("off")
+        self._retry = None
+        self._retry_btn = None
+        if note and was_armed:
+            self.add_sys(note)
+
+    def _retry_tick(self):
+        """Poll the wall clock while a retry is armed. Also the place the guards live, because
+        an armed retry has to survive minutes or hours of the user doing other things."""
+        if self._retry_after is not None:
+            # Arming and the CLI's own "you're allowed again" can both land here; without
+            # this, each would leave its own after() chain polling the same retry.
+            try:
+                self.root.after_cancel(self._retry_after)
+            except Exception:
+                pass
+            self._retry_after = None
+        r = self._retry
+        if not r or not r.get("armed"):
+            return
+        if self._entry_text() != r["text"]:
+            # They've started writing something else. Sending the old text now would push
+            # their draft out from under them mid-sentence.
+            self._cancel_retry(note="⏱ Auto-send stood down — the box has something newer in it.")
+            return
+        if (r.get("ready") or time.time() >= r["at"]) and not self.busy and not self._compacting:
+            self._fire_retry()
+            return
+        self._retry_after = self.root.after(_RETRY_POLL_MS, self._retry_tick)
+
+    def _fire_retry(self):
+        """Send it. Disarms FIRST, and only once: if the allowance still refuses (a clock
+        that disagrees with the server's by a minute is enough), the refusal offers a fresh
+        button rather than spinning a retry loop nobody asked for."""
+        self._retry["armed"] = False
+        self._set_retry_state("sent")
+        self._retry = None
+        self._retry_btn = None
+        self.add_sys("⏱ Allowance is back — sending your message.")
+        self._send_or_stop()
+
+    def _compact_advice(self):
+        """What compacting would cost right now, in seconds. Quoting today's number is also
+        the argument for not waiting: the fitted duration rises with the size of what's being
+        summarized, so the same job only gets more expensive from here.
+
+        Deliberately restricted to our own remembered runs — _compact_samples_from_transcripts
+        reads a dozen files and this runs on the UI thread, where half a second of disk is a
+        visible stall in a window that sits on top of the user's work."""
+        eta = _compact_predict(_compact_history(), self._ctx_tokens) if self._ctx_tokens else None
+        cost = f" (~{self._compact_elapsed(eta)})" if eta else ""
+        return f"Compact now{cost} — it only gets slower as the window fills."
 
     # ── compaction animation (mirrors the Claude Code CLI's /compact spinner) ──
-    def _start_compact_anim(self):
+    def _start_compact_anim(self, payload=None):
         """Animate a one-line banner in the chat and pulse it until compaction finishes,
         then rewrite that same line as the result. It's REAL Text content (not an embedded
         widget), so it word-wraps with the window width and zooms with Ctrl +/−. The line is
@@ -3004,7 +5338,11 @@ class Overlay:
         self.chat.tag_configure("compact", foreground=T["accent"], font=self.f_chip,
                                 lmargin1=self.px(18), lmargin2=self.px(18), rmargin=self.px(14),
                                 spacing1=self.px(6), spacing3=self.px(4))
-        at_bottom = self.chat.yview()[1] > 0.999
+        # The bar rides in the mono font so its cells stay aligned at any zoom, and holds a
+        # steady accent while the sparkle/elapsed pulse around it (raised so its font+colour
+        # win over "compact", which _compact_tick recolours every frame).
+        self.chat.tag_configure("compact_bar", foreground=T["accent"], font=self.f_mono)
+        self.chat.tag_raise("compact_bar")
         self.chat.insert("end", "\n")
         start = self.chat.index("end-1c")           # start of our (about-to-be-written) line
         self.chat.insert("end", " \n", "compact")
@@ -3013,10 +5351,37 @@ class Overlay:
         self._compact_line = True
         self._compact_t0 = time.monotonic()
         self._compact_frame = 0
+        # How big the thing being compacted is (the worker reads it off the last context
+        # measurement), and therefore roughly how long this should take.
+        pre = payload.get("pre_tokens") if isinstance(payload, dict) else None
+        self._compact_pre = int(pre) if isinstance(pre, (int, float)) and pre > 0 else None
+        own = _compact_history()
+        self._compact_eta = _compact_predict(own, self._compact_pre)
+        if len(own) < 2:
+            # Under two runs of our own there's no line to fit, so the estimate above (if any)
+            # ignores size. Go mine the CLI's transcripts for more.
+            self._seed_compact_eta()
         self._set_status("compacting…")
-        if at_bottom:
-            self.chat.see("end")
+        self._scroll_follow()
         self._compact_tick()
+
+    def _seed_compact_eta(self):
+        """Too few compactions of our own to fit one: fall back to the durations recorded in
+        the CLI's own session logs (which include any the overlay already drove). Reading a
+        dozen of them takes ~0.5s — nothing next to a compaction that runs for minutes, but
+        far too long to block the UI — so it happens off-thread, and the banner runs on
+        whatever we had until this lands."""
+        pre = self._compact_pre
+
+        def work():
+            try:
+                samples = _compact_samples_from_transcripts()
+                eta = _compact_predict(samples, pre) if len(samples) >= 2 else None
+            except Exception:
+                return
+            if eta is not None:
+                self.ui_q.put(("compact_eta", eta))
+        threading.Thread(target=work, name="compact-eta", daemon=True).start()
 
     def _compact_tick(self):
         if not self._compacting or not self._compact_line:
@@ -3024,18 +5389,71 @@ class Overlay:
         frames = "✶✷✸✹✺✹✸✷"             # a sparkle that pulses (same ✦/✻ family as the rest of the UI)
         i = self._compact_frame
         spark = frames[i % len(frames)]
-        dots = "." * (i % 4)
-        el = int(time.monotonic() - self._compact_t0)
+        t = time.monotonic() - self._compact_t0
+        eta = self._compact_eta
+        if eta and t < eta:
+            frac = self._compact_progress(t, eta)
+            # The percentage already carries the elapsed/predicted pair (it IS elapsed over the
+            # prediction), so showing both said the same thing twice and wrapped the line.
+            label, bar = "Compacting conversation", self._compact_bar_filled(frac)
+            tail = f"   {frac * 100:.0f}%"
+        else:
+            # No prediction, or one we've already run past. Either way there's no honest
+            # percentage left — a bar creeping 97 → 98 % looks hung and reads as *worse* than
+            # admitting we don't know. So say so, circulate the band again, and put back the
+            # one number we actually measured.
+            label = "Still compacting" if eta else "Compacting conversation"
+            bar, tail = self._compact_bar(i), f"   {self._compact_elapsed(t)}"
         try:
             self.chat.delete("compact_ln", "compact_ln lineend")
-            self.chat.insert("compact_ln", f"{spark}  Compacting conversation{dots}   ({el}s)",
-                             "compact")
+            self.chat.insert("compact_ln", f"{spark}  {label}   ", "compact",
+                             bar, ("compact", "compact_bar"),
+                             tail, "compact")
             self.chat.tag_configure(
                 "compact", foreground=(T["accent"] if (i // 2) % 2 == 0 else T["accent_hi"]))
         except tk.TclError:
             return                        # line/mark gone (chat cleared) → stop quietly
         self._compact_frame = i + 1
         self._compact_anim_after = self.root.after(110, self._compact_tick)
+
+    # /compact emits no progress events, so a *measured* percentage is impossible. Where we
+    # have past timings the bar fills against a PREDICTED duration; where we don't — or once
+    # a run outlives that prediction — a band circulates the track instead, which is honest
+    # "working, duration unknown" motion rather than a number pretending to still mean something.
+    # 18 cells at the 110ms tick means one full lap every ~2s, and each cell is ~5.5%.
+    _COMPACT_BAR_CELLS = 18
+    _COMPACT_BAR_BAND = 6
+
+    def _compact_bar_filled(self, frac):
+        # Floor, not round: _compact_progress never returns 1.0, so flooring guarantees the
+        # last cell stays empty until the CLI actually reports done — a visually FULL bar
+        # would claim a completion we haven't been told about.
+        w = self._COMPACT_BAR_CELLS
+        n = max(0, min(w, int(frac * w)))
+        return "█" * n + "░" * (w - n)
+
+    @staticmethod
+    def _compact_progress(elapsed, eta):
+        """Fraction of the predicted duration, 0 ≤ f ≤ 0.90 — linear, and capped short of the
+        end because only the CLI's done event proves a compaction actually finished. Callers
+        only use this up to the prediction; past it they drop the percentage rather than
+        invent more of it."""
+        if eta <= 0:
+            return 0.0
+        return 0.90 * max(0.0, min(1.0, elapsed / eta))
+
+    def _compact_bar(self, frame):
+        w, b = self._COMPACT_BAR_CELLS, self._COMPACT_BAR_BAND
+        cells = ["░"] * w
+        for k in range(b):
+            cells[(frame + k) % w] = "█"
+        return "".join(cells)
+
+    @staticmethod
+    def _compact_elapsed(sec):
+        """Bare seconds while short; m+s once a compaction runs past a minute."""
+        sec = max(0, int(sec))
+        return f"{sec}s" if sec < 60 else f"{sec // 60}m{sec % 60:02d}s"
 
     def _stop_compact_anim(self, payload):
         self._compacting = False
@@ -3053,8 +5471,17 @@ class Overlay:
             detail = payload.get("detail")
         else:
             status, meta, detail = "ok", payload, None
+        took = time.monotonic() - self._compact_t0
         if status == "ok":
-            final = self._format_compact_result(meta)
+            # The CLI's own duration_ms is authoritative (it excludes our queueing); the wall
+            # clock is the fallback. Remembering (size, duration) is what lets the NEXT
+            # compaction show a progress bar instead of a bare spinner.
+            m = meta if isinstance(meta, dict) else {}
+            ms = m.get("duration_ms")
+            if isinstance(ms, (int, float)) and ms > 0:
+                took = ms / 1000.0
+            _compact_history_add(m.get("pre_tokens") or self._compact_pre, took)
+            final = self._format_compact_result(meta, took)
         elif status == "unconfirmed":
             final = "⚠ Compaction finished, but success couldn't be confirmed — context may be unchanged."
             if detail:
@@ -3089,21 +5516,37 @@ class Overlay:
             self.add_sys(final)
         self._refresh_statusline()
 
-    def _format_compact_result(self, meta):
+    def _format_compact_result(self, meta, took=None):
+        # The duration isn't decoration: it's the sample the next run's estimate is built on,
+        # so showing it lets the user see the prediction converge.
+        el = f" in {self._compact_elapsed(took)}" if took else ""
         if isinstance(meta, dict) and meta.get("pre_tokens") and meta.get("post_tokens"):
             try:
                 pre, post = int(meta["pre_tokens"]), int(meta["post_tokens"])
                 saved = (1 - post / pre) * 100 if pre else 0
-                return (f"✦ Compacted — {pre:,} → {post:,} tokens "
+                return (f"✦ Compacted{el} — {pre:,} → {post:,} tokens "
                         f"(saved {saved:.0f}%). History summarized; keep going.")
             except Exception:
                 pass
-        return "✦ Compacted — conversation history summarized; keep going."
+        return f"✦ Compacted{el} — conversation history summarized; keep going."
+
+    def _menu_models(self):
+        """The models to offer in the switcher: MODELS minus the families this login has no
+        access to. Hardcoding the full list meant offering Fable to a colleague whose CLI
+        has no Fable — and picking it raised no error, because the CLI silently falls back
+        to the account default, so the overlay just appeared to ignore the click. Falls back
+        to the full list whenever entitlement can't be read (see modelresolve)."""
+        if not MODEL_MENU_FILTER:
+            return list(MODELS)
+        try:
+            return modelresolve.available_models(MODELS)
+        except Exception:
+            return list(MODELS)   # the switcher must work even if this reading breaks
 
     def _model_menu(self, e):
         m = tk.Menu(self.root, tearoff=0, bg=T["field"], fg=T["text"],
                     activebackground=T["accent"], activeforeground=T["on_accent"], bd=0)
-        for lbl, val in MODELS:
+        for lbl, val in self._menu_models():
             m.add_command(label=lbl, command=lambda v=val: self._switch_model(v))
         try:
             m.tk_popup(e.x_root, e.y_root)
@@ -3126,6 +5569,7 @@ class Overlay:
         # caught in the act and attributed (large transcript vs. streaming contention).
         t0 = time.monotonic()
         self.chat.yview_scroll(int(-e.delta / 120), "units")
+        self._sync_follow()          # scrolling up stops the follow; back to the end resumes it
         if DEBUG_LOG:
             dt = (time.monotonic() - t0) * 1000
             if dt > 50:   # only genuinely janky frames
@@ -3158,6 +5602,24 @@ class Overlay:
                     self._vscreen_sig = sig
             except Exception:
                 pass
+        # Track the most recent EXTERNAL foreground window (throttled, one cheap Win32
+        # call): when a "window"-scope capture happens while the overlay itself has
+        # focus — which is ALWAYS the case at send time, the user just typed here —
+        # this remembered hwnd is the window the user was actually working in. Tracked
+        # even while the toggle is off, so flipping it on works on the very next send.
+        if self._last_pump - self._fg_checked > 0.5:
+            self._fg_checked = self._last_pump
+            try:
+                hw = foreground_capture_window()
+                if hw:
+                    self._last_ext_fg = hw
+            except Exception:
+                pass
+        # Credential watchdog: the CLI's login can be killed from outside this process (a
+        # failed refresh in ANY claude process blanks the shared credential file), and it can
+        # be repaired from outside too (a terminal `claude auth login`). Poll it so both are
+        # announced on their own. Throttled to AUTH_CHECK_INTERVAL — one stat() per tick.
+        self._auth_watchdog(self._last_pump)
         if DEBUG_LOG and (self._last_pump - getattr(self, "_pump_logged", 0.0)) > 10.0:
             self._pump_logged = self._last_pump
             try:
@@ -3228,12 +5690,15 @@ class Overlay:
             self.busy_lbl.configure(text="")
             self._refresh_statusline()
         elif kind == "reset_done":
+            self._discard_pending = False   # worker confirmed the wipe: stale events, if any,
+                                            # have drained ahead of this; the new session is live
             self.add_sys("🔄 new conversation.")
             # Don't null _ctx_pct here: reset() already cleared it on click, and the worker's
             # post-_open _emit_usage has (just before this) pushed the NEW session's real
             # baseline. Nulling now would discard that correct value and leave a bare "—".
             self._refresh_statusline()
             self._set_busy(False)
+            self._forget_sent_shots()        # fresh context has no previous screenshot
         elif kind == "delta":
             self.add_delta(payload)
         elif kind == "think":
@@ -3246,18 +5711,131 @@ class Overlay:
         elif kind == "ctx":
             self._ctx_pct = payload
             self._refresh_statusline()
+            # The worker schedules its usage refresh AFTER turn_done (to free "thinking…" a
+            # round-trip earlier), so the reading that actually includes the finished turn is
+            # this one — sample here rather than at turn_done, where it's a turn stale.
+            if self._ctx_sample_due:
+                self._ctx_sample_due = False
+                self._note_ctx_turn()
+        elif kind == "ctx_tokens":
+            self._ctx_tokens = payload
+        elif kind == "quota":
+            self._quota = payload if isinstance(payload, dict) else None
+            self._refresh_statusline()
+            self._maybe_explain_ring()
+            self._announce_quota()
+            # The CLI saying the allowance is no longer rejected beats waiting for a clock we
+            # only ever got a prediction of. A retry is only ever armed after a rejection, so
+            # any later reading that isn't one means the window really has reopened.
+            r = self._retry
+            if r and r.get("armed") and (self._quota or {}).get("status") not in (None, "rejected"):
+                r["ready"] = True     # sticky: if we're mid-turn right now, the next tick uses it
+                self._retry_tick()
+            # The same signal releases a held line-up: the CLI itself no longer reports the
+            # allowance as rejected, so queued messages may go back on the wire.
+            if self._queue_hold == "rate" and \
+                    (self._quota or {}).get("status") not in (None, "rejected"):
+                self._queue_hold = None
+                self._queue_kick()
+        elif kind == "quota_poll":
+            # usage.py asked the allowance endpoint itself, so the gauge is right without
+            # having to send a message first. Display only, and on purpose: no announcement
+            # (the reading carries no status to announce) and no retry re-arm (only the CLI's
+            # own event may decide that a refused message can go back on the wire).
+            if isinstance(payload, dict):
+                self._quota_polled = payload
+                self._refresh_statusline()
+                self._maybe_explain_ring()
         elif kind == "turn_done":
             self._md_finalize()          # the turn ended → give the last line full block styling
             self._finish_turn_copy()     # then a Copy button under the reply
+            self._ctx_sample_due = True  # arm one burn-rate sample for the usage refresh coming
             self._set_busy(False)
             self._maybe_flag_done()      # badge the orb if this finished while collapsed
+            # Whatever pending shot hashes weren't promoted by a clean "result" belong to a
+            # turn that ended without one (stopped, errored, transport died) — the model may
+            # never have seen those images, so they must not become dedupe baselines.
+            self._pending_shot_hashes.clear()
+            if not self._discard_pending:
+                self._persist_session()  # this conversation is now the resumable one
+                                         # (skipped for a turn Cleared mid-flight)
+            self._queue_kick()           # turn_done is always a turn's LAST event (worker
+                                         # emits it in a finally), so the line-up may flush
+        elif kind == "session":
+            if not self._discard_pending:   # ignore a stale id from a Cleared conversation
+                self._session_id = str(payload)
+        elif kind == "resumed":
+            self._set_status("")
+            if self._resume_btn is not None:
+                try:
+                    self._resume_btn._set_ustate("done")
+                except Exception:
+                    pass
+                self._resume_btn = None
+            self.add_sys("↺ Resumed your last conversation. The transcript isn't "
+                         "replayed here, but Claude remembers it — just keep going.")
+            self._persist_session()      # keep it resumable even if no new turn follows
+        elif kind == "resume_failed":
+            self._set_status("")
+            self._forget_sent_shots()    # whatever session we're on, it isn't the one the
+                                         # dedupe cache was describing
+            if self._resume_btn is not None:
+                try:
+                    self._resume_btn._set_ustate("failed")
+                except Exception:
+                    pass
+                self._resume_btn = None
+            else:
+                # The offer was already retired (a send or Clear raced the resume outcome),
+                # so the button can't carry the news. Say it in the chat, or the fallback to
+                # a fresh session would be completely silent — the one thing this feature is
+                # meant not to do.
+                self.add_sys("↺ Couldn't resume the previous conversation — this is a "
+                             "fresh session.")
+        elif kind == "resume_lost":
+            # The connect looked like a resume, but the CLI's first streamed id proves it
+            # silently started FRESH (see worker._set_session). Correct the earlier
+            # optimistic "resumed" so the user isn't told the context is back when it isn't.
+            self.add_err("⚠ The previous conversation couldn't be restored after all — the "
+                         "CLI started a fresh session, so earlier context isn't available.")
+            self._forget_sent_shots()    # the fresh session has none of the old screenshots
+            if self._resume_btn is not None:
+                try:
+                    self._resume_btn._set_ustate("failed")
+                except Exception:
+                    pass
+                self._resume_btn = None
         elif kind == "compacting":
-            self._start_compact_anim()
+            self._start_compact_anim(payload)
+        elif kind == "compact_eta":
+            # Size-aware estimate mined from the CLI's transcripts, arriving a beat into the run
+            # (see _seed_compact_eta). It's fitted to two or more samples, so it supersedes the
+            # size-blind median we may have started with — but only while the run is still live.
+            if self._compacting:
+                self._compact_eta = payload
         elif kind == "compact_done":
             self._stop_compact_anim(payload)
+            # Compaction may summarize the previous screenshot right out of the context;
+            # "screen unchanged, keep using it" would then point at nothing. Attach fresh.
+            self._forget_sent_shots()
+            self._queue_kick()           # compaction ends without a turn_done; messages
+                                         # queued during it flush here
+        elif kind == "auto_compacted":
+            # Same as compact_done, but for the CLI's AUTOMATIC mid-stream compaction —
+            # there is no banner/animation for it, only the cache consequence.
+            self._forget_sent_shots()
+        elif kind == "session_replaced":
+            # The worker had to stand up a FRESH session (resume unsupported/failed): the
+            # old context — including every screenshot in it — is gone.
+            self._forget_sent_shots()
         elif kind == "error":
             self.add_err(str(payload))
             self._set_busy(False)
+            # Any error may mean the turn (and its screenshot) never reached the model, or
+            # that the worker reconnected into a fresh session. Deliberately coarse: the
+            # cost of a wrong clear is one redundant image, the cost of a stale "unchanged"
+            # pointer is the model trusting a screenshot it does not have.
+            self._forget_sent_shots()
         elif kind == "result":
             self._md_finalize()          # finalize before any error line is appended
             self._finish_turn_copy()     # Copy button under whatever reply text we did get
@@ -3265,6 +5843,26 @@ class Overlay:
             # our side; surface it WITH the CLI's reason (subtype/result) instead of a generic line.
             if isinstance(payload, dict) and payload.get("is_error"):
                 self.add_err(self._format_turn_error(payload))
+                # A turn refused for allowance never reached Claude. Give the text back
+                # rather than make the user reconstruct it after a wait they didn't choose.
+                if "rate_limit" in str(payload.get("subtype") or "") and self._restore_draft():
+                    self.add_sys("↩ Your message is back in the box.")
+                    self._offer_retry((self._last_sent or ("", []))[0])
+                if "rate_limit" in str(payload.get("subtype") or "") and self._queue:
+                    self._queue_hold = "rate"   # flushing the line-up into a closed allowance
+                                                # would burn every message the same way; the
+                                                # quota event releases the hold the moment the
+                                                # CLI stops saying "rejected"
+                # This turn's screenshots may never have reached the model — drop their
+                # staged hashes so the next send re-attaches instead of saying "unchanged".
+                # (Hashes already COMMITTED by earlier clean turns stay: an errored turn
+                # doesn't remove images that are already part of the conversation.)
+                self._pending_shot_hashes.clear()
+            else:
+                # Clean result: the model has verifiably seen this turn's images — they
+                # become the dedupe baseline.
+                self._sent_shot_hashes.update(self._pending_shot_hashes)
+                self._pending_shot_hashes.clear()
             self._set_busy(False)
         elif kind == "attach":          # background paste finished (paths, failed_count)
             self._paste_busy = False
@@ -3281,15 +5879,24 @@ class Overlay:
             self._capture_busy = False
             if payload:
                 self._precaptured = (payload, time.monotonic())
+        elif kind == "sessions":
+            store, rows = payload
+            self._show_session_rows(store, rows)
+        elif kind == "sessions_failed":
+            self._sessions_loading = False
+            self.add_err(f"Couldn't read your past conversations: {payload}")
         elif kind == "status":
             self._set_status(str(payload))
+        elif kind == "permission_mode":
+            self._apply_permission_mode(str(payload))
         elif kind == "system":
             self.add_sys(str(payload))
         elif kind == "update":
             self._update_available = str(payload)
-            self.add_sys(f"🔔 Update available: v{payload} (you have v{__version__}). "
-                         "Close the overlay and run update.cmd (or: git pull) to upgrade.")
+            self._show_overlay_update_notice(str(payload))
             self._refresh_statusline()
+        elif kind == "ov_update_result":
+            self._show_overlay_update_result(payload)
         elif kind == "cli_update":
             self._show_cli_update_notice(payload)
         elif kind == "cli_update_result":
@@ -3315,6 +5922,11 @@ class Overlay:
             pass
         try:
             self.worker.interrupt()      # stop any in-flight turn so it can close cleanly
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_usage_poll", None):
+                self._usage_poll.stop()  # daemon anyway; this just stops it waking up mid-teardown
         except Exception:
             pass
         self.worker.shutdown()
@@ -3362,10 +5974,14 @@ def _selfheal_taskbar_shortcut():
 
 
 if __name__ == "__main__":
-    set_dpi_awareness()
-    set_app_user_model_id()   # before any window, so the taskbar uses our icon
-    _selfheal_taskbar_shortcut()
-    try:
-        Overlay().run()
-    except KeyboardInterrupt:
-        sys.exit(0)
+    # Everything from here to mainloop() runs before there is a window to show an error
+    # in, so a failure would otherwise be invisible (see crashreport). The guard writes
+    # the traceback to %LOCALAPPDATA%\claude-overlay\crash.log and puts it on screen.
+    with crashreport.guard("starting up", __version__):
+        set_dpi_awareness()
+        set_app_user_model_id()   # before any window, so the taskbar uses our icon
+        _selfheal_taskbar_shortcut()
+        try:
+            Overlay().run()
+        except KeyboardInterrupt:
+            sys.exit(0)

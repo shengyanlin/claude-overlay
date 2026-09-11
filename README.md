@@ -6,6 +6,7 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-3776AB" alt="Python 3.10+">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-3DA639" alt="License: MIT"></a>
   <a href="https://github.com/shengyanlin/claude-overlay/stargazers"><img src="https://img.shields.io/github/stars/shengyanlin/claude-overlay?style=social" alt="GitHub stars"></a>
+  <a href="https://github.com/hesreallyhim/awesome-claude-code"><img src="https://awesome.re/mentioned-badge-flat.svg" alt="Mentioned in Awesome Claude Code"></a>
 </p>
 
 > ### Talk to Claude Code without ever leaving the app you're in — and let it actually *see* your screen.
@@ -46,9 +47,15 @@ so it uses your **existing Claude subscription — no API key, no metered billin
   edits files, runs commands, and can even reach into the app on your screen (say,
   fix the wording on your open slide, or build a model in your open Excel), not just
   answer questions.
+- 🔁 **Conversations survive restarts.** Relaunch the overlay (say, after an update)
+  and it offers a one-click **Resume last conversation** — and if the connection to
+  the CLI drops mid-session, it reconnects *into the same conversation* instead of
+  losing your context.
 - 💸 **No API key, no extra cost.** Runs on your existing Claude subscription.
 - 🖼️ **Screenshots *and* pasted images.** It grabs your screen automatically on every
-  message, or paste any image with **Ctrl+V** to ask about it.
+  message, or paste any image with **Ctrl+V** to ask about it. If your screen hasn't
+  changed since the last message, the duplicate isn't re-sent (Claude is told to keep
+  using the one it already has) — follow-up questions answer measurably faster.
 - ⚡ **Live, polished UI.** Responses stream token-by-token with clean tool-call
   chips, an in-place model switcher, and a context-usage meter.
 - 🎨 **Looks the part, crisp anywhere.** Styled after the Claude desktop app,
@@ -213,10 +220,30 @@ The overlay shows its version in the bottom status line (e.g. `v1.7.2`) and chec
 GitHub for a newer release on startup — when one exists you'll see a 🔔 note and a `⬆`
 next to the version. To upgrade:
 
-### 🖱️ One double-click — `update.cmd` (recommended)
+### 🖱️ One click — the button in the chat (recommended)
 
-Double-click **`update.cmd`**. It runs `git pull`, refreshes the Python packages, and — if you
-already have a Desktop shortcut — refreshes its icon to match the current version.
+On a `git clone` install, the 🔔 notice comes with an **⬆ Update overlay to vX.Y.Z**
+button. Clicking it runs `update.cmd` for you in a console window, so you can watch the
+pull, the package refresh and the check that the new code still starts. You don't have to
+close the overlay first, and that's the last thing you have to do: when the update lands,
+the console closes itself and **the overlay restarts into the new code on its own** — the
+fresh window offers to resume the conversation you were in.
+
+If the update *fails*, nothing restarts. The console stays open on the error (that's where
+the fix is written), and the button turns into **⚠ Update failed — click to retry**.
+
+(Installed from the **ZIP**? There's no clone to pull into, so the notice gives you the
+instructions below instead of a button.)
+
+### 🖱️ One double-click — `update.cmd`
+
+Double-click **`update.cmd`**. It pulls the latest release, refreshes the Python packages,
+and — if you already have a Desktop shortcut — refreshes its icon to match the current version.
+
+It pulls `main` from `upstream` if your clone has that remote and from `origin` otherwise, so
+a **fork** gets the release rather than its own stale copy. It updates only a clean clone
+sitting on `main`: on another branch, or with uncommitted changes, it says so and stops
+instead of merging a release into work in progress.
 
 ### 🛠️ By hand
 
@@ -226,11 +253,15 @@ git pull
 ```
 
 (Installed via **ZIP** instead of `git clone`? Re-download the latest ZIP from the green
-**Code** button and unzip it over the folder — at minimum replace `claude_overlay.py`.)
+**Code** button and unzip **all** of it over the folder, replacing every file. The
+overlay is a folder of modules, not a single script — replacing only `claude_overlay.py`
+leaves it unable to start. Then double-click **`Diagnose.cmd`** to confirm it loads.)
 
 > **Then restart the overlay.** It's a long-running process and does **not** reload
 > while running — close it and re-open **`Start Claude Overlay.cmd`** for the update to
-> take effect. (On a managed/enterprise machine, updating is what fixes the older
+> take effect. Your conversation isn't lost: the relaunch offers a one-click
+> **↺ Resume last conversation**, and Claude picks up right where you left off.
+> (On a managed/enterprise machine, updating is what fixes the older
 > versions that could hang on the first tool call.)
 >
 > Updated **by hand** (`git pull`) and the Desktop icon still looks old? Re-run
@@ -260,6 +291,57 @@ Double-click **`Create Desktop Shortcut.cmd`** to drop a **Claude Overlay** shor
 > launcher that must stay next to `claude_overlay.py`. The shortcut points back to it
 > in place, which is why it keeps working.
 
+### It doesn't open / it vanishes
+
+The overlay runs under `pythonw`, which has no console — so if it fails to start there
+is nothing to read. It tells you anyway:
+
+- **A dialog appears** naming what broke and the one command that fixes it.
+- **The details are saved** to `%LOCALAPPDATA%\claude-overlay\crash.log`.
+- **Double-click `Diagnose.cmd`** for a full report — which Python is running it, which
+  packages are installed, whether the app loads — copied to your clipboard, ready to
+  paste into a bug report. It's the fastest way to get help from someone who isn't at
+  your machine.
+
+The usual causes, all of which `Diagnose.cmd` names outright:
+
+| What happened | Fix |
+|---|---|
+| A `pip install` was interrupted (flaky network, proxy) and left a package uninstalled | Re-run `setup.cmd` |
+| Two Pythons — packages installed into the one that *isn't* launching the app | Use the exact `pip` command `Diagnose.cmd` prints |
+| `claude-agent-sdk` older than the app | Run `update.cmd` — it installs the pinned version from `requirements.txt` |
+| A ZIP "update" that replaced only `claude_overlay.py` | Unzip **all** files over the folder |
+
+**On v1.15.1 and v1.15.2 specifically:** if double-clicking the launcher opens a console
+window saying no Python was found — on a machine where the overlay used to work — that is
+a launcher bug, not your install. v1.15.1 checked the wrong file; v1.15.2 only looked at
+`PATH`, so it also walled machines whose Python is where `setup.cmd` puts it
+(`%LOCALAPPDATA%\Programs\Python\`) without `PATH` ever catching up. Update to
+**v1.15.3 or later** (`update.cmd`, or `git pull`). If you can't launch anything at all,
+the fix needs no Python: re-download the latest ZIP and replace
+`Start Claude Overlay.cmd`.
+
+That screen now tells you which of two different problems you have. If every path it lists
+sits under `\WindowsApps\` **and** it finds nothing off `PATH`, this PC genuinely has no
+Python — those `\WindowsApps\` entries are Windows placeholders that only print
+*"Python was not found…"* when run. Double-click **`setup.cmd`**: it installs Python for
+you, per-user, no admin needed. (`update.cmd` offers to run it for you too, so on a machine
+with no Python you can double-click either one and it gets sorted.)
+
+### Locked-down work laptop? (`403`, or an installer that won't run)
+
+If `setup.cmd` can't install Python and the reason it prints is an **HTTP 403** — or the
+installer downloads and then silently refuses to run — that's your employer's proxy or
+endpoint-security software, not a bug here. `setup.cmd` already tries three routes (winget →
+python.org → [uv](https://github.com/astral-sh/uv), whose CPython build isn't blocked by the
+signature rules that stop the others), and it prints what each one reported so you have
+something specific to send IT.
+
+When all three are refused, **[`offline/README.md`](offline/README.md) has two routes that
+need no working download at all** — pre-stage one `.zip` from any machine that *can* reach
+GitHub, or just drop any Python 3.10+ folder into `%LOCALAPPDATA%\Programs\Python\` (every
+script here *scans* that folder and uses whatever runs, no matter how it got there).
+
 ---
 
 ## Controls
@@ -267,12 +349,20 @@ Double-click **`Create Desktop Shortcut.cmd`** to drop a **Claude Overlay** shor
 | Action | How |
 |---|---|
 | Send message | `Enter` (or click the **↑** button) |
+| Type ahead while Claude answers | just keep going — `Enter` mid-reply **queues** the message (like the Claude Code CLI) instead of interrupting; queued messages show above the box and go out one per finished reply, in order. Each row's **✕** hands its text back to the box |
 | New line | `Shift+Enter` |
-| Stop a running reply | click **Stop** (the ↑ becomes ■ while busy) |
+| Stop a running reply | click **Stop** (the ↑ becomes ■ while busy) or press `Esc` — either also drops the queued line-up, listing the texts in the transcript and putting the first back in the box |
 | Paste an image | **Ctrl+V** (click **📎** to clear) |
 | Toggle auto-screenshot | **◉ / ○ Auto-shot** (orange = on) |
-| Show / hide in screen shares | **◉ / ○ Shareable** (orange = visible to Teams/Zoom/OBS; off = private, the default) |
-| Switch model | click the **statusline** (`model ▾`) |
+| Settings menu | click **⚙** — Window-only, Shareable, Read-only (✓ = on); the gear turns orange while Read-only is on |
+| &nbsp;&nbsp;• Capture only the active window | **⚙ → Window-only** (window only; off = every monitor) |
+| &nbsp;&nbsp;• Show / hide in screen shares | **⚙ → Shareable** (visible to Teams/Zoom/OBS; off = private, the default) |
+| &nbsp;&nbsp;• Lock Claude read-only | **⚙ → Read-only** ("plan" mode: looks and answers, changes nothing; off = the configured `PERMISSION_MODE`) |
+| Switch model | click the **statusline** (`model ▾`) — the list shows the model families **your** login can actually pick, read from the CLI's own record of them, so it can't offer you a model that would silently fall back to another one |
+| See how much allowance is left | **two arcs around the ✻ mark** — the inner one is the 5-hour window, the outer one is weekly. Both are drawn, always: the 5-hour window is the one that ends the session you're in, and it spends most of its life sitting below the weekly number, so showing only whichever is furthest along would hide it for exactly as long as it matters. Filled in from your account the moment the overlay opens, so it's there **before** you send anything, and refreshed every minute while it sits idle; amber as you approach a limit, red once it's gone. It speaks up once per transition, and a message refused for allowance is put back in the box rather than lost |
+| See the exact numbers | **hover the ✻ mark** — a small panel drops under it with both allowance windows, their reset times, and the context headroom in turns (extrapolated from what recent ones cost). No unlabelled gauge explains itself; this is how you ask it |
+| Retry when the allowance returns | a refused message offers **⏱ Send it automatically at &lt;time&gt;** — opt-in, one click, and it stands down the moment you type something else, send by hand, or Clear |
+| See how much context is left | the statusline's `context 72%` — always there, and it never reflows: the allowance moved to the mark, so nothing competes with it for the slot. A note at 70% and again at 85% says when compacting is worth it |
 | Zoom text in / out | **Ctrl +** / **Ctrl −** (or **Ctrl + mouse-wheel**); **Ctrl 0** resets |
 | New conversation | **Clear** |
 | Compact the conversation (free up context) | **Compact** — summarizes older turns, keeps going |
@@ -288,16 +378,76 @@ Double-click **`Create Desktop Shortcut.cmd`** to drop a **Claude Overlay** shor
 
 ## Configuration
 
-All settings are constants at the top of `claude_overlay.py`:
+All settings live as constants at the top of `config.py` — but **you don't have to edit
+the file**. Put personal values in a small per-machine **`config.json`** instead, so your
+setup survives every update with no `git pull` conflicts:
+
+```
+%LOCALAPPDATA%\claude-overlay\config.json
+```
+
+(the same folder that already remembers your toggles). List only the settings you want
+to change, using the constant names below — for example:
+
+```json
+{
+  "PERMISSION_MODE": "plan",
+  "THEME": "dark",
+  "WORKING_DIR": "C:\\Users\\you\\Documents"
+}
+```
+
+Overridable: `WORKING_DIR`, `MODEL`, `MODEL_MENU_FILTER`, `QUEUE_MESSAGES`, `EFFORT`,
+`PERMISSION_MODE`,
+`SKILLS`, `STRICT_MCP_CONFIG`, `CLI_UPDATE_CHECK`, `AUTO_SCREENSHOT_DEFAULT`, `SHOT_SCOPE`,
+`SHOT_FORMAT`, `SHOT_JPEG_QUALITY`, `SHOT_DEDUPE_BITS`, `HIDE_SCREENSHOT_TOOL`, `THEME`,
+`SHOW_IN_SCREEN_SHARE_DEFAULT`, `TASKBAR_BUTTON`, `HOTKEY`, `WINDOW_ALPHA`,
+`CORNER_RADIUS`, `ORB_SIZE`, `FONT_SANS` / `FONT_SERIF` / `FONT_MONO`.
+
+Precedence, weakest to strongest: the constants in `config.py` < `config.json` < an
+explicitly set `CLAUDE_OVERLAY_*` env var — and the remembered ⚙-toggle state
+(Window-only / Read-only) still wins over all three, exactly as it does over the
+constants: `SHOT_SCOPE` and `PERMISSION_MODE` from the file only seed the first launch.
+A typo'd key or wrong-typed value is skipped (never fatal) and called out in-chat at
+startup, so a mistake can't silently launch a misconfigured session. To keep the file
+somewhere else, point the `CLAUDE_OVERLAY_CONFIG` env var at it.
+
+The settings themselves:
 
 - `MODEL` — defaults to `"opus"`, a **family alias for the latest Opus**, so a future
   Opus release is adopted automatically. Use `"opus[1m]"` for the 1M-context variant, or
-  `"sonnet"` / `"haiku"` — every alias tracks the newest model of its family, and the
-  in-app switcher lists them all (the statusline shows the concrete version each alias
-  resolved to, e.g. `claude-opus-4-8`). Don't use `None`: the Agent SDK resolves `None`
-  to an older model, not the CLI's interactive default.
-- `PERMISSION_MODE` — `"bypassPermissions"` by default (see security note below).
-  Use `"acceptEdits"`, `"default"`, or `"plan"` to add confirmation / read-only.
+  `"fable"` / `"sonnet"` / `"haiku"` — every alias tracks the newest model of its family,
+  and the in-app switcher lists the ones your login can pick (the statusline shows the
+  concrete version each alias resolved to, e.g. `claude-opus-4-8`). Don't use `None`: the
+  Agent SDK resolves `None` to an older model, not the CLI's interactive default.
+- `MODEL_MENU_FILTER` — `true` by default: the model switcher hides families your account
+  isn't entitled to, which it reads from the same record the CLI builds its own `/model`
+  picker from (`modelAccessCache` in `~/.claude.json`). Without this the menu offered
+  every family to everyone, and choosing one you don't have looks like nothing happened —
+  the CLI does not error on an unentitled `--model`, it quietly runs your default model
+  instead. Filtering only removes what that record positively contradicts: if it's
+  missing or unreadable, or filtering would empty the menu, you get the full list. Set it
+  to `false` (or `CLAUDE_OVERLAY_MODEL_FILTER=0`) if you've just been granted a model the
+  record hasn't caught up with — any `claude -p` run refreshes it too.
+- `QUEUE_MESSAGES` — `true` by default: `Enter` while a reply is streaming queues the
+  message (shown above the input box, sent in order as each reply finishes — the Claude
+  Code CLI's type-ahead behaviour). Set it to `false` to restore the old meaning of
+  `Enter` mid-reply: interrupt. Stopping (the ■ button or `Esc`) always drops the
+  line-up, with the texts listed in the transcript so nothing is silently lost.
+- `EFFORT` — reasoning-effort ceiling for overlay sessions: `"low"`, `"medium"`,
+  `"high"`, `"xhigh"`, `"max"`, or `""` (default) to inherit your CLI's setting
+  (`effortLevel` in `~/.claude/settings.json`, or the CLI default). The same dial as the
+  CLI's `--effort` flag, scoped to the overlay. Worth knowing: a global `effortLevel`
+  tuned for deep terminal work makes the model **think for extra seconds before every
+  overlay reply** — at `xhigh` we measured 6–11s of thinking on even one-line questions.
+  If the overlay feels slow to start answering, set `"high"` or `"medium"` here; your
+  terminal sessions keep their own setting. Applied at session start, not mid-chat.
+- `PERMISSION_MODE` — `"bypassPermissions"` by default (see security note below); this
+  is just the **first-launch** mode — the **⚙ → Read-only** menu item switches
+  the live session between `"plan"` (read-only) and this mode at any time, and the
+  toggle **remembers your last choice across launches** (announced in-chat at startup
+  whenever the remembered state differs from this default). Set `"plan"` to start
+  locked read-only.
 - `WORKING_DIR` — folder Claude operates in (default: your home directory).
 - `THEME` — `"light"` (warm paper) or `"dark"`.
 - `TASKBAR_BUTTON` — `True` (default) gives the frameless window a real, clickable
@@ -309,6 +459,40 @@ All settings are constants at the top of `claude_overlay.py`:
 - `SHOT_FORMAT` / `SHOT_JPEG_QUALITY` (or the `CLAUDE_OVERLAY_SHOT_FORMAT` /
   `CLAUDE_OVERLAY_SHOT_JPEG_QUALITY` env vars) — screenshot payload: `"auto"` keeps
   the smaller of PNG/JPEG per capture; `"png"`/`"jpeg"` force one; JPEG quality 50–95.
+- `SHOT_DEDUPE_BITS` (or `CLAUDE_OVERLAY_SHOT_DEDUPE_BITS`) — how different two
+  auto-captures may look and still count as the same screen, in bits out of a 1024-bit
+  perceptual hash. Auto-shot attaches a capture to **every** message and each one keeps
+  costing vision tokens for the rest of the conversation, so a screen you haven't touched
+  is skipped and Claude is pointed at the copy already in context. `2` (default) ignores
+  a blinking caret, a ticking clock and re-compression noise while still re-sending on a
+  single new line of terminal output; raising it past `3` starts missing small real
+  changes, and `0` falls back to exact-bytes only.
+- `SHOT_SCOPE` (or the `CLAUDE_OVERLAY_SHOT_SCOPE` env var) — what a screenshot covers:
+  `"screens"` (default) captures every monitor, one image each; `"window"` captures
+  **only the active window** — more private and cheaper in vision tokens, but Claude
+  can't see anything outside it. This is just the startup default; flip it live with
+  the **⚙ → Window-only** menu item — and the choice **is remembered
+  across launches** (stored per-machine in `%LOCALAPPDATA%\claude-overlay\state.json`;
+  setting the env var explicitly overrides it for that launch). While you're typing *in* the overlay,
+  "active" means the window you were working in before it (tracked automatically), and
+  when no usable window exists (fresh launch, desktop focused, window minimized) it
+  falls back to full-screen capture rather than sending nothing.
+- `RESUME_OFFER` (or the `CLAUDE_OVERLAY_RESUME_OFFER` env var) — on launch, offer a
+  one-click **↺ Resume last conversation** when the previous run left one behind (the
+  session id is remembered per completed turn; **Clear** wipes it, so a discarded
+  conversation is never offered back). `RESUME_OFFER_MAX_AGE` bounds how old a
+  conversation may be to qualify (default 7 days). The transcript isn't replayed —
+  Claude just remembers the context and you keep going. Note the overlay resumes the
+  session **it** recorded, not "the latest conversation in this directory" — if you
+  continue that session elsewhere (the CLI or Desktop) afterward, resume still loads its
+  newest state, but the "from … ago" label is measured from the overlay's last turn.
+- `CLAUDE_OVERLAY_AUTH_GATE` (env var) — when the `claude` CLI's login dies in the one
+  way nothing local can repair (a token refresh rejected with `invalid_grant` makes the
+  CLI blank its own stored credentials), the overlay says so and **holds your message
+  back** instead of feeding it — and its attachments — into a turn that cannot succeed.
+  Set it to `0` to keep the notice but never block a send. Signing in again from a
+  terminal (`claude auth login`) is picked up on its own: no restart, and the
+  conversation is kept.
 - `AUTO_SCREENSHOT_DEFAULT`, `FONT_SANS/SERIF/MONO`, `CORNER_RADIUS`, `ORB_SIZE`,
   `HIDE_SCREENSHOT_TOOL`, `WINDOW_ALPHA` — see inline comments.
 
@@ -321,9 +505,31 @@ also lets it **act on the app you have open** — e.g. edit the document or slid
 deck on your screen via Windows/COM automation, and (with autosave on) persist
 those edits straight to the original file. That's the magic, but it also means it
 can change important documents without a confirmation step — double-check before
-you let it loose on anything you can't afford to lose. If you don't want that, set
-`PERMISSION_MODE` to `"acceptEdits"` (asks before edits), `"default"` (asks before
-most actions), or `"plan"` (read-only) before running.
+you let it loose on anything you can't afford to lose. If you don't want that, open
+the **⚙** menu and turn on **Read-only**: it switches the live session into `"plan"`
+mode (Claude looks, reads, and answers — but edits and runs nothing), and while it's
+on the overlay **denies every permission escalation the agent asks for** (including
+`ExitPlanMode`), so read-only can't be talked out of; flip it back for full access.
+(One nuance: the CLI refuses to elevate a session to `bypassPermissions` unless it was
+*launched* in it — so when the overlay started read-only, flipping the toggle off lands
+on `acceptEdits` instead, which the overlay's auto-approval makes effectively full
+access; the in-chat notice always names the mode you actually got.)
+To *start* locked on first launch, set `PERMISSION_MODE = "plan"` — after that the
+toggle's last state is remembered per-machine, and a launch says so in-chat whenever
+the remembered choice differs from the configured default. (`"acceptEdits"` / `"default"` are
+of limited use here: a GUI with no terminal has nowhere to show a permission prompt,
+so the overlay auto-answers them — see `worker._allow_tool`.)
+
+**One thing the overlay reads that it previously didn't:** to show your plan allowance
+before you've sent anything, it reads the OAuth access token the `claude` CLI already
+stores in `~/.claude/.credentials.json` and sends it, once a minute, in a single
+`GET https://api.anthropic.com/api/oauth/usage` — the same endpoint the CLI's own
+`/usage` screen reads. That token is never stored by the overlay, never written to the
+debug log, and never sent anywhere but `api.anthropic.com`; the request is a GET, so it
+can't spend, change or send anything, and no token is ever refreshed (that stays the
+CLI's job). Accounts authenticating another way — API key, Bedrock, Vertex, a gateway —
+are skipped entirely, and every failure just leaves the gauge as it was. It's all in
+[`usage.py`](usage.py), which is short and commented for exactly this reason.
 
 ## Contributing
 

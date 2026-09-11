@@ -5,6 +5,7 @@ All tests are deterministic and require no network, display, or logged-in CLI.
 Env-var mutations use monkeypatch so they never leak between tests.
 """
 import os
+import json
 import importlib
 
 import pytest
@@ -185,13 +186,16 @@ class TestModels:
     def test_models_use_family_aliases_not_pinned_versions(self):
         # The whole point of the switcher: every entry tracks the LATEST model of its
         # family, so no id may hardcode a version (e.g. "claude-opus-4-8") — that would
-        # freeze the overlay on an old model until someone edits this file. Allowed ids
-        # are the bare family aliases opus/sonnet/haiku, optionally with a "[1m]" suffix.
+        # freeze the overlay on an old model until someone edits this file. The single
+        # source of truth for "is a resolvable family alias" is modelresolve._ALIAS_RE
+        # (an id it doesn't match passes through UNresolved, i.e. version-lagged) — pin
+        # against that, not a second copy of the family list.
+        import modelresolve
         for _, model_id in config.MODELS:
-            base = model_id.replace("[1m]", "")
-            assert base in ("opus", "sonnet", "haiku"), (
-                f"MODELS id {model_id!r} is not a bare family alias — it won't auto-update "
-                f"to new model releases. Use 'opus'/'sonnet'/'haiku' (optionally '[1m]')."
+            assert modelresolve._ALIAS_RE.match(model_id), (
+                f"MODELS id {model_id!r} is not an alias modelresolve can resolve — it "
+                f"won't auto-update to new model releases (and over the SDK's streaming "
+                f"transport it would silently run a version-behind model)."
             )
 
 
@@ -219,6 +223,56 @@ class TestStrictMcpConfig:
         assert isinstance(config.STRICT_MCP_CONFIG, bool)
 
 
+class TestMcpServers:
+    """Tests for config.MCP_SERVERS and its validator.
+
+    MCP_SERVERS is the escape hatch from STRICT_MCP_CONFIG's all-or-nothing: it declares
+    specific servers FOR the overlay, so they load while the user's other ~60 stay out.
+    The committed default must stay EMPTY — a release that shipped a server would have
+    every user's overlay dialling a third party they never configured.
+    """
+
+    def test_default_is_empty(self):
+        assert config.MCP_SERVERS == {}, (
+            "the committed MCP_SERVERS default must be empty — shipping a server would "
+            "make every user's overlay connect to it. Set it per machine in config.json."
+        )
+
+    def test_is_dict(self):
+        assert isinstance(config.MCP_SERVERS, dict)
+
+    def test_validator_accepts_remote_and_stdio_shapes(self):
+        v = config._v_mcp_servers
+        remote = {"notion": {"type": "http", "url": "https://mcp.notion.com/mcp"}}
+        stdio = {"my-tool": {"command": "npx", "args": ["-y", "some-mcp"]}}
+        assert v(remote) == remote
+        assert v(stdio) == stdio
+        assert v({}) == {}          # legal: switches the feature back off from the file
+
+    def test_validator_returns_a_copy(self):
+        # The schema hands its result straight to a module global; sharing the caller's
+        # dict would let later mutation of the parsed JSON reach into config.
+        src = {"notion": {"type": "http", "url": "https://mcp.notion.com/mcp"}}
+        assert config._v_mcp_servers(src) is not src
+
+    @pytest.mark.parametrize("bad", [
+        None,                                    # JSON null
+        [],                                      # a list, not an object
+        "notion",                                # a bare string
+        {"notion": "https://mcp.notion.com/mcp"},  # value must be an object, not a URL
+        {"": {"type": "http"}},                  # blank server name
+        {"  ": {"type": "http"}},                # whitespace-only name
+        {1: {"type": "http"}},                   # non-string key
+    ])
+    def test_validator_rejects_bad_shapes(self, bad):
+        assert config._v_mcp_servers(bad) is config._BAD
+
+    def test_key_is_wired_into_the_settings_schema(self):
+        # Without this entry the key is an "unknown key" and gets skipped with a warning,
+        # so config.json could never turn the feature on.
+        assert config._USER_CONFIG_KEYS["MCP_SERVERS"] is config._v_mcp_servers
+
+
 # ---------------------------------------------------------------------------
 # 6. SHOT_JPEG_QUALITY and SYSTEM_APPEND
 # ---------------------------------------------------------------------------
@@ -239,3 +293,245 @@ class TestMiscConstants:
 
     def test_system_append_is_non_empty(self):
         assert len(config.SYSTEM_APPEND.strip()) > 0
+
+
+# ---------------------------------------------------------------------------
+# 7. SHOT_SCOPE
+# ---------------------------------------------------------------------------
+
+class TestShotScope:
+    """Tests for SHOT_SCOPE (active-window vs. all-screens capture default)."""
+
+    def test_default_is_screens(self):
+        env_val = os.environ.get("CLAUDE_OVERLAY_SHOT_SCOPE")
+        if env_val is not None:
+            pytest.skip("CLAUDE_OVERLAY_SHOT_SCOPE is set in env; skipping default check")
+        assert config.SHOT_SCOPE == "screens"
+
+    def test_env_override_is_normalized(self, monkeypatch):
+        # The env value is stripped + lowercased so "  Window " still means window scope.
+        monkeypatch.setenv("CLAUDE_OVERLAY_SHOT_SCOPE", "  Window ")
+        try:
+            importlib.reload(config)
+            assert config.SHOT_SCOPE == "window"
+        finally:
+            monkeypatch.delenv("CLAUDE_OVERLAY_SHOT_SCOPE", raising=False)
+            importlib.reload(config)
+
+    def test_shot_scope_is_str(self):
+        assert isinstance(config.SHOT_SCOPE, str)
+
+
+# ---------------------------------------------------------------------------
+# 8. config.json per-machine overrides
+# ---------------------------------------------------------------------------
+
+class TestUserConfig:
+    """Tests for the config.json override loader (config._apply_user_config).
+
+    Each test writes a temp config.json, points CLAUDE_OVERLAY_CONFIG at it, and
+    reloads config. Teardown restores the previous env value — the suite-wide
+    isolation path set in conftest.py — and reloads once more, so every other test
+    still sees the committed defaults.
+    """
+
+    @pytest.fixture
+    def load_cfg(self, tmp_path):
+        path = tmp_path / "config.json"
+        prev = os.environ.get("CLAUDE_OVERLAY_CONFIG")
+
+        def load(content):
+            text = content if isinstance(content, str) else json.dumps(content)
+            path.write_text(text, "utf-8")
+            os.environ["CLAUDE_OVERLAY_CONFIG"] = str(path)
+            importlib.reload(config)
+            return config
+
+        try:
+            yield load
+        finally:
+            if prev is None:
+                os.environ.pop("CLAUDE_OVERLAY_CONFIG", None)
+            else:
+                os.environ["CLAUDE_OVERLAY_CONFIG"] = prev
+            importlib.reload(config)
+
+    def test_no_file_means_defaults_and_no_warnings(self):
+        # conftest points CLAUDE_OVERLAY_CONFIG at a nonexistent path for the suite.
+        assert config.USER_CONFIG_WARNINGS == []
+        assert config.PERMISSION_MODE == "bypassPermissions"
+
+    def test_overrides_applied(self, load_cfg):
+        c = load_cfg({"PERMISSION_MODE": "plan", "THEME": "dark",
+                      "AUTO_SCREENSHOT_DEFAULT": False})
+        assert c.PERMISSION_MODE == "plan"
+        assert c.THEME == "dark"
+        assert c.T is c.THEMES["dark"]          # T is derived AFTER the overrides
+        assert c.AUTO_SCREENSHOT_DEFAULT is False
+        assert c.USER_CONFIG_WARNINGS == []
+
+    def test_choice_is_case_insensitive_but_canonical(self, load_cfg):
+        # The CLI wants "bypassPermissions" exactly; the file may be sloppier.
+        c = load_cfg({"PERMISSION_MODE": "BYPASSPERMISSIONS"})
+        assert c.PERMISSION_MODE == "bypassPermissions"
+
+    def test_auto_mode_is_accepted(self, load_cfg):
+        # "auto" is the classifier-reviewed mode. It has to survive the whitelist, because
+        # a REJECTED value falls back to bypassPermissions — the weakest mode there is, and
+        # the exact opposite of what someone who typed "auto" is asking for. That failure
+        # would be silent apart from one startup warning, so pin it.
+        c = load_cfg({"PERMISSION_MODE": "auto"})
+        assert c.PERMISSION_MODE == "auto"
+        assert c.USER_CONFIG_WARNINGS == []
+
+    def test_every_offered_permission_mode_is_one_the_sdk_accepts(self):
+        # Pins the RULE, not a second copy of the list: every mode config.json may set must
+        # be a mode the INSTALLED SDK will really pass through to the CLI. Catches a typo
+        # ("Auto"), a casing slip, and an SDK that later drops a mode — each of which would
+        # otherwise surface as the CLI rejecting the flag and the overlay failing to launch,
+        # which looks nothing like a config problem. requirements.txt floors the SDK rather
+        # than pinning it, so CI runs this against whatever PyPI published today.
+        from typing import get_args
+        from claude_agent_sdk.types import PermissionMode
+
+        offered = set(config._USER_CONFIG_KEYS["PERMISSION_MODE"].allowed)
+        sdk_modes = set(get_args(PermissionMode))
+        assert offered <= sdk_modes, f"config.json offers modes the SDK won't take: {offered - sdk_modes}"
+        assert "auto" in offered      # the reason this test exists; don't let it regress
+
+    def test_explicit_env_var_beats_file(self, load_cfg, monkeypatch):
+        monkeypatch.setenv("CLAUDE_OVERLAY_SHOT_SCOPE", "window")
+        try:
+            c = load_cfg({"SHOT_SCOPE": "screens"})
+            assert c.SHOT_SCOPE == "window"     # env is a per-launch decision: it wins
+            assert c.USER_CONFIG_WARNINGS == []  # outranked, but not an error
+        finally:
+            # Drop the env var BEFORE the fixture's teardown reload, so the module
+            # isn't left with the env value for later tests.
+            monkeypatch.delenv("CLAUDE_OVERLAY_SHOT_SCOPE", raising=False)
+
+    def test_invalid_value_warns_and_keeps_default(self, load_cfg):
+        c = load_cfg({"PERMISSION_MODE": "yolo"})
+        assert c.PERMISSION_MODE == "bypassPermissions"
+        assert len(c.USER_CONFIG_WARNINGS) == 1
+        assert "PERMISSION_MODE" in c.USER_CONFIG_WARNINGS[0]
+
+    def test_effort_defaults_to_inherit(self):
+        # "" = pass nothing, so the CLI keeps honouring the user's own settings.json
+        # effortLevel. The overlay must never silently override a reasoning-depth choice.
+        assert config.EFFORT == ""
+
+    def test_effort_override_is_accepted_and_canonical(self, load_cfg):
+        c = load_cfg({"EFFORT": "Medium"})
+        assert c.EFFORT == "medium"
+        assert c.USER_CONFIG_WARNINGS == []
+
+    def test_effort_typo_warns_and_keeps_inherit(self, load_cfg):
+        # A rejected value must fall back to "" (inherit), not to some fixed effort — and
+        # it must be SEEN: an unnoticed typo here would otherwise quietly change how long
+        # the model thinks on every single message.
+        c = load_cfg({"EFFORT": "ultra"})
+        assert c.EFFORT == ""
+        assert any("EFFORT" in w for w in c.USER_CONFIG_WARNINGS)
+
+    def test_unknown_key_warns(self, load_cfg):
+        c = load_cfg({"PERMISSON_MODE": "plan"})     # typo'd key must be SEEN
+        assert c.PERMISSION_MODE == "bypassPermissions"
+        assert any("PERMISSON_MODE" in w for w in c.USER_CONFIG_WARNINGS)
+
+    def test_corrupt_json_warns_and_keeps_defaults(self, load_cfg):
+        c = load_cfg("{ this is not json")
+        assert c.PERMISSION_MODE == "bypassPermissions"
+        assert c.THEME == "light"
+        assert len(c.USER_CONFIG_WARNINGS) == 1
+
+    def test_top_level_must_be_an_object(self, load_cfg):
+        c = load_cfg("[1, 2, 3]")
+        assert len(c.USER_CONFIG_WARNINGS) == 1
+
+    def test_bool_must_be_json_bool_not_string(self, load_cfg):
+        c = load_cfg({"TASKBAR_BUTTON": "true"})
+        assert c.TASKBAR_BUTTON is True              # default kept
+        assert any("TASKBAR_BUTTON" in w for w in c.USER_CONFIG_WARNINGS)
+
+    def test_numbers_clamp_like_env_int(self, load_cfg):
+        c = load_cfg({"SHOT_JPEG_QUALITY": 200, "WINDOW_ALPHA": 0.05})
+        assert c.SHOT_JPEG_QUALITY == 95
+        assert c.WINDOW_ALPHA == 0.3
+        assert c.USER_CONFIG_WARNINGS == []
+
+    def test_working_dir_accepts_existing_dir(self, load_cfg, tmp_path):
+        c = load_cfg({"WORKING_DIR": str(tmp_path)})
+        assert c.WORKING_DIR == str(tmp_path)
+        assert c.USER_CONFIG_WARNINGS == []
+
+    def test_working_dir_must_exist(self, load_cfg):
+        default = config.WORKING_DIR
+        c = load_cfg({"WORKING_DIR": r"C:\definitely\not\a\real\dir\xyz"})
+        assert c.WORKING_DIR == default              # a bad cwd would break the CLI spawn
+        assert any("WORKING_DIR" in w for w in c.USER_CONFIG_WARNINGS)
+
+    def test_skills_accepts_all_list_and_null(self, load_cfg):
+        assert load_cfg({"SKILLS": "all"}).SKILLS == "all"
+        assert load_cfg({"SKILLS": ["a", "b"]}).SKILLS == ["a", "b"]
+        assert load_cfg({"SKILLS": None}).SKILLS is None
+        c = load_cfg({"SKILLS": 42})
+        assert any("SKILLS" in w for w in c.USER_CONFIG_WARNINGS)
+
+    def test_structural_globals_are_not_overridable(self, load_cfg):
+        # The whitelist is a security boundary: derived/structural globals must stay
+        # source-only. Trying to set them from the file leaves them untouched and is
+        # reported as an unknown setting, not silently applied.
+        before_state = config.STATE_FILE
+        before_max = config.MAX_BUFFER_SIZE
+        c = load_cfg({"STATE_FILE": r"C:\evil\state.json", "MAX_BUFFER_SIZE": 999999999})
+        assert c.STATE_FILE == before_state
+        assert c.MAX_BUFFER_SIZE == before_max
+        assert any("STATE_FILE" in w for w in c.USER_CONFIG_WARNINGS)
+        assert any("MAX_BUFFER_SIZE" in w for w in c.USER_CONFIG_WARNINGS)
+
+    def test_bom_prefixed_file_is_read_not_discarded(self, load_cfg):
+        # Notepad / PowerShell Out-File on Windows prepend a UTF-8 BOM. It must be
+        # stripped, not fatal — otherwise the whole file is dropped and PERMISSION_MODE
+        # silently reverts to the bypassPermissions default (a full-access session).
+        c = load_cfg("﻿" + json.dumps({"PERMISSION_MODE": "plan"}))
+        assert c.PERMISSION_MODE == "plan"
+        assert c.USER_CONFIG_WARNINGS == []
+
+    def test_validator_that_raises_degrades_to_warning(self, load_cfg):
+        # _v_dir calls os.path.isdir, which raises "embedded null byte" on Windows for a
+        # path containing \x00. The per-key loop must catch it: a raising validator has to
+        # become a warning, never propagate and abort `from config import *` at launch.
+        default = config.WORKING_DIR
+        c = load_cfg({"WORKING_DIR": "bad\x00dir"})
+        assert c.WORKING_DIR == default
+        assert any("WORKING_DIR" in w for w in c.USER_CONFIG_WARNINGS)
+
+    def test_bad_permission_mode_warning_names_effective_mode(self, load_cfg):
+        # A typo'd read-only intent falls through to the committed default. The warning
+        # must name the mode actually in force so a permissive fallback isn't missed.
+        c = load_cfg({"PERMISSION_MODE": "raed-only"})
+        assert c.PERMISSION_MODE == "bypassPermissions"
+        warning = next(w for w in c.USER_CONFIG_WARNINGS if "PERMISSION_MODE" in w)
+        assert "bypassPermissions" in warning and "full access" in warning
+
+    def test_invalid_value_for_env_overridden_key_still_warns(self, load_cfg, monkeypatch):
+        # An explicit env var silently outranks a VALID file value, but a typo'd file value
+        # for the same key must still be surfaced — it can't vanish just because env shadows
+        # it, or a mistake in the file leaves no trace.
+        monkeypatch.setenv("CLAUDE_OVERLAY_SHOT_SCOPE", "window")
+        try:
+            c = load_cfg({"SHOT_SCOPE": "not-a-scope"})
+            assert c.SHOT_SCOPE == "window"                 # env still wins
+            assert any("SHOT_SCOPE" in w for w in c.USER_CONFIG_WARNINGS)
+        finally:
+            monkeypatch.delenv("CLAUDE_OVERLAY_SHOT_SCOPE", raising=False)
+
+    def test_unknown_key_suggests_close_match(self, load_cfg):
+        # A mistyped safety-critical key name is an UNKNOWN key, but the warning should point
+        # at the setting the user probably meant, so a typo'd PERMISSION_MODE is as legible
+        # as a typo'd value.
+        c = load_cfg({"PERMISSIONS_MODE": "plan"})          # extra S
+        assert c.PERMISSION_MODE == "bypassPermissions"
+        warning = next(w for w in c.USER_CONFIG_WARNINGS if "PERMISSIONS_MODE" in w)
+        assert "PERMISSION_MODE" in warning and "did you mean" in warning
