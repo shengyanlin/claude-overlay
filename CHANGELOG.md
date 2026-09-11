@@ -3,6 +3,13 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.20.1] - 2026-09-11
+
+### Changed
+- **The type-ahead queue shows up to six rows** above the input box before folding the
+  rest into "＋N more queued" (was three). The overall cap is unchanged: ten queued
+  messages.
+
 ## [1.20.0] - 2026-09-11
 
 Type ahead. Enter while Claude is answering no longer cuts the reply off — it lines
