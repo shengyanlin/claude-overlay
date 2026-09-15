@@ -37,37 +37,8 @@ def gauge(overlay):
 
 
 class TestGaugeText:
-    """The allowance moved to the ring on the mark; the row keeps context, which the ring says
-    nothing about. Hovering the mark spells the allowance back out in the row it vacated."""
-
-    def test_the_allowance_is_a_hover_away(self, gauge):
-        gauge._handle("quota", _q(util=0.78))
-        gauge._mark_enter()
-        assert "78%" in gauge._usage_panel.cget("text")
-
-    def test_the_window_is_named(self, gauge):
-        # 78% of five hours and 78% of a week are very different situations.
-        gauge._handle("quota", _q(util=0.78, window="five_hour"))
-        assert "78%" in gauge._usage_panel_text().splitlines()[0]
-        gauge._handle("quota", _q(util=0.78, window="seven_day"))
-        assert gauge._usage_panel_text().splitlines()[0].startswith("week")
-
-    def test_reset_time_is_a_wall_clock(self, gauge):
-        gauge._handle("quota", _q(resets_in=90 * 60))
-        shown = gauge._usage_panel_text()
-        assert "resets " + time.strftime("%H:%M", time.localtime(time.time() + 90 * 60)) in shown
-
-    def test_a_distant_reset_names_the_day(self, gauge):
-        # A weekly window can reopen days out, where a bare "resets 09:00" reads as tomorrow
-        # morning at the latest and quietly misleads by most of a week.
-        gauge._handle("quota", _q(window="seven_day", resets_in=3 * 24 * 3600))
-        assert time.strftime("%a", time.localtime(time.time() + 3 * 24 * 3600)) \
-            in gauge._usage_panel_text()
-
-    def test_missing_reset_time_is_simply_omitted(self, gauge):
-        gauge._handle("quota", _q(resets_in=None))
-        text = gauge._usage_panel_text()
-        assert "%" in text and "resets" not in text
+    """The allowance has no visible gauge; the row keeps context, which says nothing about
+    the allowance either. _announce_quota (TestAnnouncements) is what still speaks it."""
 
     def test_context_falls_back_when_no_event_has_arrived(self, gauge):
         # An older CLI, or a session that hasn't transitioned yet. An empty gauge would be
@@ -97,23 +68,6 @@ class TestGaugeText:
 
 class TestGaugeColour:
 
-    def test_ordinary_use_is_quiet(self, gauge):
-        gauge._handle("quota", _q(util=0.30))
-        assert gauge._ring_arcs()["five_hour"][1] == co.T["muted"]
-
-    def test_the_cli_warning_goes_amber(self, gauge):
-        gauge._handle("quota", _q(status="allowed_warning", util=0.80))
-        assert gauge._ring_arcs()["five_hour"][1] == co.T["accent"]
-
-    def test_rejection_goes_red(self, gauge):
-        gauge._handle("quota", _q(status="rejected", util=1.0))
-        assert gauge._ring_arcs()["five_hour"][1] == co.T["err"]
-
-    def test_a_high_number_goes_red_even_if_the_cli_is_still_calm(self, gauge):
-        # The colour has to agree with the digits on screen: a grey 94% reads as fine.
-        gauge._handle("quota", _q(status="allowed", util=0.94))
-        assert gauge._ring_arcs()["five_hour"][1] == co.T["err"]
-
     def test_context_keeps_its_own_tiers_in_the_fallback(self, gauge):
         gauge._ctx_pct = 90
         gauge._refresh_statusline()
@@ -129,14 +83,6 @@ class TestGaugeColour:
 
 
 class TestAnnouncements:
-
-    @pytest.fixture(autouse=True)
-    def _ring_already_introduced(self, gauge):
-        """The ring names itself once, on the first reading that arrives from either source.
-        That is not an announcement - it labels a piece of UI and claims nothing about status -
-        so it is stood down here to leave the transcript carrying only what _announce_quota
-        put there. TestTheRingIntroducesItself covers the introduction on its own."""
-        gauge._ring_explained = True
 
     def test_warning_says_when_it_comes_back_and_what_to_do(self, gauge):
         gauge._handle("quota", _q(status="allowed_warning", util=0.82))
