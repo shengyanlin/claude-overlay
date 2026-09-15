@@ -4930,22 +4930,35 @@ class Overlay:
         u = q.get("utilization")
         if isinstance(u, bool) or not isinstance(u, (int, float)):
             return ""
-        # NaN and infinity are floats and clear the check above. They also make round()
-        # RAISE (ValueError / OverflowError) where the old `:.0f` merely printed "nan" —
-        # and this runs on the Tk thread inside the ui_q drain, so a raise here takes out
-        # the callback that delivers every other event, not just this label. json.loads
-        # accepts NaN and Infinity by default, so a CLI that emits either reaches us.
-        if not math.isfinite(u):
+        # This runs on the Tk thread inside the ui_q drain, so an exception here does not
+        # just blank one label — it takes out the callback that delivers every other event.
+        # That makes it worth being total about a number we did not produce. Three ways a
+        # value that passes the isinstance check above can still blow up arithmetic:
+        #   NaN / infinity are floats, and round() raises on both (ValueError /
+        #     OverflowError) where the old `:.0f` merely printed "nan". json.loads accepts
+        #     NaN and Infinity by default, so a CLI emitting either reaches us.
+        #   A huge int is an int, so isfinite() is not even safe to ASK — converting it to
+        #     float raises, and so would formatting it with `:.0f`. Hence the isinstance
+        #     narrowing before the isfinite call, and the comparisons below, which never
+        #     convert.
+        #   A negative reading is not a share of anything.
+        if isinstance(u, float) and not math.isfinite(u):
             return ""
-        # Empty until there is a non-zero percent to show. Tested against the ROUNDED value,
+        if u < 0:
+            return ""
+        # Clamped at 100, the way the arcs were (min(1.0, u)): an allowance can be reported
+        # past its limit, and "5h 340%" reads as a bug in the overlay rather than a fact
+        # about the account. `u >= 1` short-circuits before any multiplication, so an
+        # absurd int never reaches round() or a format spec.
+        pct = 100 if u >= 1 else round(u * 100)
+        # Empty until there is a non-zero percent to SHOW. Tested against the rounded value,
         # which is the thing the user reads: a separate threshold constant is a second copy
-        # of `:.0f`'s rounding, and it drifted on the first try — 0.005 passed a `< 0.005`
-        # floor and then rendered as "5h 0%", which is chrome that says nothing.
-        pct = round(u * 100)
+        # of the rounding, and it drifted on the first try — 0.005 passed a `< 0.005` floor
+        # and then rendered as "5h 0%", which is chrome that says nothing.
         if pct < 1:
             return ""
         win = _QUOTA_WINDOWS.get(q.get("window"))
-        bits = [f"{win} {pct:.0f}%" if win else f"allowance {pct:.0f}%"]
+        bits = [f"{win} {pct}%" if win else f"allowance {pct}%"]
         if u >= _QUOTA_WARN or q.get("status") in ("allowed_warning", "rejected"):
             resets = self._quota_resets_text(q)
             if resets:

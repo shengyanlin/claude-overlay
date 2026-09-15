@@ -108,6 +108,24 @@ class TestAllowanceSegment:
         gauge._handle("quota", _q(util=0.006))
         assert "5h 1%" in gauge.quota_lbl.cget("text")
 
+    def test_an_absurd_integer_reading_does_not_raise(self, gauge):
+        """An int passes the isinstance check, and for one this large math.isfinite() is not
+        even safe to ASK — converting it to float raises OverflowError, and so would
+        formatting it with `:.0f`. The guard has to narrow to float BEFORE asking, and the
+        comparisons that follow must never convert."""
+        gauge._handle("quota", _q(util=10 ** 400))
+        assert "100%" in gauge.quota_lbl.cget("text")      # clamped, not crashed
+
+    def test_a_reading_past_its_limit_is_clamped_not_printed_raw(self, gauge):
+        """The arcs clamped with min(1.0, u) and the text keeps that: "5h 340%" reads as a
+        bug in the overlay rather than as a fact about the account."""
+        gauge._handle("quota", _q(util=3.4))
+        assert "5h 100%" in gauge.quota_lbl.cget("text")
+
+    def test_a_negative_reading_is_dropped(self, gauge):
+        gauge._handle("quota", _q(util=-0.5))
+        assert gauge.quota_lbl.cget("text") == ""
+
     def test_nan_and_infinity_are_dropped_rather_than_raising(self, gauge):
         """Both are floats and clear the isinstance check, and round() RAISES on both
         (ValueError / OverflowError) where the old `:.0f` merely printed "nan". This runs
