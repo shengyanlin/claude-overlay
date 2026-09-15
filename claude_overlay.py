@@ -383,9 +383,12 @@ _QUOTA_WARN = 0.75                # amber floor for a reading that carries no st
                                   # have it, but usage.py's poll has no status field at all —
                                   # without a floor of our own a polled 80% would sit in muted
                                   # grey until it crossed _QUOTA_HOT.
-_QUOTA_FLOOR = 0.005              # below this the segment stays empty: "5h 0%" is chrome that
-                                  # says nothing, and an allowance you have barely touched is
-                                  # exactly when you do not need to be told about it
+                                  # (The rule "stay empty until there is a non-zero percent to
+                                  # show" lives in _quota_text, checked against what actually
+                                  # renders rather than against a threshold constant: a
+                                  # constant here would be a second copy of the format
+                                  # string's own rounding, and the two drifted immediately —
+                                  # 0.005 cleared a `< 0.005` floor and then printed "0%".)
 
 
 def _mix(a, b, t):
@@ -2203,7 +2206,11 @@ class Overlay:
         try:
             self._stash_attachments_loop(paths, imgs, docs, why)
         finally:
-            self.ui_q.put(("attach", (imgs, len(why), docs, why)))
+            # failed=0 deliberately: every rejection this path makes is already explained in
+            # `why`, and the handler reports the count and the reasons SEPARATELY (it has
+            # to — the paste path sends a count with no reasons). Passing len(why) here
+            # would print each file once by name and once more as an anonymous tally.
+            self.ui_q.put(("attach", (imgs, 0, docs, why)))
 
     def _stash_attachments_loop(self, paths, imgs, docs, why):
         """The routing loop itself, split out so the ("attach", …) post above sits in a
@@ -4921,10 +4928,17 @@ class Overlay:
         stay narrow enough that the version does not clip."""
         q = self._gauge_quota()
         u = q.get("utilization")
-        if isinstance(u, bool) or not isinstance(u, (int, float)) or u < _QUOTA_FLOOR:
+        if isinstance(u, bool) or not isinstance(u, (int, float)):
+            return ""
+        # Empty until there is a non-zero percent to show. Tested against the ROUNDED value,
+        # which is the thing the user reads: a separate threshold constant is a second copy
+        # of `:.0f`'s rounding, and it drifted on the first try — 0.005 passed a `< 0.005`
+        # floor and then rendered as "5h 0%", which is chrome that says nothing.
+        pct = round(u * 100)
+        if pct < 1:
             return ""
         win = _QUOTA_WINDOWS.get(q.get("window"))
-        bits = [f"{win} {u * 100:.0f}%" if win else f"allowance {u * 100:.0f}%"]
+        bits = [f"{win} {pct:.0f}%" if win else f"allowance {pct:.0f}%"]
         if u >= _QUOTA_WARN or q.get("status") in ("allowed_warning", "rejected"):
             resets = self._quota_resets_text(q)
             if resets:
@@ -5813,16 +5827,20 @@ class Overlay:
             self.pending_docs.extend(keep_d)
             dropped = (len(paths) - len(keep_i)) + (len(docs) - len(keep_d))
             if dropped:
-                failed += dropped
                 why.append(f"{dropped} more didn't fit — {MAX_PENDING_IMAGES} attachments "
                            f"can be queued at once")
             if keep_i or keep_d:
                 self._refresh_attach()
-            if why:      # name the file and the cause; a bare count is a dead end
-                extra = f"\n  …and {len(why) - 6} more" if len(why) > 6 else ""
-                self.add_err("Couldn't attach:\n  " + "\n  ".join(why[:6]) + extra)
-            elif failed:
-                self.add_err(f"{failed} attachment(s) couldn't be added.")
+            # `failed` is a COUNT with no reasons attached (the paste path posts one); `why`
+            # is the reasons. Both have to be reported: keying off `why` alone hid every
+            # reasonless failure the moment one reason existed, so a full queue plus three
+            # unreadable pastes announced only "1 more didn't fit".
+            lines = list(why)
+            if failed:
+                lines.append(f"{failed} more couldn't be read")
+            if lines:      # name the file and the cause; a bare count is a dead end
+                extra = f"\n  …and {len(lines) - 6} more" if len(lines) > 6 else ""
+                self.add_err("Couldn't attach:\n  " + "\n  ".join(lines[:6]) + extra)
         elif kind == "precapture_done":
             self._capture_busy = False
             if payload:

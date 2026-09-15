@@ -980,39 +980,55 @@ class ClaudeWorker(threading.Thread):
         content: list = []
         if text:
             content.append({"type": "text", "text": text})
-        failed = 0
-        total = 0        # bytes of base64-inlined payload (images + PDFs)
+        why = []         # "name - reason" per rejected path; a count alone can't be acted on
+        total = 0        # RAW bytes on disk, not the base64 that goes on the wire: encoding
+                         # inflates by 4/3, so a 24MB budget spend is ~32MB of `source.data`.
+                         # The caps are expressed in raw bytes too (MAX_INLINE_IMAGE_BYTES et
+                         # al), so the comparison is consistent — but do not read `total` as
+                         # "size of the request".
         doc_chars = 0    # characters of EXTRACTED text (.docx/.pptx) — a separate budget
                          # because the two are not commensurable. A 40MB deck can extract to
                          # two paragraphs, and 400k characters of extracted text weigh almost
                          # nothing against MAX_INLINE_TOTAL_BYTES while costing ~100k tokens.
                          # Charging text to the byte budget would let the flood through.
+        attached = 0     # blocks actually built. NOT len(seen): counting paths meant a file
+                         # that failed still SPENT a slot, so one corrupt document could
+                         # evict a valid image later in the same turn and the turn went out
+                         # under its own cap.
         seen = set()
         for p in image_paths:
             if p in seen:           # dedupe repeated paths (same screenshot/paste twice)
                 continue
             seen.add(p)
-            if len(seen) > MAX_INLINE_IMAGES:   # cap count per turn — all kinds, see config
-                failed += 1
+            if attached >= MAX_INLINE_IMAGES:   # cap count per turn — all kinds, see config
+                why.append(f"{Path(p).name} — over the {MAX_INLINE_IMAGES}-attachment "
+                           f"limit for one message")
                 continue
             ext = Path(p).suffix.lower()
             if ext in IMAGE_EXTS:
                 block, used = self._image_block(p, total)
+                reason = "too large, or unreadable as an image"
             elif ext == ".pdf":
                 block, used = self._pdf_block(p, total)
+                reason = "too large, or unreadable as a PDF"
             elif ext in (".docx", ".pptx"):
                 block, chars = self._doc_text_block(p, ext, doc_chars)
                 doc_chars += chars      # charged in characters, not bytes — see the docstring
                 used = 0
+                reason = "couldn't be parsed, or held no text"
             else:
                 block, used = None, 0
+                reason = f"{ext or 'no extension'} isn't a supported type"
             if block is None:
-                failed += 1
+                why.append(f"{Path(p).name} — {reason}")
                 continue
+            attached += 1
             total += used
             content.append(block)
-        if failed:   # tell the user an attachment didn't actually make it into the turn
-            self.ui.put(("error", f"{failed} attachment(s) couldn't be read and were not sent."))
+        if why:      # name each one: "3 couldn't be read" can't be acted on, "deck.pptx -
+                     # couldn't be parsed" can. Same contract as the picker's own rejections.
+            self.ui.put(("error", "Not sent:\n  " + "\n  ".join(why[:6])
+                                  + (f"\n  …and {len(why) - 6} more" if len(why) > 6 else "")))
         if not content:
             return text
         msg = {"type": "user",
@@ -1088,6 +1104,14 @@ class ClaudeWorker(threading.Thread):
         if room <= 0:
             return None, 0
         try:
+            # Re-check the size HERE, not only in the picker. The picker checked whatever
+            # was on disk when the file was chosen; this runs later — after a queued
+            # message waits its turn, or after the file was edited or replaced in between —
+            # and it is this call that unzips the container and parses every XML part.
+            # A .docx is a zip: a few MB of file can expand to gigabytes of XML, so the
+            # guard has to sit in front of the parser, not only in front of the choosing.
+            if Path(p).stat().st_size > MAX_INLINE_DOC_BYTES:
+                return None, 0
             text = self._extract_docx(p) if ext == ".docx" else self._extract_pptx(p)
         except ImportError:
             self.ui.put(("error", f"{Path(p).name}: Word/PowerPoint support isn't installed "
@@ -1106,12 +1130,28 @@ class ClaudeWorker(threading.Thread):
 
     @staticmethod
     def _extract_docx(p):
+        """Text of a .docx in DOCUMENT ORDER.
+
+        Walking `doc.paragraphs` and then `doc.tables` is the obvious way and it silently
+        reorders the file: every table migrates to the end, away from the prose that
+        introduces it. "Prices", table, "Prices exclude tax" arrives as "Prices", "Prices
+        exclude tax", table — so the qualifier reads as describing the wrong thing, and a
+        model asked what a table shows answers from the wrong caption. Iterating the body's
+        own child elements keeps them where the author put them."""
         from docx import Document   # deferred: only needed when a .docx is actually sent
+        from docx.table import Table
+        from docx.text.paragraph import Paragraph
         doc = Document(p)
-        parts = [para.text for para in doc.paragraphs if para.text]
-        for table in doc.tables:
-            for row in table.rows:
-                parts.append(" | ".join(cell.text for cell in row.cells))
+        parts = []
+        for child in doc.element.body.iterchildren():
+            tag = child.tag.rsplit("}", 1)[-1]
+            if tag == "p":
+                t = Paragraph(child, doc).text
+                if t:                       # empty paragraphs are spacing, not content
+                    parts.append(t)
+            elif tag == "tbl":
+                for row in Table(child, doc).rows:
+                    parts.append(" | ".join(cell.text for cell in row.cells))
         return "\n".join(parts)
 
     @classmethod

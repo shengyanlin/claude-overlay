@@ -92,12 +92,15 @@ class TestStashAttachmentsBg:
         assert sorted(docs) == sorted([files["pdf"], files["docx"]])
         assert failed == 0 and why == []
 
-    def test_unsupported_extension_is_counted_as_failed(self, overlay, files, monkeypatch):
+    def test_unsupported_extension_is_reported_by_name(self, overlay, files, monkeypatch):
         events = []
         monkeypatch.setattr(overlay.ui_q, "put", lambda item: events.append(item))
         overlay._stash_attachments_bg([files["other"]])
         _, (imgs, failed, docs, why) = events[0]
-        assert imgs == [] and docs == [] and failed == 1
+        assert imgs == [] and docs == []
+        # failed is 0 because every rejection here is EXPLAINED; the count channel is
+        # for the paste path, which has no reasons to give.
+        assert failed == 0 and len(why) == 1
         # Names the file AND the cause. A bare count leaves the one person who can act on
         # it (pick a different file) with nothing to act on.
         assert "notes.xyz" in why[0] and ".xyz" in why[0]
@@ -108,7 +111,7 @@ class TestStashAttachmentsBg:
         monkeypatch.setattr(overlay.ui_q, "put", lambda item: events.append(item))
         overlay._stash_attachments_bg([files["pdf"]])
         _, (imgs, failed, docs, why) = events[0]
-        assert docs == [] and failed == 1
+        assert docs == [] and failed == 0 and len(why) == 1
         assert "doc.pdf" in why[0] and "limit" in why[0]
 
     def test_word_files_are_not_held_to_the_image_byte_cap(self, overlay, files, monkeypatch):
@@ -144,7 +147,7 @@ class TestStashAttachmentsBg:
         _, (imgs, failed, docs, why) = events[0]
         assert len(imgs) == 1          # the second png still got through
         assert docs == [files["pdf"]]  # and so did everything after the failure
-        assert failed == 1 and len(why) == 1
+        assert failed == 0 and len(why) == 1
 
     def test_the_post_happens_even_if_routing_raises(self, overlay, files, monkeypatch):
         """_paste_busy is cleared by the ("attach", …) post. Miss the post and the 📎 button
@@ -204,12 +207,25 @@ class TestAttachHandler:
         assert "a.xyz" in errs[0] and "b.pptx" in errs[0]
         assert "2 attachment(s) couldn't be added." not in errs[0]
 
+    def test_reasons_do_not_swallow_a_reasonless_count(self, overlay, files, monkeypatch):
+        """Keying the report off `why` alone hid every failure that came WITHOUT a reason
+        the moment one reason existed: a full queue plus three unreadable pastes announced
+        only "1 more didn't fit" and said nothing about the three."""
+        monkeypatch.setattr(co, "MAX_PENDING_IMAGES", 1)
+        overlay.pending_images = [files["png"]]          # queue already full
+        errs = []
+        monkeypatch.setattr(overlay, "add_err", lambda m: errs.append(m))
+        overlay._handle("attach", ([files["png"]], 3))   # paste: 1 dropped + 3 reasonless
+        assert len(errs) == 1
+        assert "didn't fit" in errs[0]                   # the overflow, with its reason
+        assert "3 more couldn't be read" in errs[0]      # AND the three that had none
+
     def test_a_count_with_no_reasons_still_reports(self, overlay, monkeypatch):
         """The paste path posts a count and no reasons; it must not go silent."""
         errs = []
         monkeypatch.setattr(overlay, "add_err", lambda m: errs.append(m))
         overlay._handle("attach", ([], 3))
-        assert errs == ["3 attachment(s) couldn't be added."]
+        assert len(errs) == 1 and "3 more couldn't be read" in errs[0]
 
 
 class TestSendWithDocs:

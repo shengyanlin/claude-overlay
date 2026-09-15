@@ -96,6 +96,18 @@ class TestAllowanceSegment:
         gauge._handle("quota", _q(util=0.001))
         assert gauge.quota_lbl.cget("text") == ""
 
+    def test_nothing_that_rounds_to_zero_percent_is_shown(self, gauge):
+        """The rule is tested against the ROUNDED value, not a threshold constant. A
+        constant is a second copy of `:.0f`'s rounding and the two drifted at once: 0.005
+        cleared a `< 0.005` floor and then rendered, via round-half-even, as "5h 0%"."""
+        for u in (0.004, 0.005, 0.0049):
+            gauge._handle("quota", _q(util=u))
+            assert gauge.quota_lbl.cget("text") == "", f"utilization {u} printed a 0% segment"
+
+    def test_the_smallest_number_worth_showing_is_shown(self, gauge):
+        gauge._handle("quota", _q(util=0.006))
+        assert "5h 1%" in gauge.quota_lbl.cget("text")
+
     def test_a_malformed_reading_is_dropped_not_printed(self, gauge):
         gauge._handle("quota", {"status": "allowed", "utilization": None})
         assert gauge.quota_lbl.cget("text") == ""

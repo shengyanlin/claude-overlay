@@ -103,6 +103,21 @@ class TestExtractDocx:
     def test_empty_paragraphs_are_dropped(self, docx_file):
         assert "\n\n" not in ClaudeWorker._extract_docx(docx_file)
 
+    def test_tables_stay_where_the_author_put_them(self, tmp_path):
+        """doc.paragraphs then doc.tables is the obvious walk and it silently moves every
+        table to the end, away from the prose that introduces it. "Prices" / table /
+        "Prices exclude tax" would arrive with the qualifier attached to the wrong thing,
+        and a model asked what the table shows answers from the wrong caption."""
+        p = tmp_path / "ordered.docx"
+        d = Document()
+        d.add_paragraph("BEFORE_TABLE")
+        t = d.add_table(rows=1, cols=1)
+        t.cell(0, 0).text = "IN_TABLE"
+        d.add_paragraph("AFTER_TABLE")
+        d.save(p)
+        text = ClaudeWorker._extract_docx(str(p))
+        assert text.index("BEFORE_TABLE") < text.index("IN_TABLE") < text.index("AFTER_TABLE")
+
 
 class TestExtractPptx:
 
@@ -180,6 +195,16 @@ class TestDocTextBlock:
         w = make_worker()
         assert w._doc_text_block(str(p), ".docx") == (None, 0)
 
+    def test_the_size_cap_is_re_checked_here_not_only_in_the_picker(self, docx_file,
+                                                                   monkeypatch):
+        """The picker measured the file when it was CHOSEN; this runs later — after a queued
+        message waits its turn, or after the file was replaced — and it is this call that
+        unzips the container and parses every XML part. A .docx is a zip, so a few MB can
+        expand to gigabytes of XML: the guard has to sit in front of the parser."""
+        monkeypatch.setattr(worker_module, "MAX_INLINE_DOC_BYTES", 1)
+        w = make_worker()
+        assert w._doc_text_block(docx_file, ".docx") == (None, 0)
+
     def test_a_missing_package_tells_the_user_how_to_fix_it(self, docx_file, monkeypatch):
         def no_docx(_p):
             raise ImportError("No module named 'docx'")
@@ -227,8 +252,15 @@ class TestImageBlock:
         block, used = ClaudeWorker._image_block(str(jpg), 0)
         assert block["source"]["media_type"] == "image/jpeg" and used > 0
 
-    def test_an_unknown_extension_defaults_to_png(self, png_file):
-        block, _ = ClaudeWorker._image_block(png_file, 0)
+    def test_an_unmapped_extension_defaults_to_png(self, tmp_path):
+        """.bmp is an accepted image type with no entry in the media-type map, so it
+        is the branch this covers. The first version passed a .png, which reaches the
+        same default only because .png also happens to be unmapped - adding it to the
+        map would have left the test green and the fallback untested."""
+        from PIL import Image
+        bmp = tmp_path / "x.bmp"
+        Image.new("RGB", (2, 2)).save(bmp)
+        block, _ = ClaudeWorker._image_block(str(bmp), 0)
         assert block["source"]["media_type"] == "image/png"
 
 
@@ -262,7 +294,7 @@ class TestBuildQueryRouting:
         content = self._content(w_inline, "look", [str(p)])
         assert [b["type"] for b in content] == ["text"]       # prompt only
         errs = [e for e in _drain(w_inline.ui) if e[0] == "error"]
-        assert errs and "couldn't be read" in errs[0][1]
+        assert errs and "isn't a supported type" in errs[0][1]
 
     def test_repeated_paths_are_deduped(self, w_inline, docx_file):
         content = self._content(w_inline, "look", [docx_file, docx_file])
@@ -310,7 +342,45 @@ class TestBuildQueryRouting:
         docs = [b["text"] for b in content if b["text"].startswith("[Attached file:")]
         assert len(docs) == 1 and "first.docx" in docs[0]
         errs = [e for e in _drain(w_inline.ui) if e[0] == "error"]
-        assert errs and "were not sent" in errs[0][1]
+        assert errs and "Not sent" in errs[0][1] and "second.docx" in errs[0][1]
+
+    def test_a_failed_file_does_not_spend_an_attachment_slot(self, w_inline, tmp_path,
+                                                             monkeypatch):
+        """The cap counts blocks BUILT, not paths seen. Counting paths let a file that
+        produced nothing still spend a slot, so one corrupt document could evict a valid
+        image later in the same turn and the message went out under its own cap."""
+        monkeypatch.setattr(worker_module, "MAX_INLINE_IMAGES", 2)
+        corrupt = tmp_path / "lying.docx"
+        corrupt.write_bytes(b"not a zip")
+        from PIL import Image
+        imgs = []
+        for n in (1, 2):
+            q = tmp_path / f"i{n}.png"
+            Image.new("RGB", (2, 2), (n, n, n)).save(q)
+            imgs.append(str(q))
+        content = self._content(w_inline, "look", [str(corrupt)] + imgs)
+        assert len([b for b in content if b["type"] == "image"]) == 2
+
+    def test_a_rejected_file_is_named_in_the_error(self, w_inline, tmp_path):
+        """Same contract as the picker's rejections: the file and the cause, not a tally."""
+        corrupt = tmp_path / "broken.docx"
+        corrupt.write_bytes(b"not a zip")
+        self._content(w_inline, "look", [str(corrupt)])
+        errs = [e for e in _drain(w_inline.ui) if e[0] == "error"]
+        assert errs and "broken.docx" in errs[0][1]
+        assert "parsed" in errs[0][1]
+
+    def test_over_the_count_cap_says_so_by_name(self, w_inline, tmp_path, monkeypatch):
+        monkeypatch.setattr(worker_module, "MAX_INLINE_IMAGES", 1)
+        from PIL import Image
+        paths = []
+        for n in (1, 2):
+            q = tmp_path / f"i{n}.png"
+            Image.new("RGB", (2, 2), (n, n, n)).save(q)
+            paths.append(str(q))
+        self._content(w_inline, "look", paths)
+        errs = [e for e in _drain(w_inline.ui) if e[0] == "error"]
+        assert errs and "i2.png" in errs[0][1] and "1-attachment limit" in errs[0][1]
 
     def test_the_count_cap_covers_documents_too(self, w_inline, tmp_path, monkeypatch):
         monkeypatch.setattr(worker_module, "MAX_INLINE_IMAGES", 2)

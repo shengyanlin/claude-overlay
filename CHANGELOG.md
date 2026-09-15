@@ -60,6 +60,22 @@ statusline as text.
   sees extracted prose as a rounding error while the model sees a flood.
 - **Truncated documents say so in the text**, so the model doesn't answer confidently
   about a file it only half received.
+- **A Word table stays where its author put it.** Extraction collected every paragraph
+  and then every table, which moves each table to the end of the document, away from the
+  prose that introduces it: "Prices", a table, "Prices exclude tax" arrived with the
+  qualifier apparently describing something else.
+- **An attachment that fails no longer spends one of the per-turn slots.** The cap counted
+  paths seen rather than blocks built, so one corrupt document could evict a valid image
+  later in the same message and the message went out under its own limit.
+- **The document size limit is re-checked when the file is read**, not only when it was
+  picked. A `.docx` is a zip — a few MB can expand to gigabytes of XML — and the picker's
+  measurement can be minutes old by the time a queued message actually sends.
+- **A file the worker rejects is named**, with the reason, the way the picker's own
+  rejections already were.
+- **A failure with no reason attached is no longer hidden by one that has one.** A full
+  queue plus three unreadable pastes reported only the queue overflow.
+- **An allowance of 0.5% no longer displays as `0%`.** The floor constant was a second
+  copy of the format string's rounding and the two disagreed immediately.
 - **Preflight's remedy for a missing python-docx/python-pptx now points at the file they
   are actually in.** It offered the `requirements.txt` command, which provably cannot
   install them.
