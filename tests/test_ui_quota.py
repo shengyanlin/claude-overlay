@@ -201,6 +201,16 @@ class TestAllowanceColour:
         gauge._handle("quota", _q(status="rejected", util=0.10))
         assert gauge.quota_lbl.cget("fg") == co.T["err"]
 
+    def test_a_reading_the_text_refuses_is_not_coloured_as_spent(self, gauge):
+        """Colour and text go through ONE validator. The second copy drifted at once: the
+        colour check accepted any int-or-float, so True read as 100% and infinity read as
+        spent, painting the label red while the text correctly printed nothing. Invisible
+        while the label is empty, and a wrong answer the moment that branch shows anything."""
+        for u in (True, float("inf"), float("nan"), -0.5):
+            gauge._handle("quota", _q(status="allowed", util=u))
+            assert gauge.quota_lbl.cget("text") == ""
+            assert gauge.quota_lbl.cget("fg") == co.T["muted"], f"{u!r} was coloured"
+
     def test_context_does_not_follow_the_allowance(self, gauge):
         """Two numbers, two tiers, two labels. One recolouring for the other's sake is how
         a row starts lying about which figure is the problem."""

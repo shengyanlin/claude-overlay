@@ -391,6 +391,40 @@ _QUOTA_WARN = 0.75                # amber floor for a reading that carries no st
                                   # 0.005 cleared a `< 0.005` floor and then printed "0%".)
 
 
+def _quota_pct(u):
+    """An allowance reading as a whole percent 0-100, or None if it isn't a reading.
+
+    ONE validator, because both the text and its colour read the same field and a second
+    copy drifted immediately: the colour check said `isinstance(u, (int, float))` and so
+    treated `True` as 100% and infinity as spent, painting the label red while the text
+    correctly refused to print anything. Invisible today only because the label it
+    colours is empty in exactly those cases — a latent wrong answer waiting for someone
+    to give that branch something to show.
+
+    Total on purpose. The value comes from JSON the CLI emitted, so it can be absent,
+    null, a bool, a string, NaN, Infinity, negative, or a gigantic int — and this is read
+    on the Tk thread inside the ui_q drain, where an exception doesn't blank one label but
+    kills the callback that delivers every other queued event. Order matters:
+      - bool before int, since bool IS an int and True would read as 100%.
+      - isfinite only AFTER narrowing to float: NaN and Infinity are floats and round()
+        raises on both, but a huge INT cannot even be passed to isfinite — converting it
+        to float raises, and so would formatting it with a fixed-point spec. json.loads
+        accepts NaN and Infinity by default, so either can genuinely arrive.
+      - `u >= 1` short-circuits before any multiplication, so an absurd int reaches
+        neither round() nor a format spec.
+    Clamped at 100 the way the arcs were (min(1.0, u)): an allowance can be reported past
+    its limit, and "5h 340%" reads as a bug in the overlay rather than a fact about the
+    account.
+    """
+    if isinstance(u, bool) or not isinstance(u, (int, float)):
+        return None
+    if isinstance(u, float) and not math.isfinite(u):
+        return None
+    if u < 0:
+        return None
+    return 100 if u >= 1 else round(u * 100)
+
+
 def _mix(a, b, t):
     """Blend two #rrggbb colours, t of the way from a to b."""
     x, y = (int(a[i:i + 2], 16) for i in (1, 3, 5)), (int(b[i:i + 2], 16) for i in (1, 3, 5))
@@ -4927,39 +4961,18 @@ class Overlay:
         of the string and useless while you have most of the allowance left — the row has to
         stay narrow enough that the version does not clip."""
         q = self._gauge_quota()
-        u = q.get("utilization")
-        if isinstance(u, bool) or not isinstance(u, (int, float)):
-            return ""
-        # This runs on the Tk thread inside the ui_q drain, so an exception here does not
-        # just blank one label — it takes out the callback that delivers every other event.
-        # That makes it worth being total about a number we did not produce. Three ways a
-        # value that passes the isinstance check above can still blow up arithmetic:
-        #   NaN / infinity are floats, and round() raises on both (ValueError /
-        #     OverflowError) where the old `:.0f` merely printed "nan". json.loads accepts
-        #     NaN and Infinity by default, so a CLI emitting either reaches us.
-        #   A huge int is an int, so isfinite() is not even safe to ASK — converting it to
-        #     float raises, and so would formatting it with `:.0f`. Hence the isinstance
-        #     narrowing before the isfinite call, and the comparisons below, which never
-        #     convert.
-        #   A negative reading is not a share of anything.
-        if isinstance(u, float) and not math.isfinite(u):
-            return ""
-        if u < 0:
-            return ""
-        # Clamped at 100, the way the arcs were (min(1.0, u)): an allowance can be reported
-        # past its limit, and "5h 340%" reads as a bug in the overlay rather than a fact
-        # about the account. `u >= 1` short-circuits before any multiplication, so an
-        # absurd int never reaches round() or a format spec.
-        pct = 100 if u >= 1 else round(u * 100)
+        pct = _quota_pct(q.get("utilization"))
         # Empty until there is a non-zero percent to SHOW. Tested against the rounded value,
         # which is the thing the user reads: a separate threshold constant is a second copy
         # of the rounding, and it drifted on the first try — 0.005 passed a `< 0.005` floor
         # and then rendered as "5h 0%", which is chrome that says nothing.
-        if pct < 1:
+        if pct is None or pct < 1:
             return ""
         win = _QUOTA_WINDOWS.get(q.get("window"))
         bits = [f"{win} {pct}%" if win else f"allowance {pct}%"]
-        if u >= _QUOTA_WARN or q.get("status") in ("allowed_warning", "rejected"):
+        # Compared on the VALIDATED percent, not on the raw reading: touching the raw value
+        # again here is how the second copy of the validation gets reintroduced.
+        if pct >= _QUOTA_WARN * 100 or q.get("status") in ("allowed_warning", "rejected"):
             resets = self._quota_resets_text(q)
             if resets:
                 bits.append(resets)
@@ -5000,17 +5013,18 @@ class Overlay:
             return ""
 
     def _gauge_color(self):
-        # Same reading the text came from, so colour and number can never describe different
-        # windows. The CLI's own status is trusted first where it exists; _QUOTA_HOT and
-        # _QUOTA_WARN colour by the number alone, which is the only thing a polled reading
-        # gives us — it carries no status field, and usage.py won't invent one.
+        # Same reading the text came from, AND through the same validator, so colour and
+        # number can never describe different windows or disagree about whether there is a
+        # reading at all. The CLI's own status is trusted first where it exists; _QUOTA_HOT
+        # and _QUOTA_WARN colour by the number alone, which is the only thing a polled
+        # reading gives us — it carries no status field, and usage.py won't invent one.
         q = self._gauge_quota()
-        u = q.get("utilization")
-        if isinstance(u, (int, float)):
+        pct = _quota_pct(q.get("utilization"))   # the SAME validator the text uses
+        if pct is not None:
             st = q.get("status")
-            if st == "rejected" or u >= _QUOTA_HOT:
+            if st == "rejected" or pct >= _QUOTA_HOT * 100:
                 return T["err"]
-            if st == "allowed_warning" or u >= _QUOTA_WARN:
+            if st == "allowed_warning" or pct >= _QUOTA_WARN * 100:
                 return T["accent"]
         return T["muted"]
 
