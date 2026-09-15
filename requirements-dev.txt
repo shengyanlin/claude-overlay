@@ -1,4 +1,8 @@
 # Dev/test dependencies. Runtime deps come from requirements.txt (pulled in below so a
 # fresh checkout can import worker/claude_overlay, which the smoke test exercises).
 -r requirements.txt
+# OPTIONAL at runtime, REQUIRED to test: the attachment tests build real .docx/.pptx
+# files and run the extractors over them. Omitting these from CI would leave the only
+# coverage of that code silently unrun.
+-r requirements-docs.txt
 pytest>=7.0

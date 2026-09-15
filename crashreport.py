@@ -81,7 +81,11 @@ def environment_lines(app_version=""):
         out.append(f"script       : {os.path.abspath(sys.argv[0]) if sys.argv else '?'}")
         out.append(f"cwd          : {os.getcwd()}")
         out.append(f"console      : {'yes' if has_console() else 'no (pythonw)'}")
-        for dist in ("claude-agent-sdk", "pillow", "keyboard", "anyio"):
+        # python-docx/python-pptx are OPTIONAL (requirements-docs.txt), so "not installed"
+        # is a normal reading here rather than a fault. Reported anyway: "attaching my deck
+        # does nothing" is answered by this line and unanswerable without it.
+        for dist in ("claude-agent-sdk", "pillow", "keyboard", "anyio",
+                     "python-docx", "python-pptx"):
             out.append(f"{dist:<13}: {_pkg_version(dist)}")
     except Exception:                                          # pragma: no cover - defensive
         pass

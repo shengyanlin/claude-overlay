@@ -361,17 +361,76 @@ _CTX_HOT_PCT = 85.0               # red, and a second, louder note
 # spent. So a window that never rises past a few percent can sit next to an allowance that's
 # nearly gone — which is precisely how you get cut off with no warning, and why the context
 # number can't be the one on display. The CLI knows the real figure and emits it on every
-# status transition (RateLimitEvent → the worker's "quota"); the statusline gives it the slot
-# and lends it back to context only when context is itself over its warning line, so the row
-# never carries two percentages competing to be the one you should worry about.
+# status transition (RateLimitEvent → the worker's "quota"), and usage.py polls for it too.
+#
+# It gets its OWN segment in the statusline, next to context rather than instead of it. Three
+# arrangements have now been tried. One shared slot, allowance winning and context demoted to
+# a fallback, was two percentages competing to be the one number you read. Moving the
+# allowance onto the titlebar mark as two arcs bought the row back, at the cost of a gauge
+# that could carry the figures but not their names, plus a supersampled-PIL repaint to make
+# arcs legible at 36px. The third is the cheap one: both numbers, each labelled, each in its
+# own label so it can recolour without dragging the model name and version with it. They are
+# not a duplication — the allowance is your plan, context is the size of THIS conversation,
+# and they answer different questions. The allowance segment collapses to nothing when there
+# is no reading, so the row stays short on a narrow overlay, which is what killed arrangement
+# one (a second clause pushed the version off the end).
 _QUOTA_WINDOWS = {"five_hour": "5h", "seven_day": "week", "seven_day_opus": "week/opus",
                   "seven_day_sonnet": "week/sonnet", "overage": "overage"}
 _QUOTA_HOT = 0.90                 # colour by the number shown, even if the CLI still says
                                   # "allowed" — a grey 94% reads as nothing being wrong
-_QUOTA_WARN = 0.75                # the ring's amber step. The text gauge can wait for the
-                                  # CLI's own "allowed_warning" because it prints a number you
-                                  # read; an arc has no number, so it has to earn attention
-                                  # before it is nearly spent or it says nothing until too late.
+_QUOTA_WARN = 0.75                # amber floor for a reading that carries no status. The CLI's
+                                  # own "allowed_warning" is the better signal and wins where we
+                                  # have it, but usage.py's poll has no status field at all —
+                                  # without a floor of our own a polled 80% would sit in muted
+                                  # grey until it crossed _QUOTA_HOT.
+                                  # (The rule "stay empty until there is a non-zero percent to
+                                  # show" lives in _quota_text, checked against what actually
+                                  # renders rather than against a threshold constant: a
+                                  # constant here would be a second copy of the format
+                                  # string's own rounding, and the two drifted immediately —
+                                  # 0.005 cleared a `< 0.005` floor and then printed "0%".)
+
+
+def _quota_pct(u):
+    """An allowance reading as a whole percent 0-100, or None if it isn't a reading.
+
+    ONE validator, because both the text and its colour read the same field and a second
+    copy drifted immediately: the colour check said `isinstance(u, (int, float))` and so
+    treated `True` as 100% and infinity as spent, painting the label red while the text
+    correctly refused to print anything. Invisible today only because the label it
+    colours is empty in exactly those cases — a latent wrong answer waiting for someone
+    to give that branch something to show.
+
+    Total on purpose. The value comes from JSON the CLI emitted, so it can be absent,
+    null, a bool, a string, NaN, Infinity, negative, or a gigantic int — and this is read
+    on the Tk thread inside the ui_q drain, where an exception doesn't blank one label but
+    kills the callback that delivers every other queued event. Order matters:
+      - bool before int, since bool IS an int and True would read as 100%.
+      - isfinite only AFTER narrowing to float: NaN and Infinity are floats and round()
+        raises on both, but a huge INT cannot even be passed to isfinite — converting it
+        to float raises, and so would formatting it with a fixed-point spec. json.loads
+        accepts NaN and Infinity by default, so either can genuinely arrive.
+      - `u >= 1` short-circuits before any multiplication, so an absurd int reaches
+        neither round() nor a format spec.
+    Clamped at 100 the way the arcs were (min(1.0, u)): an allowance can be reported past
+    its limit, and "5h 340%" reads as a bug in the overlay rather than a fact about the
+    account.
+
+    Rounding here shifts the tier boundaries by half a percent, and that is deliberate:
+    every caller compares against THIS number, so 0.749 rounds to 75 and goes amber where
+    a raw `0.749 >= 0.75` would not. Keep it. The alternative is a label reading "75%" in
+    muted grey, which is the same defect _QUOTA_HOT's comment already names one tier up —
+    a grey 94% reads as nothing being wrong. Colour and number must agree, and the number
+    is the one on screen. Half a percent of earliness costs nothing; a gauge that
+    contradicts itself costs the reader's trust in the whole row.
+    """
+    if isinstance(u, bool) or not isinstance(u, (int, float)):
+        return None
+    if isinstance(u, float) and not math.isfinite(u):
+        return None
+    if u < 0:
+        return None
+    return 100 if u >= 1 else round(u * 100)
 
 
 def _mix(a, b, t):
@@ -1485,6 +1544,15 @@ class Overlay:
         self.ctx_lbl = tk.Label(sl, text="", bg=T["bg"], fg=T["faint"],
                                 font=self.f_small, anchor="w")
         self.ctx_lbl.pack(side="left", padx=(self.px(9), 0), pady=(0, self.px(6)))
+        # The allowance gets the same treatment for the same reason, one slot along: it has its
+        # own warning tiers and must be able to go amber while context stays grey. With no
+        # reading its text is "", which leaves a zero-width label — the row gives up this
+        # segment's padding and nothing else, rather than reserving space for a number that
+        # may never arrive. Not pack_forget()'d: repacking mid-life is how the input bar got
+        # starved once already (see _build_chat), and 9px is not worth that risk.
+        self.quota_lbl = tk.Label(sl, text="", bg=T["bg"], fg=T["faint"],
+                                  font=self.f_small, anchor="w")
+        self.quota_lbl.pack(side="left", padx=(self.px(9), 0), pady=(0, self.px(6)))
         self.ver_lbl = tk.Label(sl, text="", bg=T["bg"], fg=T["faint"],
                                 font=self.f_small, anchor="w")
         self.ver_lbl.pack(side="left", padx=(self.px(9), self.px(6)), pady=(0, self.px(6)))
@@ -2171,33 +2239,58 @@ class Overlay:
         through _stash_image (same downscale/decompression-bomb guard as paste), PDF/
         Word/PPT through a plain size check (worker.py does the real reading — as a
         native document block for PDF, extracted text for .docx/.pptx). Always posts
-        ("attach", …) so _paste_busy is cleared even on failure."""
-        imgs, docs, failed = [], [], 0
+        ("attach", …) so _paste_busy is cleared even on failure.
+
+        Every rejection names the file and the reason. "3 attachment(s) couldn't be
+        added" is a dead end for the one person who can fix it: the fix is almost always
+        "that was a .xlsx" or "that deck is 90MB", and neither is guessable from a count."""
+        imgs, docs, failed, why = [], [], 0, []
         try:
-            for p in paths:
+            self._stash_attachments_loop(paths, imgs, docs, why)
+        finally:
+            # failed=0 deliberately: every rejection this path makes is already explained in
+            # `why`, and the handler reports the count and the reasons SEPARATELY (it has
+            # to — the paste path sends a count with no reasons). Passing len(why) here
+            # would print each file once by name and once more as an anonymous tally.
+            self.ui_q.put(("attach", (imgs, 0, docs, why)))
+
+    def _stash_attachments_loop(self, paths, imgs, docs, why):
+        """The routing loop itself, split out so the ("attach", …) post above sits in a
+        finally that nothing in here can skip — _paste_busy is cleared by that post, and a
+        picker that leaves it set locks the 📎 button and Ctrl+V for the rest of the session.
+
+        `why` is both the reason list and the failure count: every rejection appends
+        exactly one line, so a separate counter is a second copy of the same fact."""
+        for p in paths:
+            # Per FILE, not around the loop. A try spanning the whole loop means one bad file
+            # silently discards every file after it AND doesn't count them as failed: pick
+            # five, see "1 image", get no error, never learn the other three existed.
+            try:
                 ext = Path(p).suffix.lower()
                 if ext in IMAGE_EXTS:
                     saved = self._stash_image(p)
                     if saved:
                         imgs.append(saved)
                     else:
-                        failed += 1
+                        why.append(f"{Path(p).name} — couldn't be read as an image")
                 elif ext in DOC_EXTS:
                     try:
                         size = Path(p).stat().st_size
                     except OSError:
                         size = 0
-                    cap = MAX_INLINE_PDF_BYTES if ext == ".pdf" else MAX_INLINE_IMAGE_BYTES
-                    if 0 < size <= cap:
-                        docs.append(p)
+                    cap = MAX_INLINE_PDF_BYTES if ext == ".pdf" else MAX_INLINE_DOC_BYTES
+                    if size <= 0:
+                        why.append(f"{Path(p).name} — is empty or unreadable")
+                    elif size > cap:
+                        why.append(f"{Path(p).name} — {size / 1048576:.0f}MB, over the "
+                                   f"{cap // 1048576}MB limit for {ext} files")
                     else:
-                        failed += 1
+                        docs.append(p)
                 else:
-                    failed += 1
-        except BaseException:
-            pass
-        finally:
-            self.ui_q.put(("attach", (imgs, failed, docs)))
+                    why.append(f"{Path(p).name} — {ext or 'no extension'} isn't supported "
+                               f"(images, {', '.join(DOC_EXTS)})")
+            except BaseException:
+                why.append(f"{Path(p).name} — couldn't be read")
 
     def _refresh_attach(self):
         ni, nd = len(self.pending_images), len(self.pending_docs)
@@ -4851,6 +4944,8 @@ class Overlay:
         ver = f"v{__version__}" + ("  ⬆" if self._update_available else "")
         self.statusline.configure(text=f"{self._model or 'Claude'} ▾", fg=T["muted"])
         self.ctx_lbl.configure(text=f"·   {self._gauge_text()}", fg=self._ctx_color())
+        q = self._quota_text()
+        self.quota_lbl.configure(text=(f"·   {q}" if q else ""), fg=self._gauge_color())
         self.ver_lbl.configure(text=f"·   {ver}", fg=T["muted"])
 
     # ── the middle of the statusline ──
@@ -4862,6 +4957,34 @@ class Overlay:
 
     def _gauge_text(self):
         return self._ctx_text()
+
+    def _quota_text(self):
+        """The allowance segment: which window, how far through it, and — only once it is
+        worth planning around — when it comes back.
+
+        The window is NAMED rather than implied by position. That is the whole reason this is
+        text again: two arcs could carry both figures at once but neither label, so an unnamed
+        reading had to be dropped instead of drawn, and a "week/opus" window had nowhere to
+        say so. Reset time is held back until the warning tier because it is the longest part
+        of the string and useless while you have most of the allowance left — the row has to
+        stay narrow enough that the version does not clip."""
+        q = self._gauge_quota()
+        pct = _quota_pct(q.get("utilization"))
+        # Empty until there is a non-zero percent to SHOW. Tested against the rounded value,
+        # which is the thing the user reads: a separate threshold constant is a second copy
+        # of the rounding, and it drifted on the first try — 0.005 passed a `< 0.005` floor
+        # and then rendered as "5h 0%", which is chrome that says nothing.
+        if pct is None or pct < 1:
+            return ""
+        win = _QUOTA_WINDOWS.get(q.get("window"))
+        bits = [f"{win} {pct}%" if win else f"allowance {pct}%"]
+        # Compared on the VALIDATED percent, not on the raw reading: touching the raw value
+        # again here is how the second copy of the validation gets reintroduced.
+        if pct >= _QUOTA_WARN * 100 or q.get("status") in ("allowed_warning", "rejected"):
+            resets = self._quota_resets_text(q)
+            if resets:
+                bits.append(resets)
+        return " · ".join(bits)
 
     def _gauge_quota(self):
         """The freshest allowance reading, for DISPLAY only.
@@ -4898,19 +5021,20 @@ class Overlay:
             return ""
 
     def _gauge_color(self):
-        # Same reading the text came from, so colour and number can never describe different
-        # windows. A polled reading has no status, which is why _QUOTA_HOT colours by the
-        # number: an amber tier we'd have to guess at is worse than a red one we can prove.
+        # Same reading the text came from, AND through the same validator, so colour and
+        # number can never describe different windows or disagree about whether there is a
+        # reading at all. The CLI's own status is trusted first where it exists; _QUOTA_HOT
+        # and _QUOTA_WARN colour by the number alone, which is the only thing a polled
+        # reading gives us — it carries no status field, and usage.py won't invent one.
         q = self._gauge_quota()
-        u = q.get("utilization")
-        if isinstance(u, (int, float)):
+        pct = _quota_pct(q.get("utilization"))   # the SAME validator the text uses
+        if pct is not None:
             st = q.get("status")
-            if st == "rejected" or u >= _QUOTA_HOT:
+            if st == "rejected" or pct >= _QUOTA_HOT * 100:
                 return T["err"]
-            if st == "allowed_warning":
+            if st == "allowed_warning" or pct >= _QUOTA_WARN * 100:
                 return T["accent"]
-            return T["muted"]
-        return self._ctx_color()
+        return T["muted"]
 
     def _ctx_color(self):
         p = self._ctx_pct
@@ -5727,23 +5851,38 @@ class Overlay:
                 self._sent_shot_hashes.update(self._pending_shot_hashes)
                 self._pending_shot_hashes.clear()
             self._set_busy(False)
-        elif kind == "attach":          # background paste/picker finished: (images, failed[, docs])
+        elif kind == "attach":   # paste/picker finished: (images, failed[, docs[, reasons]])
             self._paste_busy = False
-            paths, failed, docs = payload if len(payload) == 3 else (*payload, [])
-            if paths:
-                room = max(0, MAX_PENDING_IMAGES - len(self.pending_images))
-                self.pending_images.extend(paths[:room])
-                if len(paths) > room:   # over the queue cap → count the rest as not attached
-                    failed += len(paths) - room
-            if docs:
-                room = max(0, MAX_PENDING_IMAGES - len(self.pending_docs))
-                self.pending_docs.extend(docs[:room])
-                if len(docs) > room:
-                    failed += len(docs) - room
-            if paths or docs:
+            pl = list(payload)   # paste posts a 2-tuple, the picker a 4-tuple
+            paths, failed = pl[0], pl[1]
+            docs = pl[2] if len(pl) > 2 else []
+            why = list(pl[3]) if len(pl) > 3 else []
+            # ONE budget across both kinds. MAX_PENDING_IMAGES is named for images because
+            # they were all there was, but its job — stated in its own comment — is that a
+            # hostile clipboard can't pile up, and a per-kind cap quietly doubles the ceiling
+            # it sets. Images fill first when the budget is tight: a pasted screenshot is
+            # usually the thing being asked about, and a doc is cheap to re-pick.
+            room = max(0, MAX_PENDING_IMAGES - len(self.pending_images) - len(self.pending_docs))
+            keep_i = paths[:room]
+            keep_d = docs[:max(0, room - len(keep_i))]
+            self.pending_images.extend(keep_i)
+            self.pending_docs.extend(keep_d)
+            dropped = (len(paths) - len(keep_i)) + (len(docs) - len(keep_d))
+            if dropped:
+                why.append(f"{dropped} more didn't fit — {MAX_PENDING_IMAGES} attachments "
+                           f"can be queued at once")
+            if keep_i or keep_d:
                 self._refresh_attach()
+            # `failed` is a COUNT with no reasons attached (the paste path posts one); `why`
+            # is the reasons. Both have to be reported: keying off `why` alone hid every
+            # reasonless failure the moment one reason existed, so a full queue plus three
+            # unreadable pastes announced only "1 more didn't fit".
+            lines = list(why)
             if failed:
-                self.add_err(f"{failed} attachment(s) couldn't be added.")
+                lines.append(f"{failed} more couldn't be read")
+            if lines:      # name the file and the cause; a bare count is a dead end
+                extra = f"\n  …and {len(lines) - 6} more" if len(lines) > 6 else ""
+                self.add_err("Couldn't attach:\n  " + "\n  ".join(lines[:6]) + extra)
         elif kind == "precapture_done":
             self._capture_busy = False
             if payload:

@@ -52,10 +52,13 @@ so it uses your **existing Claude subscription — no API key, no metered billin
   the CLI drops mid-session, it reconnects *into the same conversation* instead of
   losing your context.
 - 💸 **No API key, no extra cost.** Runs on your existing Claude subscription.
-- 🖼️ **Screenshots *and* pasted images.** It grabs your screen automatically on every
-  message, or paste any image with **Ctrl+V** to ask about it. If your screen hasn't
-  changed since the last message, the duplicate isn't re-sent (Claude is told to keep
-  using the one it already has) — follow-up questions answer measurably faster.
+- 🖼️ **Screenshots, pasted images, and files.** It grabs your screen automatically on
+  every message, or paste any image with **Ctrl+V** to ask about it. Click **📎** to
+  attach a PDF, Word or PowerPoint file from this machine — PDFs go to Claude whole,
+  pages and all; Word and PowerPoint have their text pulled out locally, so the words
+  arrive and the charts and layout don't. If your screen hasn't changed since the last
+  message, the duplicate isn't re-sent (Claude is told to keep using the one it already
+  has) — follow-up questions answer measurably faster.
 - ⚡ **Live, polished UI.** Responses stream token-by-token with clean tool-call
   chips, an in-place model switcher, and a context-usage meter.
 - 🎨 **Looks the part, crisp anywhere.** Styled after the Claude desktop app,
@@ -352,17 +355,18 @@ script here *scans* that folder and uses whatever runs, no matter how it got the
 | Type ahead while Claude answers | just keep going — `Enter` mid-reply **queues** the message (like the Claude Code CLI) instead of interrupting; queued messages show above the box and go out one per finished reply, in order. Each row's **✕** hands its text back to the box |
 | New line | `Shift+Enter` |
 | Stop a running reply | click **Stop** (the ↑ becomes ■ while busy) or press `Esc` — either also drops the queued line-up, listing the texts in the transcript and putting the first back in the box |
-| Paste an image | **Ctrl+V** (click **📎** to clear) |
+| Paste an image | **Ctrl+V** (or `Shift+Insert`) |
+| Attach a file | click **📎** — images, PDF, `.docx`, `.pptx`, multi-select allowed. Anything that can't be attached says which file and why, rather than just how many failed |
+| Clear what's attached | click the **📎 2 images, 1 file ✕** count next to the button (the button itself opens the picker) |
 | Toggle auto-screenshot | **◉ / ○ Auto-shot** (orange = on) |
 | Settings menu | click **⚙** — Window-only, Shareable, Read-only (✓ = on); the gear turns orange while Read-only is on |
 | &nbsp;&nbsp;• Capture only the active window | **⚙ → Window-only** (window only; off = every monitor) |
 | &nbsp;&nbsp;• Show / hide in screen shares | **⚙ → Shareable** (visible to Teams/Zoom/OBS; off = private, the default) |
 | &nbsp;&nbsp;• Lock Claude read-only | **⚙ → Read-only** ("plan" mode: looks and answers, changes nothing; off = the configured `PERMISSION_MODE`) |
 | Switch model | click the **statusline** (`model ▾`) — the list shows the model families **your** login can actually pick, read from the CLI's own record of them, so it can't offer you a model that would silently fall back to another one |
-| See how much allowance is left | **two arcs around the ✻ mark** — the inner one is the 5-hour window, the outer one is weekly. Both are drawn, always: the 5-hour window is the one that ends the session you're in, and it spends most of its life sitting below the weekly number, so showing only whichever is furthest along would hide it for exactly as long as it matters. Filled in from your account the moment the overlay opens, so it's there **before** you send anything, and refreshed every minute while it sits idle; amber as you approach a limit, red once it's gone. It speaks up once per transition, and a message refused for allowance is put back in the box rather than lost |
-| See the exact numbers | **hover the ✻ mark** — a small panel drops under it with both allowance windows, their reset times, and the context headroom in turns (extrapolated from what recent ones cost). No unlabelled gauge explains itself; this is how you ask it |
+| See how much allowance is left | the statusline's `5h 61%` — the window is **named**, so you always know whether you're looking at the 5-hour allowance or a weekly one, and whichever you'll hit first is the one shown. Filled in from your account the moment the overlay opens, so it's there **before** you send anything, and refreshed every minute while it sits idle; amber as you approach a limit, red once it's gone, and the reset time joins it only once that's worth planning around. It speaks up once per transition, and a message refused for allowance is put back in the box rather than lost |
 | Retry when the allowance returns | a refused message offers **⏱ Send it automatically at &lt;time&gt;** — opt-in, one click, and it stands down the moment you type something else, send by hand, or Clear |
-| See how much context is left | the statusline's `context 72%` — always there, and it never reflows: the allowance moved to the mark, so nothing competes with it for the slot. A note at 70% and again at 85% says when compacting is worth it |
+| See how much context is left | the statusline's `context 72%` — its own segment, beside the allowance rather than competing with it: the allowance is your plan, context is the size of *this* conversation, and Clear or Compact hands context back while the spend stays spent. A note at 70% and again at 85% says when compacting is worth it |
 | Zoom text in / out | **Ctrl +** / **Ctrl −** (or **Ctrl + mouse-wheel**); **Ctrl 0** resets |
 | New conversation | **Clear** |
 | Compact the conversation (free up context) | **Compact** — summarizes older turns, keeps going |

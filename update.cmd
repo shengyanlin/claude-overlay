@@ -314,6 +314,27 @@ if errorlevel 1 (
   pause & exit /b 1
 )
 
+rem --- optional extras: Word/PowerPoint attachments -------------------------
+rem A SEPARATE pass, and deliberately NOT fatal. These pull in lxml, a compiled
+rem extension, so on a Python with no lxml wheel pip fails - and listed in the file
+rem above, that failure would abort the whole update and leave the app unlaunchable
+rem over a file-attachment convenience. Everything downstream already copes with them
+rem being absent (deferred imports in worker.py, a preflight WARN, an ImportError
+rem message that names the install command), so a warning is the honest outcome.
+if exist "%~dp0requirements-docs.txt" (
+  echo Refreshing optional Word/PowerPoint support ...
+  call %PY% -m pip install --upgrade -r "%~dp0requirements-docs.txt"
+  if errorlevel 1 (
+    echo.
+    rem No bare `!` in this notice - see the note above :finish; delayed expansion eats it.
+    echo [NOTE] Optional Word/PowerPoint support did not install ^(see above^).
+    echo     Everything else is fine and the app will start normally. Attaching a
+    echo     .docx or .pptx will say support is missing; images and PDFs are
+    echo     unaffected. To retry just this part:
+    echo       %PY% -m pip install --upgrade -r requirements-docs.txt
+  )
+)
+
 rem --- refresh the desktop shortcut icon IF one already exists ---
 rem The .lnk is machine-specific (gitignored), so git pull can't touch it. If a "Claude
 rem Overlay" shortcut is on the Desktop, re-point it at the current icon. We skip this when

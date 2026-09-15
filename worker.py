@@ -69,6 +69,24 @@ from debuglog import dbg, DEBUG_LOG, _UIQueueTap, _dbg_stream_last, _dbg_think_l
 from modelresolve import resolve_model
 import authstate
 
+
+def _stat_reason(exc):
+    """Why a file we were handed could not be measured or read, in words the person who
+    picked it can act on.
+
+    The distinction is the whole point. A path stops working between the picker and the
+    send for two very different reasons — it was moved or deleted, or it is locked and
+    unreadable — and "couldn't be read" covers both while helping with neither. The
+    exception class already knows which; this just stops throwing that away."""
+    if isinstance(exc, FileNotFoundError):
+        return "is no longer there (moved or deleted since you picked it)"
+    if isinstance(exc, PermissionError):
+        return "couldn't be opened (permission denied, or another program has it locked)"
+    if isinstance(exc, IsADirectoryError):
+        return "is a folder, not a file"
+    return f"couldn't be read ({exc.__class__.__name__})"
+
+
 class ClaudeWorker(threading.Thread):
     def __init__(self, ui_queue: "queue.Queue", permission_mode=None):
         super().__init__(daemon=True)
@@ -980,32 +998,57 @@ class ClaudeWorker(threading.Thread):
         content: list = []
         if text:
             content.append({"type": "text", "text": text})
-        failed = 0
-        total = 0
+        why = []         # "name - reason" per rejected path; a count alone can't be acted on
+        total = 0        # RAW bytes on disk, not the base64 that goes on the wire: encoding
+                         # inflates by 4/3, so a 24MB budget spend is ~32MB of `source.data`.
+                         # The caps are expressed in raw bytes too (MAX_INLINE_IMAGE_BYTES et
+                         # al), so the comparison is consistent — but do not read `total` as
+                         # "size of the request".
+        doc_chars = 0    # characters of EXTRACTED text (.docx/.pptx) — a separate budget
+                         # because the two are not commensurable. A 40MB deck can extract to
+                         # two paragraphs, and 400k characters of extracted text weigh almost
+                         # nothing against MAX_INLINE_TOTAL_BYTES while costing ~100k tokens.
+                         # Charging text to the byte budget would let the flood through.
+        attached = 0     # blocks actually built. NOT len(seen): counting paths meant a file
+                         # that failed still SPENT a slot, so one corrupt document could
+                         # evict a valid image later in the same turn and the turn went out
+                         # under its own cap.
         seen = set()
         for p in image_paths:
             if p in seen:           # dedupe repeated paths (same screenshot/paste twice)
                 continue
             seen.add(p)
-            if len(seen) > MAX_INLINE_IMAGES:   # cap count per turn
-                failed += 1
+            if attached >= MAX_INLINE_IMAGES:   # cap count per turn — all kinds, see config
+                why.append(f"{Path(p).name} — over the {MAX_INLINE_IMAGES}-attachment "
+                           f"limit for one message")
                 continue
+            # Each helper reports its OWN reason, because only it knows which of four
+            # unrelated things went wrong. A single hedged sentence per branch ("too large,
+            # or unreadable") sent people to check the wrong thing: a file that was deleted
+            # since it was picked and a file that is genuinely too big need opposite
+            # responses, and the message named neither.
             ext = Path(p).suffix.lower()
             if ext in IMAGE_EXTS:
-                block, used = self._image_block(p, total)
+                block, used, reason = self._image_block(p, total)
             elif ext == ".pdf":
-                block, used = self._pdf_block(p, total)
+                block, used, reason = self._pdf_block(p, total)
             elif ext in (".docx", ".pptx"):
-                block, used = self._doc_text_block(p, ext), 0
+                block, chars, reason = self._doc_text_block(p, ext, doc_chars)
+                doc_chars += chars      # charged in characters, not bytes — see the docstring
+                used = 0
             else:
                 block, used = None, 0
+                reason = f"{ext or 'no extension'} isn't a supported type"
             if block is None:
-                failed += 1
+                why.append(f"{Path(p).name} — {reason}")
                 continue
+            attached += 1
             total += used
             content.append(block)
-        if failed:   # tell the user an attachment didn't actually make it into the turn
-            self.ui.put(("error", f"{failed} attachment(s) couldn't be read and were not sent."))
+        if why:      # name each one: "3 couldn't be read" can't be acted on, "deck.pptx -
+                     # couldn't be parsed" can. Same contract as the picker's own rejections.
+            self.ui.put(("error", "Not sent:\n  " + "\n  ".join(why[:6])
+                                  + (f"\n  …and {len(why) - 6} more" if len(why) > 6 else "")))
         if not content:
             return text
         msg = {"type": "user",
@@ -1019,92 +1062,184 @@ class ClaudeWorker(threading.Thread):
 
     @staticmethod
     def _image_block(p, total):
-        """One IMAGE_EXTS path → a base64 image block, or (None, 0) on any failure.
+        """One IMAGE_EXTS path → (block, bytes_charged, None), or (None, 0, reason).
+
         Capped before reading — per-file AND aggregate — so a huge file (per file) or
         many accumulated attachments (aggregate) can't be read whole into RAM and
-        base64-expanded into one query."""
+        base64-expanded into one query.
+
+        The third slot is why it was refused, in the caller's words, because only this
+        function knows which of four unrelated things went wrong. Reporting them as one
+        hedged sentence (\"too large, or unreadable\") sent people to check the wrong
+        thing: a deleted file and an oversized file need opposite responses."""
         try:
             size = Path(p).stat().st_size
-            if size > MAX_INLINE_IMAGE_BYTES or (total + size) > MAX_INLINE_TOTAL_BYTES:
-                return None, 0
+        except Exception as e:
+            return None, 0, _stat_reason(e)
+        if size > MAX_INLINE_IMAGE_BYTES:
+            return None, 0, (f"{size / 1048576:.0f}MB, over the "
+                             f"{MAX_INLINE_IMAGE_BYTES // 1048576}MB limit for one image")
+        if (total + size) > MAX_INLINE_TOTAL_BYTES:
+            return None, 0, (f"no room left in this message "
+                             f"({MAX_INLINE_TOTAL_BYTES // 1048576}MB of attachments total)")
+        try:
             data = Path(p).read_bytes()
-        except Exception:
-            return None, 0
+        except Exception as e:
+            return None, 0, _stat_reason(e)
         if not data:            # 0-byte / unreadable-as-empty → don't send a blank block
-            return None, 0
+            return None, 0, "is empty"
         ext = Path(p).suffix.lower()
         mt = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
               ".gif": "image/gif"}.get(ext, "image/png")
         return {"type": "image", "source": {
             "type": "base64", "media_type": mt,
-            "data": base64.b64encode(data).decode()}}, size
+            "data": base64.b64encode(data).decode()}}, size, None
 
     @staticmethod
     def _pdf_block(p, total):
         """One .pdf path → Claude's native `document` content block. Unlike .docx/.pptx
         below, no local parsing is needed: the API extracts text and renders pages
         server-side. Same per-file/aggregate byte caps as images — both are base64
-        inline payloads and count against the same query-size budget."""
+        inline payloads and count against the same query-size budget.
+
+        Returns (block, bytes_charged, None) or (None, 0, reason), like _image_block."""
         try:
             size = Path(p).stat().st_size
-            if size > MAX_INLINE_PDF_BYTES or (total + size) > MAX_INLINE_TOTAL_BYTES:
-                return None, 0
+        except Exception as e:
+            return None, 0, _stat_reason(e)
+        if size > MAX_INLINE_PDF_BYTES:
+            return None, 0, (f"{size / 1048576:.0f}MB, over the "
+                             f"{MAX_INLINE_PDF_BYTES // 1048576}MB limit for one PDF")
+        if (total + size) > MAX_INLINE_TOTAL_BYTES:
+            return None, 0, (f"no room left in this message "
+                             f"({MAX_INLINE_TOTAL_BYTES // 1048576}MB of attachments total)")
+        try:
             data = Path(p).read_bytes()
-        except Exception:
-            return None, 0
+        except Exception as e:
+            return None, 0, _stat_reason(e)
         if not data:
-            return None, 0
+            return None, 0, "is empty"
         return {"type": "document", "source": {
             "type": "base64", "media_type": "application/pdf",
-            "data": base64.b64encode(data).decode()}}, size
+            "data": base64.b64encode(data).decode()}}, size, None
 
-    def _doc_text_block(self, p, ext):
+    def _doc_text_block(self, p, ext, already=0):
         """One .docx/.pptx path → a plain text block. The Claude API has no native
         document block for either format (only PDF), so the text is pulled out locally
         with python-docx/python-pptx — charts, layout and embedded images don't survive,
         only the words. Headed with the filename so the model knows which attachment
-        it's reading when more than one is sent."""
+        it's reading when more than one is sent.
+
+        `already` is how many characters earlier documents in this same turn have spent, so
+        the per-file cap can't be multiplied by the attachment count. Truncation says so in
+        the text: a model handed a deck that stops mid-sentence should know the deck did not,
+        or it will answer confidently about a document it only half received.
+
+        Returns (block, chars_charged, None) or (None, 0, reason), like its two siblings.
+        The charged UNIT differs — they count bytes of base64 payload, this counts
+        characters of prose — which is the whole point: the two budgets are not
+        interconvertible, so each helper reports in its own and _build_query keeps them in
+        separate accumulators. `chars_charged` covers the prose only; the filename header is
+        fixed overhead per attachment, bounded by the attachment count cap, and charging it
+        would make "200k characters of text" mean something slightly different for every
+        filename length.
+
+        The missing-package case returns its advice AS the reason instead of posting an
+        error of its own. Posting here and returning None meant the caller then added a
+        second, vaguer line about the same file — one failure, two messages, and the useful
+        one contradicted by the useless one."""
+        room = min(MAX_INLINE_DOC_CHARS, max(0, MAX_INLINE_DOC_TOTAL_CHARS - already))
+        if room <= 0:
+            return None, 0, (f"no room left in this message ({MAX_INLINE_DOC_TOTAL_CHARS} "
+                             f"characters of document text total, already spent by the "
+                             f"files ahead of it)")
+        try:
+            # Re-check the size HERE, not only in the picker. The picker checked whatever
+            # was on disk when the file was chosen; this runs later — after a queued
+            # message waits its turn, or after the file was edited or replaced in between —
+            # and it is this call that unzips the container and parses every XML part.
+            # A .docx is a zip: a few MB of file can expand to gigabytes of XML, so the
+            # guard has to sit in front of the parser, not only in front of the choosing.
+            size = Path(p).stat().st_size
+        except Exception as e:
+            return None, 0, _stat_reason(e)
+        if size > MAX_INLINE_DOC_BYTES:
+            return None, 0, (f"{size / 1048576:.0f}MB, over the "
+                             f"{MAX_INLINE_DOC_BYTES // 1048576}MB limit for one document")
         try:
             text = self._extract_docx(p) if ext == ".docx" else self._extract_pptx(p)
         except ImportError:
-            self.ui.put(("error", f"{Path(p).name}: Word/PowerPoint support isn't "
-                                  "installed — run update.cmd, then try again."))
-            return None
-        except Exception:
-            return None
+            return None, 0, ("Word/PowerPoint support isn't installed — run "
+                             "`pip install -r requirements-docs.txt` (or update.cmd, which "
+                             "now does it). Images and PDFs don't need it")
+        except Exception as e:
+            return None, 0, f"couldn't be parsed ({e.__class__.__name__})"
         if not text or not text.strip():
-            return None
-        if len(text) > MAX_INLINE_DOC_CHARS:
-            text = text[:MAX_INLINE_DOC_CHARS] + "\n[... truncated ...]"
-        return {"type": "text", "text": f"[Attached file: {Path(p).name}]\n{text}"}
+            return None, 0, "held no extractable text"
+        charged = min(len(text), room)
+        if len(text) > room:
+            text = text[:room] + f"\n[... truncated at {room} characters — this file is longer]"
+        return {"type": "text",
+                "text": f"[Attached file: {Path(p).name}]\n{text}"}, charged, None
 
     @staticmethod
     def _extract_docx(p):
+        """Text of a .docx in DOCUMENT ORDER.
+
+        Walking `doc.paragraphs` and then `doc.tables` is the obvious way and it silently
+        reorders the file: every table migrates to the end, away from the prose that
+        introduces it. "Prices", table, "Prices exclude tax" arrives as "Prices", "Prices
+        exclude tax", table — so the qualifier reads as describing the wrong thing, and a
+        model asked what a table shows answers from the wrong caption. Iterating the body's
+        own child elements keeps them where the author put them."""
         from docx import Document   # deferred: only needed when a .docx is actually sent
+        from docx.table import Table
+        from docx.text.paragraph import Paragraph
         doc = Document(p)
-        parts = [para.text for para in doc.paragraphs if para.text]
-        for table in doc.tables:
-            for row in table.rows:
-                parts.append(" | ".join(cell.text for cell in row.cells))
+        parts = []
+        for child in doc.element.body.iterchildren():
+            tag = child.tag.rsplit("}", 1)[-1]
+            if tag == "p":
+                t = Paragraph(child, doc).text
+                if t:                       # empty paragraphs are spacing, not content
+                    parts.append(t)
+            elif tag == "tbl":
+                for row in Table(child, doc).rows:
+                    parts.append(" | ".join(cell.text for cell in row.cells))
         return "\n".join(parts)
 
-    @staticmethod
-    def _extract_pptx(p):
+    @classmethod
+    def _extract_pptx(cls, p):
         from pptx import Presentation   # deferred: only needed when a .pptx is actually sent
         prs = Presentation(p)
         parts = []
         for i, slide in enumerate(prs.slides, 1):
             lines = [f"--- Slide {i} ---"]
-            for shape in slide.shapes:
-                if shape.has_text_frame and shape.text_frame.text:
-                    lines.append(shape.text_frame.text)
-                if shape.has_table:
-                    for row in shape.table.rows:
-                        lines.append(" | ".join(c.text for c in row.cells))
+            cls._pptx_shape_text(slide.shapes, lines)
+            # has_notes_slide FIRST: reading .notes_slide on a slide without one CREATES it.
             if slide.has_notes_slide and slide.notes_slide.notes_text_frame.text:
                 lines.append(f"[Notes] {slide.notes_slide.notes_text_frame.text}")
             parts.append("\n".join(lines))
         return "\n\n".join(parts)
+
+    @classmethod
+    def _pptx_shape_text(cls, shapes, lines):
+        """Walk a shape collection, descending into groups.
+
+        Groups are why this recurses. A flat `for shape in slide.shapes` sees a GroupShape as
+        one opaque item with no text frame of its own, so every label inside it vanishes
+        silently — and consultants group things constantly, so the slides most worth reading
+        are the ones that come back emptiest. Depth is whatever the file has; PowerPoint
+        itself won't nest groups deeply enough to threaten the recursion limit."""
+        for shape in shapes:
+            if hasattr(shape, "shapes"):    # GroupShape is the only kind that nests
+                cls._pptx_shape_text(shape.shapes, lines)
+                continue
+            if shape.has_text_frame and shape.text_frame.text:
+                lines.append(shape.text_frame.text)
+            if shape.has_table:
+                for row in shape.table.rows:
+                    lines.append(" | ".join(c.text for c in row.cells))
 
     @staticmethod
     def _msg_has_tool(msg):

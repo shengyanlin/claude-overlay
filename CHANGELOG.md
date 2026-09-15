@@ -3,6 +3,85 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Attach files, not just screenshots — and the plan allowance comes back to the
+statusline as text.
+
+### Added
+- **A 📎 button that attaches files.** Images, **PDF**, **Word** and **PowerPoint**,
+  multi-select, from anywhere on the machine — the button form of what `Ctrl+V` already
+  did for a pasted image. PDFs go to Claude as a native document block, so text *and*
+  page layout are read server-side with nothing parsed locally. Word and PowerPoint have
+  no such block, so their text is extracted on this machine with python-docx /
+  python-pptx: the words arrive, the charts and layout don't. PowerPoint extraction
+  descends into **grouped shapes** (and groups inside groups) — a flat pass over
+  `slide.shapes` sees a group as one item with no text and loses everything inside it,
+  which on real decks is most of the deck. Speaker notes and table cells come too.
+  Contributed by [@gesean1219](https://github.com/gesean1219) in
+  [#10](https://github.com/shengyanlin/claude-overlay/pull/10).
+- **A failed attachment says which file and why.** "3 attachment(s) couldn't be added"
+  is a dead end; the fix is nearly always "that was a .xlsx" or "that deck is 90MB", and
+  neither is guessable from a count.
+- **`requirements-docs.txt`** — the two Word/PowerPoint packages, installed by a separate
+  pass that is allowed to fail. They pull in `lxml`, a compiled extension, and
+  `update.cmd` treats a failure in `requirements.txt` as fatal on purpose; leaving them
+  there meant a machine with no `lxml` wheel could not update or start the app at all,
+  over a file-attachment convenience. Everything already handled their absence — the
+  imports are deferred, preflight reports a WARN, and attaching a `.docx` names the
+  command that installs them.
+
+### Changed
+- **The plan allowance is back in the statusline, as text** (`5h 61%`), after a spell as
+  two arcs around the titlebar ✻ mark. The mark and its hover panel are gone. Arcs could
+  carry both windows at once but neither's *name*, so a reading the CLI didn't label had
+  to be dropped rather than drawn on whichever track was handy, and "week/opus" had
+  nowhere to say so. Text names the window, costs no supersampled repaint, and collapses
+  to nothing when there is no reading — so the row still doesn't grow a clause you have
+  to watch. Context keeps its own separate segment beside it: the allowance is your plan,
+  context is the size of *this* conversation, and Clear or Compact hands context back
+  while the spend stays spent.
+- **A statusless allowance reading can now go amber.** `usage.py`'s poll carries no
+  status field, so a polled 80% used to sit in muted grey until it crossed 90%.
+- **The queue cap is one budget again.** `MAX_PENDING_IMAGES` is a total across pasted
+  images and 📎 files, as its own comment always said; giving files a separate allowance
+  of it had quietly doubled the ceiling to 32.
+
+### Fixed
+- **Word and PowerPoint files are no longer weighed against the image size cap.** Only
+  their extracted text is ever sent, so judging the *file* like an upload refused decks
+  whose actual payload was a few paragraphs — and a deck over 16MB is an ordinary deck.
+- **One unreadable file no longer discards the files picked after it.** The guard was
+  around the whole loop, so a raise partway through dropped every later file *and* left
+  them out of the failure count: you got a short list and no error.
+- **Extracted document text is capped in aggregate, not just per file.** The per-file cap
+  multiplied by the attachment count — sixteen documents just under it is ~800k tokens of
+  text, which no context survives. Bytes could not express this: the aggregate byte budget
+  sees extracted prose as a rounding error while the model sees a flood.
+- **Truncated documents say so in the text**, so the model doesn't answer confidently
+  about a file it only half received.
+- **A Word table stays where its author put it.** Extraction collected every paragraph
+  and then every table, which moves each table to the end of the document, away from the
+  prose that introduces it: "Prices", a table, "Prices exclude tax" arrived with the
+  qualifier apparently describing something else.
+- **An attachment that fails no longer spends one of the per-turn slots.** The cap counted
+  paths seen rather than blocks built, so one corrupt document could evict a valid image
+  later in the same message and the message went out under its own limit.
+- **The document size limit is re-checked when the file is read**, not only when it was
+  picked. A `.docx` is a zip — a few MB can expand to gigabytes of XML — and the picker's
+  measurement can be minutes old by the time a queued message actually sends.
+- **A file the worker rejects is named**, with the reason, the way the picker's own
+  rejections already were.
+- **A failure with no reason attached is no longer hidden by one that has one.** A full
+  queue plus three unreadable pastes reported only the queue overflow.
+- **An allowance of 0.5% no longer displays as `0%`.** The floor constant was a second
+  copy of the format string's rounding and the two disagreed immediately.
+- **Preflight's remedy for a missing python-docx/python-pptx now points at the file they
+  are actually in.** It offered the `requirements.txt` command, which provably cannot
+  install them.
+- **The Diagnose report lists `python-docx` / `python-pptx`**, so "attaching my deck does
+  nothing" is answerable from the report.
+
 ## [1.20.1] - 2026-09-11
 
 ### Changed

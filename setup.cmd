@@ -182,6 +182,18 @@ if errorlevel 1 (
   pause & exit /b 1
 )
 
+rem Optional Word/PowerPoint attachment support, in its own NON-fatal pass: these pull in
+rem lxml (a compiled extension), and a machine with no lxml wheel must still end up with a
+rem working overlay rather than a failed setup. See requirements-docs.txt.
+if exist "%~dp0requirements-docs.txt" (
+  echo Installing optional Word/PowerPoint support ...
+  call %PY% -m pip install --upgrade -r "%~dp0requirements-docs.txt"
+  if errorlevel 1 (
+    echo [!] Optional Word/PowerPoint support did not install - continuing anyway.
+    echo     Images and PDFs work; attaching .docx/.pptx will say support is missing.
+  )
+)
+
 rem --- 4. prove it can actually start ---------------------------------------
 rem "Setup completed" and "the app runs" are not the same claim, and the gap between
 rem them is invisible: the overlay launches under pythonw, so a bad install shows up as
