@@ -540,9 +540,26 @@ class Overlay:
                                                       # then the CLI default full-access mode
         self.pending_shot = None
         self.pending_images: list = []
-        self.pending_docs: list = []    # queued PDF/Word/PPT paths from the 📎 picker —
+        self.pending_docs: list = []    # queued PDF/Word/PPT paths from the ⚙ picker —
                                         # kept apart from pending_images since they aren't
                                         # decoded/validated the same way (see _pick_attachments)
+        self.pending_bad: list = []     # [(filename, reason)] for files the picker REFUSED.
+                                        # These used to go straight to add_err as a red block
+                                        # in the transcript, which scrolled away while the
+                                        # thing it was about was still queued below. They now
+                                        # sit in the strip beside the files that DID make it,
+                                        # so "why isn't my spreadsheet going" is answered
+                                        # where the question gets asked. Cleared on send and
+                                        # by Clear all, like everything else in the strip.
+        self._attach_names: dict = {}   # stashed image path → the name the user picked it by.
+                                        # _stash_image copies into SHOT_DIR as
+                                        # shot_<ms>_paste.png, so the original name is gone by
+                                        # the time the strip draws; the picker carries it over
+                                        # in the ("attach", …) payload. Absent for a clipboard
+                                        # paste, which genuinely has no filename.
+        self._attach_rows: list = []    # the FILE row widgets currently drawn in attach_frame
+        self._attach_foot = None        # and its footer (Clear all / ＋N more), kept apart
+                                        # so the read-back accessors can tell a row from chrome
         self._precaptured = None        # (shots, monotonic_ts) grabbed while typing
         self._sent_shot_hashes: dict = {}  # capture-target key → (sha256, perceptual hash) of
                                         # the last shot the model VERIFIABLY has in context;
@@ -1455,8 +1472,17 @@ class Overlay:
         self.queue_frame = tk.Frame(wrap, bg=T["bg"])
         self.canvas = tk.Canvas(wrap, bg=T["bg"], height=self.in_h, highlightthickness=0)
         self.canvas.pack(fill="x", padx=self.px(12), pady=self.px(2))
+        # The attachment strip: what is queued to go with the NEXT message, one named row
+        # per file. Packed ONCE, here, and never packed or unpacked again — with no rows it
+        # asks Tk for 1px, which is invisible, and that 1px buys immunity from the failure
+        # mode that repacking above the input box has already caused once (see _build_chat,
+        # and the same reasoning on quota_lbl in _build_statusline). padx matches
+        # queue_frame's 24 so the two strips line up as one block above the box.
+        self.attach_frame = tk.Frame(wrap, bg=T["bg"])
+        self.attach_frame.pack(fill="x", side="top", before=self.canvas, padx=self.px(24))
         # Width changes move the truncation point of every queued row — re-clip on resize.
         wrap.bind("<Configure>", self._refresh_queue, add="+")
+        wrap.bind("<Configure>", self._refresh_attach, add="+")
         self.entry = tk.Text(self.canvas, bg=T["field"], fg=T["text"], bd=0, height=2,
                              wrap="word", font=self.f_body, insertbackground=T["accent"],
                              highlightthickness=0, padx=0, pady=0)
@@ -1496,28 +1522,38 @@ class Overlay:
         self.gear.bind("<Enter>", lambda e: self.gear.configure(fg=T["accent"]))
         self.gear.bind("<Leave>", lambda e: self._paint_gear())
         self._paint_gear()
-        # Opens a native file picker for images/PDF/Word/PPT — the button form of what
-        # Ctrl+V already does for images (see _on_paste). attach_lbl (below) shows the
-        # queued count for both and clears them on click.
-        self.attach_btn = tk.Label(st, text="📎", bg=T["bg"], fg=T["muted"],
-                                   font=self.f_icon, cursor="hand2")
-        self.attach_btn.pack(side="left", padx=(self.px(10), self.px(2)), pady=pad)
-        self.attach_btn.bind("<Button-1>", lambda e: self._pick_attachments())
-        self.attach_btn.bind("<Enter>", lambda e: self.attach_btn.configure(fg=T["accent"]))
-        self.attach_btn.bind("<Leave>", lambda e: self.attach_btn.configure(fg=T["muted"]))
-        self.attach_lbl = tk.Label(st, text="", bg=T["bg"], fg=T["accent"],
-                                   font=self.f_small, cursor="hand2")
-        self.attach_lbl.pack(side="left", padx=self.px(6), pady=pad)
-        self.attach_lbl.bind("<Button-1>", lambda e: self._clear_attachments())
-        # Mode chips sit between the ⚙ and the attachment label (hence `before=` in
-        # _paint_modes). One per setting that is NOT at its quiet default, so the strip is
-        # empty on a stock overlay and anything visible means "this one is behaving
-        # differently" — the reason the old always-on inline toggles were removed was that
-        # they crowded the bar even when they had nothing to say. The ⚙ menu still spells
-        # all three out with checkmarks; clicking a chip opens it.
+        # A bare 📎 used to sit here, with a text label beside it counting what was queued.
+        # Both are gone. The glyph said nothing about what it did — a paperclip next to a
+        # gear, in a row of words, reads as decoration — and 📎 is not in Segoe Fluent Icons
+        # anyway, so f_icon fell through to the colour emoji and it didn't even match the
+        # monochrome gear next to it. Attaching is now a NAMED row in the ⚙ menu
+        # (_gear_items), and what is queued gets a resident readout of its own above the
+        # input box (_refresh_attach), where the files can be read and dropped one at a time
+        # instead of being a single count that cleared everything on click.
+        #
+        # Mode chips sit after the ⚙, last on the left-packed run. They no longer need a
+        # `before=` anchor in _paint_modes: with the two attachment widgets gone the gear IS
+        # the end of that run, so a plain side="left" lands them in the same place.
+        # One chip per setting that is NOT at its quiet default, so the strip is empty on a
+        # stock overlay and anything visible means "this one is behaving differently" — the
+        # reason the old always-on inline toggles were removed was that they crowded the bar
+        # even when they had nothing to say. The ⚙ menu still spells all three out with
+        # checkmarks; clicking a chip opens it.
+        # The chips live in a container packed ONCE, right after the gear. They used to
+        # be packed straight onto the bar with `before=self.attach_lbl`, which is what
+        # gave them their slot; with that label deleted, a plain side="left" put them
+        # visually in the same place but LAST in the packing order — behind the
+        # right-packed grip. pack allocates from the cavity in packing order, so on a
+        # narrow bar that starves the CHIPS and keeps the resize grip, and a dropped chip
+        # reports its mode as OFF. Read-only is the safety state; it must not be the thing
+        # that vanishes. A container can't be given `before=self.grip` either, since the
+        # grip does not exist until after the first _paint_modes() call below — so it is
+        # packed here, in place, and never repacked again.
+        self.mode_frame = tk.Frame(st, bg=T["bg"])
+        self.mode_frame.pack(side="left", pady=pad)
         self.mode_lbls = {}
         for key in self.MODE_CHIPS:
-            lbl = tk.Label(st, bg=T["bg"], font=self.f_small, cursor="hand2")
+            lbl = tk.Label(self.mode_frame, bg=T["bg"], font=self.f_small, cursor="hand2")
             lbl.bind("<Button-1>", self._gear_menu)
             self.mode_lbls[key] = lbl
         # Resizing changes whether the spelled-out chips still fit, so re-decide on every
@@ -1944,7 +1980,10 @@ class Overlay:
         avail = st.winfo_width() if st is not None else 0
         if avail <= 1:
             return True          # not laid out yet; <Configure> re-runs this once it is
-        mine = set(self.mode_lbls.values())
+        # mode_frame is excluded along with the chips themselves: its requested width IS
+        # the chips\' width, so counting it would feed this decision its own output — the
+        # feedback loop the original `mine` exclusion existed to prevent.
+        mine = set(self.mode_lbls.values()) | {getattr(self, "mode_frame", None)}
         used = sum(w.winfo_reqwidth() + self.px(12) for w in st.pack_slaves() if w not in mine)
         need = sum(self.f_small.measure(t) + self.px(10) for t in labels)
         return used + need <= avail
@@ -1965,8 +2004,7 @@ class Overlay:
             glyph, label, colour, _ = self.MODE_CHIPS[key]
             self.mode_lbls[key].configure(text=(f"{glyph} {label}" if full else glyph),
                                           fg=T[colour])
-            self.mode_lbls[key].pack(side="left", padx=(self.px(6), 0), pady=self.px(4),
-                                     before=self.attach_lbl)
+            self.mode_lbls[key].pack(side="left", padx=(self.px(6), 0), pady=self.px(4))
 
     def _active_modes(self):
         """The chip texts currently on the bar, in bar order. Split out so a test can assert on
@@ -1987,17 +2025,30 @@ class Overlay:
     def _paint_ro_toggle(self):
         self._paint_gear()
 
+    GEAR_SEP = "-"   # a row whose command is None: _gear_menu draws add_separator() for it.
+                     # Spelled as a string, not None, so every caller that unpacks
+                     # `for lbl, cmd in _gear_items()` and then touches the label — they
+                     # .strip() it, they test `name in lbl` — keeps working on a str.
+
     def _gear_items(self):
         """The (label, command) rows of the ⚙ settings menu. A ✓ prefixes each setting
         that is currently ON. Split out from _gear_menu so it's unit-testable without
         popping a real Tk menu. Read-only reflects the CONFIRMED state (it flips only after
-        the worker confirms), so the checkmark never claims a lock that isn't live."""
+        the worker confirms), so the checkmark never claims a lock that isn't live.
+
+        The three toggles keep the order and the top position they have always had; the two
+        ACTIONS live below a separator. Without that rule "Attach files…" reads as a fourth
+        toggle you forgot to tick — the row grammar is identical (same six-space indent,
+        since only settings ever carry a ✓), so the gap is the only thing saying one group
+        DOES something and the other group IS something."""
         def row(on, name):
             return ("✓  " + name) if on else ("      " + name)
         return [
             (row(self.window_shot, "Window-only"), self.toggle_window_shot),
             (row(self.share_visible, "Shareable"), self.toggle_screen_share),
             (row(self.read_only, "Read-only"), self.toggle_read_only),
+            (self.GEAR_SEP, None),
+            ("      Attach files…", self._pick_attachments),
             ("      Past conversations…", self.show_sessions),
         ]
 
@@ -2007,7 +2058,10 @@ class Overlay:
         m = tk.Menu(self.root, tearoff=0, bg=T["field"], fg=T["text"],
                     activebackground=T["accent"], activeforeground=T["on_accent"], bd=0)
         for lbl, cmd in self._gear_items():
-            m.add_command(label=lbl, command=cmd)
+            if cmd is None:          # GEAR_SEP — a divider, not a clickable row
+                m.add_separator()
+            else:
+                m.add_command(label=lbl, command=cmd)
         try:
             m.tk_popup(e.x_root, e.y_root)
         finally:
@@ -2218,10 +2272,15 @@ class Overlay:
                     pass
 
     def _pick_attachments(self):
-        """📎 button: a native file picker for images/PDF/Word/PPT — everything Ctrl+V
-        already handles for a pasted image, plus the formats that only reach the model
-        via _stash_attachments_bg. Reuses _paste_busy as the in-flight guard so a picker
-        run and a clipboard paste can never race on pending_images/pending_docs."""
+        """⚙ → "Attach files…": a native file picker for images/PDF/Word/PPT — everything
+        Ctrl+V already handles for a pasted image, plus the formats that only reach the
+        model via _stash_attachments_bg. Reuses _paste_busy as the in-flight guard so a
+        picker run and a clipboard paste can never race on pending_images/pending_docs.
+
+        NOT FIXED by moving the entry point into the menu: askopenfilenames is a native
+        modal parented on an overrideredirect window, so while it is open the Tk main loop
+        is not draining ui_q and a streaming reply stalls. Menu row or status-bar glyph,
+        it is the same dialog — the fix is a different picker, not a different button."""
         if self._paste_busy:
             return
         exts = IMAGE_EXTS + DOC_EXTS
@@ -2244,20 +2303,27 @@ class Overlay:
         Every rejection names the file and the reason. "3 attachment(s) couldn't be
         added" is a dead end for the one person who can fix it: the fix is almost always
         "that was a .xlsx" or "that deck is 90MB", and neither is guessable from a count."""
-        imgs, docs, failed, why = [], [], 0, []
+        imgs, docs, failed, why, names = [], [], 0, [], {}
         try:
-            self._stash_attachments_loop(paths, imgs, docs, why)
+            self._stash_attachments_loop(paths, imgs, docs, why, names)
         finally:
             # failed=0 deliberately: every rejection this path makes is already explained in
             # `why`, and the handler reports the count and the reasons SEPARATELY (it has
             # to — the paste path sends a count with no reasons). Passing len(why) here
             # would print each file once by name and once more as an anonymous tally.
-            self.ui_q.put(("attach", (imgs, 0, docs, why)))
+            #
+            # `names` rides along as a 5th slot so the strip can show the name the user
+            # actually picked: _stash_image copies into SHOT_DIR under a generated
+            # shot_<ms>_paste.png, so by the time the row is drawn the original is gone.
+            # Handed over through the queue rather than written into self off-thread —
+            # everything else on this thread already obeys that rule and one exception is
+            # how the rule stops being true.
+            self.ui_q.put(("attach", (imgs, 0, docs, why, names)))
 
-    def _stash_attachments_loop(self, paths, imgs, docs, why):
+    def _stash_attachments_loop(self, paths, imgs, docs, why, names):
         """The routing loop itself, split out so the ("attach", …) post above sits in a
         finally that nothing in here can skip — _paste_busy is cleared by that post, and a
-        picker that leaves it set locks the 📎 button and Ctrl+V for the rest of the session.
+        picker that leaves it set locks Attach files… and Ctrl+V for the rest of the session.
 
         `why` is both the reason list and the failure count: every rejection appends
         exactly one line, so a separate counter is a second copy of the same fact."""
@@ -2271,8 +2337,9 @@ class Overlay:
                     saved = self._stash_image(p)
                     if saved:
                         imgs.append(saved)
+                        names[saved] = Path(p).name
                     else:
-                        why.append(f"{Path(p).name} — couldn't be read as an image")
+                        why.append((Path(p).name, "couldn't be read as an image"))
                 elif ext in DOC_EXTS:
                     try:
                         size = Path(p).stat().st_size
@@ -2280,33 +2347,231 @@ class Overlay:
                         size = 0
                     cap = MAX_INLINE_PDF_BYTES if ext == ".pdf" else MAX_INLINE_DOC_BYTES
                     if size <= 0:
-                        why.append(f"{Path(p).name} — is empty or unreadable")
+                        why.append((Path(p).name, "empty or unreadable"))
                     elif size > cap:
-                        why.append(f"{Path(p).name} — {size / 1048576:.0f}MB, over the "
-                                   f"{cap // 1048576}MB limit for {ext} files")
+                        why.append((Path(p).name,
+                                    f"{size / 1048576:.0f}MB, over the "
+                                    f"{cap // 1048576}MB limit"))
                     else:
                         docs.append(p)
                 else:
-                    why.append(f"{Path(p).name} — {ext or 'no extension'} isn't supported "
-                               f"(images, {', '.join(DOC_EXTS)})")
+                    why.append((Path(p).name,
+                                f"{ext or 'no extension'} isn't supported"))
             except BaseException:
-                why.append(f"{Path(p).name} — couldn't be read")
+                why.append((Path(p).name, "couldn't be read"))
 
-    def _refresh_attach(self):
-        ni, nd = len(self.pending_images), len(self.pending_docs)
-        if not ni and not nd:
-            self.attach_lbl.configure(text="")
-            return
-        parts = []
-        if ni:
-            parts.append(f"{ni} image{'s' if ni != 1 else ''}")
-        if nd:
-            parts.append(f"{nd} file{'s' if nd != 1 else ''}")
-        self.attach_lbl.configure(text=f"📎 {', '.join(parts)}  ✕")
+    # ── the attachment strip (above the input box) ──
+    @staticmethod
+    def _fmt_size(n):
+        """Bytes as the shortest honest reading. No decimal under 10MB-ish boundaries where
+        it would be noise: the strip is competing with the filename for one 12px row, and
+        "2.1 MB" earns its extra glyph where "11.4 MB" does not.
+
+        None means the file could not be stat'd and is reported as such. Collapsing that
+        into "" (as an `n <= 0` test did) made a vanished file the ONE row on the strip
+        with no size, which reads as a rendering glitch rather than as the answer to why
+        the next send is about to fail."""
+        if n is None:
+            return "missing"
+        if n < 0:
+            return ""
+        if n < 1024:
+            return f"{n} B"
+        if n < 1048576:
+            return f"{n / 1024:.0f} KB"
+        mb = n / 1048576
+        return f"{mb:.1f} MB" if mb < 10 else f"{mb:.0f} MB"
+
+    @staticmethod
+    def _size_of(p):
+        """Size on disk, or None if it can't be stat'd. Never raises: a file that vanished
+        between the pick and the draw must not take the strip (and with it the ✕ that
+        removes it) down -- the row still has to be there to be got rid of. None rather
+        than 0 so a real zero-byte file stays distinguishable from a missing one."""
+        try:
+            return Path(p).stat().st_size
+        except OSError:
+            return None
+
+    def _attach_label(self, path):
+        """What to call a queued image. The picker carries the real name over in the
+        ("attach", …) payload; a clipboard paste has none to carry, because the bytes came
+        off the clipboard and _stash_image wrote them to shot_<ms>_paste.png — a temp path,
+        not anything the user would recognise as what they pasted."""
+        return self._attach_names.get(path) or "Pasted image"
+
+    def _attach_rows_data(self, limit=None):
+        """Up to `limit` drawable rows as (label, note, colour, remove), and the TOTAL
+        number of queued items — images, then documents, then refusals.
+
+        Split out from the drawing so a test can assert on what the strip SAYS without
+        reaching into Tk's widget tree, and so the row order can't drift between the two.
+
+        The limit is honoured while BUILDING, not by slicing afterwards, and that is the
+        whole point: every row costs a stat() (for its size) plus a closure, this runs on
+        every <Configure>, and refusing a hundred files made dragging the window edge do a
+        hundred stat()s to draw four rows. Counting is separate from building, so the
+        footer's remainder is exact however many there are. An earlier attempt capped the
+        stored list instead — that bounded the work but made the count lie, which is how
+        "＋60 more" came to stand for a hundred refused files.
+
+        `remove` closes over its own item with a default argument, not the loop variable:
+        late binding would give every ✕ on the strip the last row's file."""
+        rows, total = [], 0
+        def room():
+            return limit is None or len(rows) < limit
+        for p in self.pending_images:
+            total += 1
+            if room():
+                rows.append((self._attach_label(p), self._fmt_size(self._size_of(p)),
+                             T["muted"], lambda it=p: self._drop_attachment(it)))
+        for p in self.pending_docs:
+            total += 1
+            if room():
+                rows.append((Path(p).name, self._fmt_size(self._size_of(p)),
+                             T["muted"], lambda it=p: self._drop_attachment(it)))
+        for bad in self.pending_bad:
+            total += 1
+            if room():
+                rows.append((bad[0], bad[1], T["err"],
+                             lambda it=bad: self._drop_refusal(it)))
+        return rows, total
+
+    def _refresh_attach(self, _e=None):
+        """Rebuild the attachment strip: one row per queued file with its own ✕, capped at
+        MAX_ATTACH_ROWS with the remainder counted, plus a Clear all.
+
+        Destroy-and-rebuild, exactly like _refresh_queue: at most five widgets, and they
+        change shape rather than value (a row appears, a row leaves), so reconciling in
+        place would be more code for nothing. Bound to the input wrap's <Configure> for the
+        same reason the queue is — the filename truncation point moves with the width, and a
+        stale clip would push the ✕ off the edge, taking the only way to remove that file
+        with it."""
+        frame = getattr(self, "attach_frame", None)
+        if frame is None:
+            return                      # called before _build_input (headless tests)
+        for w in self._attach_rows + [getattr(self, "_attach_foot", None)]:
+            if w is None:
+                continue
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._attach_rows, self._attach_foot = [], None
+        shown, total = self._attach_rows_data(MAX_ATTACH_ROWS)
+        if not shown:
+            return                      # no rows: the frame sits at its 1px minimum
+        # Budget for the filename: the strip's width less the ✕, the size note and their
+        # padding. Falls back to the default window width before Tk has laid the bar out,
+        # exactly as _queue_row_text does.
+        try:
+            w = self.input_wrap.winfo_width()
+        except Exception:
+            w = 0
+        avail = max(self.px(90), (w if w > 1 else self.px(420)) - self.px(48))
+        for i, (label, note, colour, remove) in enumerate(shown):
+            row = tk.Frame(frame, bg=T["bg"])
+            row.pack(fill="x", pady=(self.px(2) if i == 0 else 0, 0))
+            x = tk.Label(row, text="✕", bg=T["bg"], fg=T["faint"], font=self.f_small,
+                         cursor="hand2")
+            x.pack(side="right", padx=(self.px(6), 0))
+            x.bind("<Button-1>", lambda e, r=remove: r())
+            x.bind("<Enter>", lambda e, wg=x: wg.configure(fg=T["accent"]))
+            x.bind("<Leave>", lambda e, wg=x: wg.configure(fg=T["faint"]))
+            # The NOTE is capped first, not just the name. pack fills side="right"
+            # children from their requested width before the side="left" label sees the
+            # cavity at all, so an unconstrained note takes the whole row and leaves the
+            # filename a non-empty string with nowhere to draw it. Flooring the name's
+            # budget did NOT fix that -- it only made the string look right to a test
+            # that read .cget("text"). Reserving the room on the note's side does.
+            # px(20) is the ✕ and the paddings either side of it — chrome that is NOT
+            # available to either text. Both budgets subtract it, or they disagree: the
+            # note was capped against `avail - 60 - 20` while the name was sized against
+            # `avail - note`, so the name could be truncated to a width WIDER than its
+            # real cavity and Tk would then clip it — sometimes clipping off the very
+            # ellipsis that says it was cut.
+            chrome = self.px(20)
+            room_for_name = self.px(60)
+            note_shown = self._truncate_to_px(
+                self.f_small, note or "", max(0, avail - room_for_name - chrome))
+            if note_shown:
+                n = tk.Label(row, text=note_shown, bg=T["bg"], fg=T["faint"],
+                             font=self.f_small)
+                n.pack(side="right", padx=(self.px(8), 0))
+            budget = max(room_for_name,
+                         avail - chrome - self.f_small.measure(note_shown))
+            lbl = tk.Label(row, text=self._truncate_to_px(self.f_small, label, budget),
+                           bg=T["bg"], fg=colour, font=self.f_small, anchor="w")
+            lbl.pack(side="left")
+            self._attach_rows.append(row)
+        foot = tk.Frame(frame, bg=T["bg"])
+        foot.pack(fill="x")
+        clear = tk.Label(foot, text="Clear all", bg=T["bg"], fg=T["faint"],
+                         font=self.f_small, cursor="hand2")
+        clear.pack(side="right", padx=(self.px(6), 0))
+        clear.bind("<Button-1>", lambda e: self._clear_attachments())
+        clear.bind("<Enter>", lambda e: clear.configure(fg=T["accent"]))
+        clear.bind("<Leave>", lambda e: clear.configure(fg=T["faint"]))
+        more = total - len(shown)
+        if more:
+            # "more", not "more attached": the hidden remainder can be REFUSALS. Five
+            # unsupported files drew four red rows and a footer claiming a fifth was
+            # attached, when nothing was.
+            tk.Label(foot, text=f"＋{more} more", bg=T["bg"], fg=T["faint"],
+                     font=self.f_small, anchor="w").pack(side="left")
+        self._attach_foot = foot
+
+    def _attach_row_texts(self):
+        """(label, note) for each FILE row actually drawn, in strip order. Read back off the
+        widgets rather than recomputed from _attach_rows_data: a test that re-derived the
+        data would pass while the widget tree said something else, which is the whole
+        failure it exists to catch. winfo_children() comes back in CREATION order, which
+        here is ✕, then the size note if there is one, then the label."""
+        out = []
+        for row in self._attach_rows:
+            texts = [t for t in (w.cget("text") for w in row.winfo_children())
+                     if t and t != "✕"]
+            if not texts:
+                continue
+            out.append((texts[-1], texts[0] if len(texts) > 1 else ""))
+        return out
+
+    def _attach_more_text(self):
+        """The counted-remainder line on the strip's footer, or "" when every queued file
+        got a row of its own."""
+        foot = getattr(self, "_attach_foot", None)
+        if foot is None:
+            return ""
+        for w in foot.winfo_children():
+            t = w.cget("text")
+            if t and t != "Clear all":
+                return t
+        return ""
+
+    def _drop_attachment(self, path):
+        """Remove ONE queued file. Identity, not index: the strip is rebuilt on every
+        change and on every resize, so a row's position is not a stable handle on a file."""
+        self.pending_images = [p for p in self.pending_images if p != path]
+        self.pending_docs = [p for p in self.pending_docs if p != path]
+        self._attach_names.pop(path, None)
+        self._refresh_attach()
+
+    def _drop_refusal(self, item):
+        """Dismiss ONE refusal row. Removes a single occurrence, not every equal pair: two
+        picks of the same unsupported file are two rows, and a filter would clear both."""
+        rest = list(self.pending_bad)
+        try:
+            rest.remove(item)
+        except ValueError:
+            pass
+        self.pending_bad = rest
+        self._refresh_attach()
 
     def _clear_attachments(self):
         self.pending_images = []
         self.pending_docs = []
+        self.pending_bad = []
+        self._attach_names = {}
         self._refresh_attach()
 
     # ── window drag / resize / rounding ──
@@ -4168,6 +4433,11 @@ class Overlay:
         self.pending_shot = None
         self.pending_images = []
         self.pending_docs = []
+        # Refusals and the picked-name map go with the queue they describe. Leaving a
+        # refusal on the strip past a send would leave it explaining a file that is no
+        # longer queued — and the names map would grow for the life of the session.
+        self.pending_bad = []
+        self._attach_names = {}
         self._refresh_attach()
         self.entry.delete("1.0", "end")
         self._ph_active = False
@@ -5853,36 +6123,71 @@ class Overlay:
             self._set_busy(False)
         elif kind == "attach":   # paste/picker finished: (images, failed[, docs[, reasons]])
             self._paste_busy = False
-            pl = list(payload)   # paste posts a 2-tuple, the picker a 4-tuple
+            pl = list(payload)   # paste posts a 2-tuple, the picker a 5-tuple
             paths, failed = pl[0], pl[1]
             docs = pl[2] if len(pl) > 2 else []
             why = list(pl[3]) if len(pl) > 3 else []
+            # Guarded the same way `why` is, and for the same reason: this is an
+            # informally-versioned tuple crossing a thread boundary, names.items() on a
+            # list raises AttributeError, and a raise in _handle kills the callback that
+            # delivers every other queued event. Values are coerced to str because they
+            # are about to be drawn into a Label.
+            names = pl[4] if len(pl) > 4 else {}
+            names = ({str(k): str(v) for k, v in names.items()}
+                     if isinstance(names, dict) else {})
             # ONE budget across both kinds. MAX_PENDING_IMAGES is named for images because
             # they were all there was, but its job — stated in its own comment — is that a
             # hostile clipboard can't pile up, and a per-kind cap quietly doubles the ceiling
             # it sets. Images fill first when the budget is tight: a pasted screenshot is
             # usually the thing being asked about, and a doc is cheap to re-pick.
+            # Already-queued paths are dropped BEFORE the budget is spent on them: a file
+            # picked twice is one attachment, which is what actually gets sent (worker.py's
+            # _build_query dedupes the path list too). Without this the strip shows two
+            # rows for one file and either row's ✕ removes BOTH of them, since a path is
+            # the only handle a row has on its file. Filtering here rather than at draw
+            # time also stops a duplicate from eating a slot the next real file needed.
+            have = set(self.pending_images) | set(self.pending_docs)
+            paths = [p for p in paths if not (p in have or have.add(p))]
+            docs = [p for p in docs if not (p in have or have.add(p))]
             room = max(0, MAX_PENDING_IMAGES - len(self.pending_images) - len(self.pending_docs))
             keep_i = paths[:room]
             keep_d = docs[:max(0, room - len(keep_i))]
             self.pending_images.extend(keep_i)
             self.pending_docs.extend(keep_d)
+            # Names only for the images that actually made it in. Updating from the whole
+            # payload leaves an entry behind for every image the cap turned away — junk
+            # that survives until the next send, keyed by a path nothing on the strip
+            # refers to any more.
+            self._attach_names.update({k: v for k, v in names.items() if k in keep_i})
             dropped = (len(paths) - len(keep_i)) + (len(docs) - len(keep_d))
             if dropped:
-                why.append(f"{dropped} more didn't fit — {MAX_PENDING_IMAGES} attachments "
-                           f"can be queued at once")
-            if keep_i or keep_d:
-                self._refresh_attach()
+                why.append((f"{dropped} more didn't fit", f"limit is {MAX_PENDING_IMAGES}"))
             # `failed` is a COUNT with no reasons attached (the paste path posts one); `why`
-            # is the reasons. Both have to be reported: keying off `why` alone hid every
-            # reasonless failure the moment one reason existed, so a full queue plus three
-            # unreadable pastes announced only "1 more didn't fit".
-            lines = list(why)
+            # is the reasons. Both still have to be reported: keying off `why` alone hid
+            # every reasonless failure the moment one reason existed, so a full queue plus
+            # three unreadable pastes announced only "1 more didn't fit".
             if failed:
-                lines.append(f"{failed} more couldn't be read")
-            if lines:      # name the file and the cause; a bare count is a dead end
-                extra = f"\n  …and {len(lines) - 6} more" if len(lines) > 6 else ""
-                self.add_err("Couldn't attach:\n  " + "\n  ".join(lines[:6]) + extra)
+                why.append((f"{failed} more couldn't be read", ""))
+            # Refusals join the strip instead of going to add_err. A red block in the
+            # transcript scrolled away while the files it was about were still queued below
+            # it, so the answer to "why isn't my spreadsheet going" ended up nowhere near
+            # the question. On the strip it sits beside the files that DID make it, in the
+            # error colour, with its own ✕ — and it leaves on send like everything else,
+            # because a refusal is about a queue that no longer exists.
+            # Coerced to (name, reason) pairs on the way in, not trusted. `why` crosses a
+            # thread boundary as part of an informally-versioned tuple whose arity this
+            # very branch already tolerates four ways — so an entry arriving as a plain
+            # string is a shape this side has to survive, and _attach_rows_data indexes
+            # [0] and [1]: a one-character string would raise IndexError, and a raise in
+            # _handle kills the callback that delivers every OTHER queued event. The whole
+            # string becomes the label rather than being split on " — ", which would make
+            # that dash load-bearing punctuation — the exact coupling this change removed.
+            for entry in why:
+                if isinstance(entry, (tuple, list)) and len(entry) >= 2:
+                    self.pending_bad.append((str(entry[0]), str(entry[1])))
+                else:
+                    self.pending_bad.append((str(entry), ""))
+            self._refresh_attach()
         elif kind == "precapture_done":
             self._capture_busy = False
             if payload:

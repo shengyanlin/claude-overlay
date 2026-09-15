@@ -3,6 +3,39 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- **Attaching files moved out of the status bar and into the ⚙ menu**, as
+  **⚙ → Attach files…**. The bare 📎 button is gone. It said nothing about what it did —
+  a paperclip glyph next to a gear, in a row of words, reads as decoration — and 📎 is
+  not in Segoe Fluent Icons, so it fell through to the colour emoji and did not even
+  match the monochrome gear beside it. The three existing toggles keep their order and
+  position; the two actions sit below a new separator.
+- **Queued attachments are a named strip above the input box**, one row per file with
+  its filename and size and its own **✕**, plus a **Clear all**. It replaces a single
+  status-bar label that read `📎 2 images, 1 file ✕` — which named no file, gave no
+  size, and whose one ✕ cleared everything. Pasted images have no filename to show (the
+  clipboard has none) and say so. Capped at 4 rows with the rest counted, because 16
+  queued files would take more than half the window to say what one line says.
+- **A file the picker refuses now stays on that strip**, in red, with its reason — next
+  to the files that did make it. It used to be an error block in the transcript, which
+  scrolled away while the files it was about were still queued below it.
+- Picking a file that is already attached no longer queues it twice. It was never going
+  to be sent twice (the request builder deduplicates paths), and a second row meant
+  either row's ✕ removed both.
+
+### Fixed
+- Removing the 📎 button and its label frees ~150px on the status bar, which at 420px
+  wide was full enough that the attachment label — packed last — was the first thing to
+  clip.
+
+### Known
+- **⚙ → Attach files…** still opens a native Windows file dialog, which blocks the UI
+  thread while it is open: a reply streaming in the background will stall until you
+  pick or cancel. Moving the entry point into the menu does not change that; it needs a
+  different picker.
+
 ## [1.21.0] - 2026-09-15
 
 Attach files, not just screenshots — and the plan allowance comes back to the
