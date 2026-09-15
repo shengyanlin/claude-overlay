@@ -113,6 +113,7 @@ def _file_version():
 try:
     import tkinter as tk
     from tkinter import font as tkfont
+    from tkinter import filedialog
 
     from PIL import Image, ImageGrab, ImageDraw, ImageChops, ImageFilter, ImageTk
 
@@ -390,20 +391,6 @@ def _contrast(a, b):
     return (max(p, q) + 0.05) / (min(p, q) + 0.05)
 
 
-# Radii and stroke widths as fractions of a 32px mark, the size they were tuned at; the mark
-# is drawn at _MARK_PX and these scale with it. Inner track is the 5-hour window and is the
-# thicker of the two — it is the one that ends the session you are sitting in.
-_RING_GEOM = (("five_hour", 10.5 / 32, 3 / 32), ("week", 14.5 / 32, 2 / 32))
-_SPARK_R = 5.75 / 32           # small enough to leave clear air inside the 5h track:
-                               # when that arc goes amber it is T["accent"], the same
-                               # colour as the mark, and touching arc and mark merge
-_RING_SS = 4                      # supersample factor, then downsample: Tk's create_arc has
-                                  # no antialiasing on Windows and a 3px arc on a 36px circle
-                                  # comes out a visible staircase
-_MARK_PX = 36                     # two legible arcs plus a readable ✻ need this much room;
-                                  # the titlebar is 44px tall, so this is the largest that fits
-
-
 def _binding_window(windows):
     """The one window that earns the statusline's single text slot: whichever is furthest
     along, because the binding constraint is the limit you reach first and the rest are noise
@@ -494,6 +481,9 @@ class Overlay:
                                                       # then the CLI default full-access mode
         self.pending_shot = None
         self.pending_images: list = []
+        self.pending_docs: list = []    # queued PDF/Word/PPT paths from the 📎 picker —
+                                        # kept apart from pending_images since they aren't
+                                        # decoded/validated the same way (see _pick_attachments)
         self._precaptured = None        # (shots, monotonic_ts) grabbed while typing
         self._sent_shot_hashes: dict = {}  # capture-target key → (sha256, perceptual hash) of
                                         # the last shot the model VERIFIABLY has in context;
@@ -533,8 +523,6 @@ class Overlay:
                                         # fresher and so wins the DISPLAY, while everything that
                                         # speaks or sends still reads the CLI's own event above.
         self._quota_said = None         # status already announced, so each transition speaks once
-        self._ring_explained = False    # the ring names itself once, when there is finally
-                                        # something to point at (see _maybe_explain_ring)
         self._last_sent = None          # (text, images) of the last message handed to the worker,
                                         # so a refusal that never reached Claude can give it back
         self._retry = None              # {"at", "text", "armed"} — a refused message waiting for
@@ -1054,34 +1042,11 @@ class Overlay:
         self.titlebar = bar
         bar.pack_propagate(False)
         self._bind_drag(bar)
-        sz = self.px(_MARK_PX)
-        mark = tk.Canvas(bar, width=sz, height=sz, bg=T["bg"], highlightthickness=0)
-        mark.pack(side="left", padx=(self.px(10), self.px(7)))
-        # The whole mark — allowance arcs AND the ✻ — is one supersampled image rather than
-        # Tk canvas primitives, so every curve is antialiased. See _paint_quota_ring.
-        self._mark, self._mark_sz = mark, sz
-        self._paint_quota_ring()
-        # The ring can carry the numbers but not their name. A pointer cursor says it answers
-        # to something, and <Enter> is where the answer arrives — see _quota_hover_text.
-        mark.configure(cursor="hand2")
-        mark.bind("<Enter>", self._mark_enter, add="+")
-        mark.bind("<Leave>", self._mark_leave, add="+")
-        # Deliberately a child of root rather than a Toplevel. The capture exclusion that keeps
-        # the overlay out of screen shares - and out of the screenshots we send Claude - is set
-        # on the root HWND (see _apply_share_visibility) and a new top-level window does not
-        # inherit it: the panel would show up in a Teams share while the overlay itself did not,
-        # and would land inside our own grabs, because capture() skips its withdraw dance
-        # whenever the exclusion is active. A placed child inherits all of that for nothing.
-        self._usage_panel = tk.Label(self.root, text="", bg=T["tool_bg"], fg=T["text"],
-                                     font=self.f_mono, justify="left", anchor="w",
-                                     padx=self.px(10), pady=self.px(8),
-                                     highlightthickness=1, highlightbackground=T["border"])
-        self._bind_drag(mark)
         # The title doubles as the rename target: click it (without dragging) to edit this
         # overlay's name; dragging it still moves the window (moved-detection, like the orb).
         self.title_lbl = tk.Label(bar, text=self.overlay_name or "Claude", bg=T["bg"],
                                   fg=T["text"], font=self.f_title, cursor="hand2")
-        self.title_lbl.pack(side="left")
+        self.title_lbl.pack(side="left", padx=(self.px(10), 0))
         self.title_lbl.bind("<ButtonPress-1>", self._title_press)
         self.title_lbl.bind("<B1-Motion>", self._title_drag)
         self.title_lbl.bind("<ButtonRelease-1>", self._title_release)
@@ -1472,6 +1437,15 @@ class Overlay:
         self.gear.bind("<Enter>", lambda e: self.gear.configure(fg=T["accent"]))
         self.gear.bind("<Leave>", lambda e: self._paint_gear())
         self._paint_gear()
+        # Opens a native file picker for images/PDF/Word/PPT — the button form of what
+        # Ctrl+V already does for images (see _on_paste). attach_lbl (below) shows the
+        # queued count for both and clears them on click.
+        self.attach_btn = tk.Label(st, text="📎", bg=T["bg"], fg=T["muted"],
+                                   font=self.f_icon, cursor="hand2")
+        self.attach_btn.pack(side="left", padx=(self.px(10), self.px(2)), pady=pad)
+        self.attach_btn.bind("<Button-1>", lambda e: self._pick_attachments())
+        self.attach_btn.bind("<Enter>", lambda e: self.attach_btn.configure(fg=T["accent"]))
+        self.attach_btn.bind("<Leave>", lambda e: self.attach_btn.configure(fg=T["muted"]))
         self.attach_lbl = tk.Label(st, text="", bg=T["bg"], fg=T["accent"],
                                    font=self.f_small, cursor="hand2")
         self.attach_lbl.pack(side="left", padx=self.px(6), pady=pad)
@@ -2175,12 +2149,71 @@ class Overlay:
                 except Exception:
                     pass
 
+    def _pick_attachments(self):
+        """📎 button: a native file picker for images/PDF/Word/PPT — everything Ctrl+V
+        already handles for a pasted image, plus the formats that only reach the model
+        via _stash_attachments_bg. Reuses _paste_busy as the in-flight guard so a picker
+        run and a clipboard paste can never race on pending_images/pending_docs."""
+        if self._paste_busy:
+            return
+        exts = IMAGE_EXTS + DOC_EXTS
+        paths = filedialog.askopenfilenames(
+            parent=self.root, title="Attach files to Claude",
+            filetypes=[("Supported files", " ".join(f"*{e}" for e in exts)),
+                       ("All files", "*.*")])
+        if not paths:
+            return
+        self._paste_busy = True
+        threading.Thread(target=self._stash_attachments_bg, args=(list(paths),), daemon=True).start()
+
+    def _stash_attachments_bg(self, paths):
+        """Background side of the picker: route each picked file by extension — images
+        through _stash_image (same downscale/decompression-bomb guard as paste), PDF/
+        Word/PPT through a plain size check (worker.py does the real reading — as a
+        native document block for PDF, extracted text for .docx/.pptx). Always posts
+        ("attach", …) so _paste_busy is cleared even on failure."""
+        imgs, docs, failed = [], [], 0
+        try:
+            for p in paths:
+                ext = Path(p).suffix.lower()
+                if ext in IMAGE_EXTS:
+                    saved = self._stash_image(p)
+                    if saved:
+                        imgs.append(saved)
+                    else:
+                        failed += 1
+                elif ext in DOC_EXTS:
+                    try:
+                        size = Path(p).stat().st_size
+                    except OSError:
+                        size = 0
+                    cap = MAX_INLINE_PDF_BYTES if ext == ".pdf" else MAX_INLINE_IMAGE_BYTES
+                    if 0 < size <= cap:
+                        docs.append(p)
+                    else:
+                        failed += 1
+                else:
+                    failed += 1
+        except BaseException:
+            pass
+        finally:
+            self.ui_q.put(("attach", (imgs, failed, docs)))
+
     def _refresh_attach(self):
-        n = len(self.pending_images)
-        self.attach_lbl.configure(text=(f"📎 {n} image{'s' if n != 1 else ''}  ✕" if n else ""))
+        ni, nd = len(self.pending_images), len(self.pending_docs)
+        if not ni and not nd:
+            self.attach_lbl.configure(text="")
+            return
+        parts = []
+        if ni:
+            parts.append(f"{ni} image{'s' if ni != 1 else ''}")
+        if nd:
+            parts.append(f"{nd} file{'s' if nd != 1 else ''}")
+        self.attach_lbl.configure(text=f"📎 {', '.join(parts)}  ✕")
 
     def _clear_attachments(self):
         self.pending_images = []
+        self.pending_docs = []
         self._refresh_attach()
 
     # ── window drag / resize / rounding ──
@@ -3960,7 +3993,8 @@ class Overlay:
             return False
         # Nothing to send anyway (empty box, no auto-shot, no attachments): stay quiet and let
         # the normal empty-send no-op happen, so Enter on an empty box can't nag about login.
-        if not (self._entry_text() or self.auto_shot or self.pending_shot or self.pending_images):
+        if not (self._entry_text() or self.auto_shot or self.pending_shot
+                or self.pending_images or self.pending_docs):
             return False
         try:
             if authstate.dead_reason() is None:
@@ -4035,10 +4069,12 @@ class Overlay:
             shots = self.pending_shot
         self._precaptured = None
         images = list(self.pending_images)
-        if not text and not shots and not images:
+        docs = list(self.pending_docs)
+        if not text and not shots and not images and not docs:
             return None
         self.pending_shot = None
         self.pending_images = []
+        self.pending_docs = []
         self._refresh_attach()
         self.entry.delete("1.0", "end")
         self._ph_active = False
@@ -4046,7 +4082,7 @@ class Overlay:
                                            # whether this is the armed message or a different
                                            # one, the schedule has been overtaken and must
                                            # not fire later on its own
-        return {"text": text, "shots": shots, "images": images,
+        return {"text": text, "shots": shots, "images": images, "docs": docs,
                 "auto": bool(self.auto_shot)}
 
     def _deliver(self, item):
@@ -4055,7 +4091,7 @@ class Overlay:
         Dedupe runs NOW, not at collect time: it compares against the baseline the model
         verifiably holds, and for a queued message that baseline can change while it waits
         (the turn ahead may attach its own screenshots)."""
-        text, shots, images = item["text"], item["shots"], item["images"]
+        text, shots, images, docs = item["text"], item["shots"], item["images"], item["docs"]
         self._last_sent = (text, images)   # a turn refused for allowance never reached Claude;
                                            # _restore_draft hands the text back (see "result")
         # Auto-screenshots only: drop any capture that the model already has — the same bytes,
@@ -4069,11 +4105,13 @@ class Overlay:
         if item.get("auto") and shots and IMAGE_INPUT == "inline":
             shots, unchanged = self._dedupe_shots(shots)
         n = (len(shots) if shots else 0) + len(images)
-        label = text if text else "(look at my screens)"
+        label = text if text else ("(look at my screens)" if (shots or images) else "(look at my file)")
         if n:
             label += (f"   🖼×{n}" if n > 1 else "   🖼")
         elif unchanged:
             label += "   🖼 unchanged"
+        if docs:
+            label += (f"   📎×{len(docs)}" if len(docs) > 1 else "   📎")
         self.add_user(label)
         if self._resume_btn is not None:   # a NEW conversation is starting — resuming now
             try:                           # would silently discard it; retire the offer
@@ -4082,10 +4120,10 @@ class Overlay:
                 pass
             self._resume_btn = None
         if IMAGE_INPUT == "inline":
-            paths = [s["path"] for s in (shots or [])] + list(images)
-            self.worker.ask(self._inline_text(text, shots, images, unchanged), paths)
+            paths = [s["path"] for s in (shots or [])] + list(images) + list(docs)
+            self.worker.ask(self._inline_text(text, shots, images, unchanged, docs), paths)
         else:
-            self.worker.ask(self._build_prompt(text, shots, images), [])
+            self.worker.ask(self._build_prompt(text, shots, images, docs), [])
         self._set_busy(True)
 
     # ── the type-ahead line-up (the CLI's message queue) ──
@@ -4190,7 +4228,9 @@ class Overlay:
         edge, taking the remove affordance with it)."""
         body = " ".join((item["text"] or "(look at my screens)").split())
         n = (len(item["shots"]) if item["shots"] else 0) + len(item["images"])
+        nd = len(item.get("docs") or [])
         tail = ((f"  🖼×{n}" if n > 1 else "  🖼") if n else "")
+        tail += ((f"  📎×{nd}" if nd > 1 else "  📎") if nd else "")
         try:
             w = self.input_wrap.winfo_width()
         except Exception:
@@ -4296,12 +4336,13 @@ class Overlay:
         self._sent_shot_hashes.clear()
         self._pending_shot_hashes.clear()
 
-    def _inline_text(self, text, shots, images, unchanged=None):
-        """Short text companion for inline-image turns: the model sees the images
-        directly, so we only add a one-line note about what's attached. Deduped
-        captures (see _dedupe_shots) become an explicit "unchanged" pointer instead —
-        the model must know it can trust the previous screenshot, or it may assume it
-        has no current view of the screen at all."""
+    def _inline_text(self, text, shots, images, unchanged=None, docs=None):
+        """Short text companion for inline-attachment turns: the model sees the images/
+        PDF/Word/PPT directly (worker.py builds the actual content blocks), so we only
+        add a one-line note about what's attached. Deduped captures (see _dedupe_shots)
+        become an explicit "unchanged" pointer instead — the model must know it can
+        trust the previous screenshot, or it may assume it has no current view of the
+        screen at all."""
         note = []
         if unchanged:
             tags = ", ".join(
@@ -4321,10 +4362,13 @@ class Overlay:
             note.append(f"[Attached: a live screenshot of my screen — {tags}.]")
         if images:
             note.append(f"[Attached: {len(images)} pasted image(s).]")
+        if docs:
+            names = ", ".join(Path(p).name for p in docs)
+            note.append(f"[Attached: {len(docs)} file(s) — {names}.]")
         if text:
             body = text
-        elif shots or images:
-            body = ("Look at the attached screen(s)/image(s) and tell me "
+        elif shots or images or docs:
+            body = ("Look at the attached screen(s)/image(s)/file(s) and tell me "
                     "what's there / what I might want help with.")
         else:   # everything was deduped away — point at the context copy instead
             body = ("Look at my screen (the most recent screenshot earlier in this "
@@ -4373,7 +4417,7 @@ class Overlay:
         finally:
             self.ui_q.put(("precapture_done", shots))
 
-    def _build_prompt(self, text, shots, images=None):
+    def _build_prompt(self, text, shots, images=None, docs=None):
         parts = []
         lines = []
         if shots and shots[0].get("window") is not None:
@@ -4387,11 +4431,13 @@ class Overlay:
                 lines.append(f"- Monitor {s['index']} ({tag}): {s['path']}")
         for i, p in enumerate(images or [], 1):
             lines.append(f"- Pasted image {i}: {p}")
+        for i, p in enumerate(docs or [], 1):
+            lines.append(f"- File {i}: {p}")
         if lines:
             parts.append("[ATTACHMENTS] " + "\n".join(lines) +
                          "\nUse the Read tool on each of these exact paths to view them, then respond.")
         parts.append(text if text else
-                     "Look at the attached image(s)/screen(s) and tell me what's there / what I might want help with.")
+                     "Look at the attached image(s)/screen(s)/file(s) and tell me what's there / what I might want help with.")
         return "\n\n".join(parts)
 
     def _save_shot(self, img, stem: Path) -> Path:
@@ -4806,78 +4852,16 @@ class Overlay:
         self.statusline.configure(text=f"{self._model or 'Claude'} ▾", fg=T["muted"])
         self.ctx_lbl.configure(text=f"·   {self._gauge_text()}", fg=self._ctx_color())
         self.ver_lbl.configure(text=f"·   {ver}", fg=T["muted"])
-        self._paint_quota_ring()
 
     # ── the middle of the statusline ──
     def _ctx_text(self):
-        """Context as a percentage, and nothing else.
-
-        The headroom in turns used to be appended here, which meant the row grew a second
-        clause the moment a burn rate could be read and lost it again after a compaction. The
-        one strip of chrome that should hold still was reflowing while you looked at it. The
-        figure is not gone - _usage_panel_text carries it, one hover away, and the end-of-turn
-        warning still speaks it."""
+        """Context as a percentage, and nothing else. The end-of-turn warning speaks the
+        turns-left figure when it matters; this slot just holds the number."""
         p = f"{self._ctx_pct:.0f}%" if isinstance(self._ctx_pct, (int, float)) else "—"
         return f"context {p}"
 
     def _gauge_text(self):
-        """What the row carries when the mark is not being hovered: context.
-
-        The allowance used to own this slot, with context demoted to a fallback and allowed
-        back only once it was over its own warning line - two percentages competing for one
-        place. The allowance lives on the ring now, and printing it here as well would be the
-        same number twice; on a narrow overlay that duplication is what pushed the version off
-        the end. Context is NOT duplicated by the ring: the ring is the plan allowance, context
-        is the size of THIS conversation, and the two answer different questions. So context
-        simply keeps the slot, and the competition this method used to arbitrate is gone.
-        """
         return self._ctx_text()
-
-    def _usage_panel_text(self):
-        """Everything about usage, in one aligned block, for the panel the mark opens.
-
-        No unlabelled gauge explains itself. What makes one learnable is being able to
-        interrogate it, and the answer belongs where the asking happened - beside the mark,
-        not down in a status row that then reflows under the cursor. Both allowance windows
-        and context sit here together because they are the same question asked three ways, and
-        because context's turns figure had to leave the row to stop it moving."""
-        rows = []
-        wins = self._ring_windows()
-        for key, label in (("five_hour", "5h"), ("week", "week")):
-            u = (wins.get(key) or {}).get("utilization")
-            if isinstance(u, bool) or not isinstance(u, (int, float)):
-                continue
-            rows.append((label, f"{u * 100:.0f}%", self._quota_resets_text(wins[key])))
-        if not rows:
-            rows.append(("allowance", "—", "no reading yet"))
-        p = self._ctx_pct
-        if isinstance(p, (int, float)):
-            left = self._ctx_turns_left()
-            rows.append(("context", f"{p:.0f}%",
-                         f"~{left} turn{'' if left == 1 else 's'} left" if left is not None else ""))
-        w = max(len(r[0]) for r in rows)
-        return "\n".join(f"{a.ljust(w)}   {b:>4}   {c}".rstrip() for a, b, c in rows)
-
-    def _mark_enter(self, _e=None):
-        self._usage_panel.configure(text=self._usage_panel_text())
-        # Just under the titlebar, left-aligned with the mark it belongs to.
-        self._usage_panel.place(x=self.px(10), y=self.px(42))
-        self._usage_panel.lift()
-
-    def _mark_leave(self, _e=None):
-        self._usage_panel.place_forget()
-
-    def _maybe_explain_ring(self):
-        """Name the ring once, the first time there is something to point at.
-
-        A first-time reader has no way to guess that two arcs around a logo are a plan
-        allowance — the shape can carry the numbers but not their meaning. One sentence, said
-        once, is the only thing that closes that gap; after that the hover carries it."""
-        if self._ring_explained or not self._ring_arcs():
-            return
-        self._ring_explained = True
-        self.add_sys("◔ The ring on ✻ is your plan allowance — the inner arc is the 5-hour "
-                     "window, the outer one is weekly. Hover the mark for the numbers.")
 
     def _gauge_quota(self):
         """The freshest allowance reading, for DISPLAY only.
@@ -4894,125 +4878,6 @@ class Overlay:
         if isinstance(w, dict) and w:
             return _binding_window(w) or {}
         return self._quota or {}
-
-    def _quota_windows(self):
-        """Every allowance window we can place on the ring, keyed by name.
-
-        The poll carries all of them. The CLI's own event carries exactly one, and only
-        sometimes names it — an unnamed one is DROPPED rather than parked on whichever track
-        is handy, because putting a weekly reading on the 5-hour arc would be a lie the user
-        has no way to see through. The statusline text still prints that number, so staying
-        silent here costs nothing.
-        """
-        w = (self._quota_polled or {}).get("windows")
-        if isinstance(w, dict) and w:
-            return w
-        q = self._quota or {}
-        u, name = q.get("utilization"), q.get("window")
-        if name in _QUOTA_WINDOWS and isinstance(u, (int, float)) and not isinstance(u, bool):
-            return {name: {"utilization": float(u), "resets_at": q.get("resets_at")}}
-        return {}
-
-    def _ring_color(self, u, quiet):
-        """Recessive until it isn't. An arc carries no number, so colour is the only channel
-        it has for urgency — hence its own amber step rather than waiting for the CLI's."""
-        if u >= _QUOTA_HOT:
-            return T["err"]
-        if u >= _QUOTA_WARN:
-            return T["accent"]
-        return quiet
-
-    def _ring_track(self):
-        """The empty part of a gauge, in a tone you can actually see.
-
-        The first cut used T["border"], which is 1.2:1 against the surface — exactly right for
-        a hairline between two panels and completely invisible as a track, so a fresh overlay
-        with no reading yet drew a mark that looked untouched. _contrast pins the replacement
-        rather than trusting the eye that missed it the first time."""
-        return _mix(T["bg"], T["faint"], 0.70)   # 1.8:1 light, 2.1:1 dark — seen, not shouted
-
-    def _ring_windows(self):
-        """The two tracks, each resolved to the one window it stands for. Shared by the ring
-        and by the hover text so a number and its label can never come from different windows."""
-        wins = self._quota_windows()
-        return {"five_hour": wins.get("five_hour"),
-                "week": _binding_window({k: v for k, v in wins.items() if k != "five_hour"})}
-
-    def _ring_arcs(self):
-        """What each track should show: {track: (fraction, colour)}, tracks with nothing to
-        say left out. Kept separate from the drawing so the numbers and colours can be tested
-        without decoding a bitmap."""
-        out = {}
-        for key, w in self._ring_windows().items():
-            u = (w or {}).get("utilization")
-            if isinstance(u, bool) or not isinstance(u, (int, float)) or u <= 0.005:
-                continue           # a hairline at 0% would read as "something is used"
-            out[key] = (min(1.0, float(u)), self._ring_color(u, T["muted"]))
-        return out
-
-    def _paint_quota_ring(self):
-        """The ✻ mark, ringed by two allowance gauges: the 5-hour window inside, the weekly
-        one outside.
-
-        WHY TWO, AND WHY HERE. The status row had one slot and filled it with whichever window
-        was furthest along, labelled "(5h)" or "(week)". That works as text because the text
-        says which window it is describing — but the row was also carrying the model name, the
-        reset time and the version, and on a narrow overlay the version was being clipped.
-        Moving the gauge onto the mark buys the row back; the catch is that an arc cannot carry
-        the label, so a single arc that silently changed meaning would be strictly worse than
-        the text it replaced. Two fixed tracks answer both at once: position IS the label, and
-        the thicker inner one is the window that ends the session you are sitting in.
-
-        Two arcs are also the honest reading of the data. The weekly window climbs slowly in
-        the background; the 5-hour one can go from a tenth to spent in an afternoon. Ranking
-        them by magnitude hid the 5-hour window for exactly as long as it sat below the weekly
-        number — which is where it is every time you sit down to work. Both are the same unit
-        (share of an allowance) on the same 0-1 scale, so drawing them together is one scale,
-        not two. The sweep runs clockwise from 12 o'clock, the direction a clock face reads,
-        which is what a window that empties and refills on a timer actually is.
-
-        WHY AN IMAGE. Tk's create_arc is not antialiased on Windows, and a 3px stroke on a 36px
-        circle comes out a visible staircase — the first cut of this was drawn with canvas
-        primitives and was unreadable at real size. Everything is rendered at _RING_SS× into
-        one PIL image, downsampled, and placed as a single canvas item, so every curve
-        (including the ✻ itself) is smooth. The photo is kept on the instance because Tk holds
-        only a weak claim on a PhotoImage — drop the Python reference and the mark goes blank.
-        """
-        c = getattr(self, "_mark", None)
-        if c is None:              # a repaint can land before the titlebar is built
-            return
-        sz = self._mark_sz
-        S = sz * _RING_SS
-        im = Image.new("RGB", (S, S), T["bg"])
-        d = ImageDraw.Draw(im)
-        arcs, track = self._ring_arcs(), self._ring_track()
-        for key, rf, wf in _RING_GEOM:
-            r, lw = S * rf, max(1, round(S * wf))
-            box = [S / 2 - r, S / 2 - r, S / 2 + r, S / 2 + r]
-            # The empty track is always drawn: an arc with nothing behind it reads as a
-            # fragment of something rather than as "this much of that".
-            d.arc(box, 0, 360, fill=track, width=lw)
-            a = arcs.get(key)
-            if a:
-                d.arc(box, -90, -90 + 360 * a[0], fill=a[1], width=lw)
-        self._draw_spark_pil(d, S)
-        self._ring_photo = ImageTk.PhotoImage(im.resize((sz, sz), Image.LANCZOS))
-        c.delete("ring")
-        c.create_image(sz / 2, sz / 2, image=self._ring_photo, tags="ring")
-
-    def _draw_spark_pil(self, d, S):
-        """The ✻ at the centre of the mark, into the same supersampled image as the rings.
-        Round tips are ellipses because PIL has no cap style; at _RING_SS× they land as the
-        same shape Tk's capstyle="round" used to give."""
-        import math
-        cx = cy = S / 2
-        r, w = S * _SPARK_R, max(1, round(S * 2 / 32))
-        for i in range(12):
-            a = math.pi * i / 6
-            r1 = r if i % 2 == 0 else r * 0.5
-            x, y = cx + r1 * math.cos(a), cy + r1 * math.sin(a)
-            d.line([cx, cy, x, y], fill=T["accent"], width=w)
-            d.ellipse([x - w / 2, y - w / 2, x + w / 2, y + w / 2], fill=T["accent"])
 
     def _quota_resets_text(self, q):
         """When the allowance comes back, as a wall clock. A live countdown would need a timer
@@ -5722,7 +5587,6 @@ class Overlay:
         elif kind == "quota":
             self._quota = payload if isinstance(payload, dict) else None
             self._refresh_statusline()
-            self._maybe_explain_ring()
             self._announce_quota()
             # The CLI saying the allowance is no longer rejected beats waiting for a clock we
             # only ever got a prediction of. A retry is only ever armed after a rejection, so
@@ -5745,7 +5609,6 @@ class Overlay:
             if isinstance(payload, dict):
                 self._quota_polled = payload
                 self._refresh_statusline()
-                self._maybe_explain_ring()
         elif kind == "turn_done":
             self._md_finalize()          # the turn ended → give the last line full block styling
             self._finish_turn_copy()     # then a Copy button under the reply
@@ -5864,17 +5727,23 @@ class Overlay:
                 self._sent_shot_hashes.update(self._pending_shot_hashes)
                 self._pending_shot_hashes.clear()
             self._set_busy(False)
-        elif kind == "attach":          # background paste finished (paths, failed_count)
+        elif kind == "attach":          # background paste/picker finished: (images, failed[, docs])
             self._paste_busy = False
-            paths, failed = payload
+            paths, failed, docs = payload if len(payload) == 3 else (*payload, [])
             if paths:
                 room = max(0, MAX_PENDING_IMAGES - len(self.pending_images))
                 self.pending_images.extend(paths[:room])
                 if len(paths) > room:   # over the queue cap → count the rest as not attached
                     failed += len(paths) - room
+            if docs:
+                room = max(0, MAX_PENDING_IMAGES - len(self.pending_docs))
+                self.pending_docs.extend(docs[:room])
+                if len(docs) > room:
+                    failed += len(docs) - room
+            if paths or docs:
                 self._refresh_attach()
             if failed:
-                self.add_err(f"{failed} pasted image(s) couldn't be attached.")
+                self.add_err(f"{failed} attachment(s) couldn't be added.")
         elif kind == "precapture_done":
             self._capture_busy = False
             if payload:

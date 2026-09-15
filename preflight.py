@@ -264,6 +264,24 @@ def check():
             f"still runs, but the Ctrl+Alt+Space global hotkey won't work",
             pip_command()))
 
+    try:
+        import docx  # noqa: F401
+    except Exception as e:
+        problems.append(Problem(
+            WARN, "python-docx",
+            f"the `python-docx` package isn't usable ({e.__class__.__name__}) - the "
+            f"overlay still runs, but attaching a .docx file will fail",
+            pip_command()))
+
+    try:
+        import pptx  # noqa: F401
+    except Exception as e:
+        problems.append(Problem(
+            WARN, "python-pptx",
+            f"the `python-pptx` package isn't usable ({e.__class__.__name__}) - the "
+            f"overlay still runs, but attaching a .pptx file will fail",
+            pip_command()))
+
     # --- am I even inspecting the right Python? ---------------------------------
     # Reported as a WARN, not a FAIL: this report may legitimately be run by a different
     # interpreter than the launcher uses. But when everything above looks fine and the

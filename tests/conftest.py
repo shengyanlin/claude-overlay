@@ -144,9 +144,8 @@ def _clean_overlay(ov):
     ov._quota = None                    # allowance readings are per-test: a leaked one would
     ov._quota_polled = None             # take the gauge slot away from the next test's context
     ov._quota_said = None
-    ov._ring_explained = False          # the ring introduces itself once; a leaked flag would
-                                        # rob the next test of the introduction it is watching
     ov.pending_images = []
+    ov.pending_docs = []
     ov.pending_shot = None
     ov._precaptured = None
     try:
