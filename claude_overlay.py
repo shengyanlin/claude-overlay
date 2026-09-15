@@ -4930,6 +4930,13 @@ class Overlay:
         u = q.get("utilization")
         if isinstance(u, bool) or not isinstance(u, (int, float)):
             return ""
+        # NaN and infinity are floats and clear the check above. They also make round()
+        # RAISE (ValueError / OverflowError) where the old `:.0f` merely printed "nan" —
+        # and this runs on the Tk thread inside the ui_q drain, so a raise here takes out
+        # the callback that delivers every other event, not just this label. json.loads
+        # accepts NaN and Infinity by default, so a CLI that emits either reaches us.
+        if not math.isfinite(u):
+            return ""
         # Empty until there is a non-zero percent to show. Tested against the ROUNDED value,
         # which is the thing the user reads: a separate threshold constant is a second copy
         # of `:.0f`'s rounding, and it drifted on the first try — 0.005 passed a `< 0.005`

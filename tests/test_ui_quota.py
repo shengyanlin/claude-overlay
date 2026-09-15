@@ -108,6 +108,16 @@ class TestAllowanceSegment:
         gauge._handle("quota", _q(util=0.006))
         assert "5h 1%" in gauge.quota_lbl.cget("text")
 
+    def test_nan_and_infinity_are_dropped_rather_than_raising(self, gauge):
+        """Both are floats and clear the isinstance check, and round() RAISES on both
+        (ValueError / OverflowError) where the old `:.0f` merely printed "nan". This runs
+        on the Tk thread inside the ui_q drain, so a raise here would take out the callback
+        that delivers every OTHER event, not just this label. json.loads accepts NaN and
+        Infinity by default, so a CLI that emits either reaches us."""
+        for u in (float("nan"), float("inf"), float("-inf")):
+            gauge._handle("quota", _q(util=u))
+            assert gauge.quota_lbl.cget("text") == "", f"{u} was not dropped"
+
     def test_a_malformed_reading_is_dropped_not_printed(self, gauge):
         gauge._handle("quota", {"status": "allowed", "utilization": None})
         assert gauge.quota_lbl.cget("text") == ""

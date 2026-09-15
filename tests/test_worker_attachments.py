@@ -157,7 +157,7 @@ class TestDocTextBlock:
 
     def test_block_is_headed_with_the_filename(self, docx_file):
         w = make_worker()
-        block, charged = w._doc_text_block(docx_file, ".docx")
+        block, charged, reason = w._doc_text_block(docx_file, ".docx")
         assert block["type"] == "text"
         assert block["text"].startswith("[Attached file: report.docx]")
         assert "FIRST_PARAGRAPH" in block["text"]
@@ -165,7 +165,7 @@ class TestDocTextBlock:
     def test_per_file_char_cap_truncates_and_says_so(self, docx_file, monkeypatch):
         monkeypatch.setattr(worker_module, "MAX_INLINE_DOC_CHARS", 12)
         w = make_worker()
-        block, charged = w._doc_text_block(docx_file, ".docx")
+        block, charged, reason = w._doc_text_block(docx_file, ".docx")
         assert "truncated" in block["text"]
         assert "this file is longer" in block["text"]
 
@@ -175,25 +175,31 @@ class TestDocTextBlock:
         monkeypatch.setattr(worker_module, "MAX_INLINE_DOC_CHARS", 10_000)
         monkeypatch.setattr(worker_module, "MAX_INLINE_DOC_TOTAL_CHARS", 20)
         w = make_worker()
-        block, charged = w._doc_text_block(docx_file, ".docx", already=8)
+        block, charged, reason = w._doc_text_block(docx_file, ".docx", already=8)
         assert "truncated at 12 characters" in block["text"]
 
     def test_no_room_left_means_no_block(self, docx_file, monkeypatch):
         monkeypatch.setattr(worker_module, "MAX_INLINE_DOC_TOTAL_CHARS", 100)
         w = make_worker()
-        assert w._doc_text_block(docx_file, ".docx", already=100) == (None, 0)
+        block, charged, reason = w._doc_text_block(docx_file, ".docx", already=100)
+        assert (block, charged) == (None, 0)
+        assert "no room left" in reason
 
     def test_an_empty_document_is_not_sent_as_a_blank_block(self, tmp_path):
         p = tmp_path / "blank.docx"
         Document().save(p)
         w = make_worker()
-        assert w._doc_text_block(str(p), ".docx") == (None, 0)
+        block, charged, reason = w._doc_text_block(str(p), ".docx")
+        assert (block, charged) == (None, 0)
+        assert reason == "held no extractable text"
 
     def test_a_corrupt_file_is_rejected_not_raised(self, tmp_path):
         p = tmp_path / "lying.docx"
         p.write_bytes(b"this is not a zip container")
         w = make_worker()
-        assert w._doc_text_block(str(p), ".docx") == (None, 0)
+        block, charged, reason = w._doc_text_block(str(p), ".docx")
+        assert (block, charged) == (None, 0)
+        assert "couldn't be parsed" in reason
 
     def test_the_size_cap_is_re_checked_here_not_only_in_the_picker(self, docx_file,
                                                                    monkeypatch):
@@ -203,24 +209,29 @@ class TestDocTextBlock:
         expand to gigabytes of XML: the guard has to sit in front of the parser."""
         monkeypatch.setattr(worker_module, "MAX_INLINE_DOC_BYTES", 1)
         w = make_worker()
-        assert w._doc_text_block(docx_file, ".docx") == (None, 0)
+        block, charged, reason = w._doc_text_block(docx_file, ".docx")
+        assert (block, charged) == (None, 0)
+        assert "limit for one document" in reason
 
     def test_a_missing_package_tells_the_user_how_to_fix_it(self, docx_file, monkeypatch):
+        """The install advice comes back as the REASON, and the helper posts NOTHING of its
+        own. Posting here and returning None gave one failure two messages — the actionable
+        one immediately contradicted by a vaguer "couldn't be parsed" from the caller."""
         def no_docx(_p):
             raise ImportError("No module named 'docx'")
 
         monkeypatch.setattr(ClaudeWorker, "_extract_docx", staticmethod(no_docx))
         w = make_worker()
-        assert w._doc_text_block(docx_file, ".docx") == (None, 0)
-        kinds = _drain(w.ui)
-        assert kinds and kinds[0][0] == "error"
-        assert "update.cmd" in kinds[0][1]      # the command that actually installs it
+        block, charged, reason = w._doc_text_block(docx_file, ".docx")
+        assert (block, charged) == (None, 0)
+        assert "requirements-docs.txt" in reason    # the command that installs it
+        assert _drain(w.ui) == []                   # and not a second message about it
 
 
 class TestPdfBlock:
 
     def test_native_document_block(self, pdf_file):
-        block, used = ClaudeWorker._pdf_block(pdf_file, 0)
+        block, used, reason = ClaudeWorker._pdf_block(pdf_file, 0)
         assert block["type"] == "document"
         assert block["source"]["media_type"] == "application/pdf"
         assert base64.b64decode(block["source"]["data"]).startswith(b"%PDF")
@@ -228,19 +239,26 @@ class TestPdfBlock:
 
     def test_over_the_per_file_ceiling(self, pdf_file, monkeypatch):
         monkeypatch.setattr(worker_module, "MAX_INLINE_PDF_BYTES", 1)
-        assert ClaudeWorker._pdf_block(pdf_file, 0) == (None, 0)
+        block, used, reason = ClaudeWorker._pdf_block(pdf_file, 0)
+        assert (block, used) == (None, 0) and "limit for one PDF" in reason
 
     def test_over_the_aggregate_ceiling(self, pdf_file, monkeypatch):
         monkeypatch.setattr(worker_module, "MAX_INLINE_TOTAL_BYTES", 10)
-        assert ClaudeWorker._pdf_block(pdf_file, 9) == (None, 0)
+        block, used, reason = ClaudeWorker._pdf_block(pdf_file, 9)
+        assert (block, used) == (None, 0) and "no room left" in reason
 
     def test_an_empty_pdf_is_not_sent(self, tmp_path):
         p = tmp_path / "zero.pdf"
         p.write_bytes(b"")
-        assert ClaudeWorker._pdf_block(str(p), 0) == (None, 0)
+        block, used, reason = ClaudeWorker._pdf_block(str(p), 0)
+        assert (block, used) == (None, 0) and reason == "is empty"
 
     def test_a_missing_file_is_rejected_not_raised(self, tmp_path):
-        assert ClaudeWorker._pdf_block(str(tmp_path / "nope.pdf"), 0) == (None, 0)
+        block, used, reason = ClaudeWorker._pdf_block(str(tmp_path / "nope.pdf"), 0)
+        assert (block, used) == (None, 0)
+        # Not a generic "couldn't be read": moved/deleted and locked need opposite
+        # responses from the person who picked the file.
+        assert "no longer there" in reason
 
 
 class TestImageBlock:
@@ -249,7 +267,7 @@ class TestImageBlock:
         from PIL import Image
         jpg = tmp_path / "x.jpg"
         Image.new("RGB", (2, 2)).save(jpg)
-        block, used = ClaudeWorker._image_block(str(jpg), 0)
+        block, used, reason = ClaudeWorker._image_block(str(jpg), 0)
         assert block["source"]["media_type"] == "image/jpeg" and used > 0
 
     def test_an_unmapped_extension_defaults_to_png(self, tmp_path):
@@ -260,7 +278,7 @@ class TestImageBlock:
         from PIL import Image
         bmp = tmp_path / "x.bmp"
         Image.new("RGB", (2, 2)).save(bmp)
-        block, _ = ClaudeWorker._image_block(str(bmp), 0)
+        block, _, _r = ClaudeWorker._image_block(str(bmp), 0)
         assert block["source"]["media_type"] == "image/png"
 
 
@@ -369,6 +387,32 @@ class TestBuildQueryRouting:
         errs = [e for e in _drain(w_inline.ui) if e[0] == "error"]
         assert errs and "broken.docx" in errs[0][1]
         assert "parsed" in errs[0][1]
+
+    def test_a_missing_file_says_it_is_missing_not_that_it_is_unparseable(self, w_inline,
+                                                                         tmp_path):
+        """Each helper reports its OWN cause. One hedged sentence per branch ("couldn't be
+        parsed, or held no text") named the file correctly and then sent the reader to check
+        the wrong thing — a deleted file and a corrupt one need opposite responses."""
+        gone = tmp_path / "vanished.docx"
+        self._content(w_inline, "look", [str(gone)])
+        errs = [e for e in _drain(w_inline.ui) if e[0] == "error"]
+        assert errs and "vanished.docx" in errs[0][1]
+        assert "no longer there" in errs[0][1]
+        assert "parsed" not in errs[0][1]
+
+    def test_a_missing_package_produces_exactly_one_message(self, w_inline, docx_file,
+                                                            monkeypatch):
+        """Regression: the helper posted its own actionable error AND returned None, so the
+        caller appended a second, vaguer line about the same file."""
+        def no_docx(_p):
+            raise ImportError("No module named 'docx'")
+
+        monkeypatch.setattr(ClaudeWorker, "_extract_docx", staticmethod(no_docx))
+        self._content(w_inline, "look", [docx_file])
+        errs = [e for e in _drain(w_inline.ui) if e[0] == "error"]
+        assert len(errs) == 1
+        assert "requirements-docs.txt" in errs[0][1]
+        assert errs[0][1].count("report.docx") == 1
 
     def test_over_the_count_cap_says_so_by_name(self, w_inline, tmp_path, monkeypatch):
         monkeypatch.setattr(worker_module, "MAX_INLINE_IMAGES", 1)
