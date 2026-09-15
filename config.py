@@ -242,6 +242,14 @@ MAX_CHAT_LINES = 4000       # cap the rendered transcript; prune oldest lines pa
 MAX_CHAT_CHARS = 350_000    # also cap by characters — one giant whitespace-free assistant
                             # line counts as 1 line and would otherwise bypass the line cap
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
+DOC_EXTS = (".pdf", ".docx", ".pptx")   # non-image files the 📎 picker accepts. PDFs go to
+                            # Claude as a native document block; .docx/.pptx have no such
+                            # block, so their text is extracted locally (python-docx /
+                            # python-pptx) and sent as plain text - charts/layout are lost.
+MAX_INLINE_PDF_BYTES = 32 * 1024 * 1024   # Claude's own per-PDF ceiling; refuse locally with
+                            # a clear message instead of spending the upload on a rejection
+MAX_INLINE_DOC_CHARS = 200_000   # cap extracted Word/PPT text (~50k tokens) so one huge
+                            # attachment can't blow past the context on its own
 TOOL_IDLE_TIMEOUT = 1800    # once a tool call is in flight, allow a much longer silent gap
                             # (a long build/test can legitimately stream nothing for minutes)
 COMPACT_IDLE_TIMEOUT = 600  # /compact is one big summarization round-trip that streams nothing

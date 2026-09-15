@@ -113,6 +113,7 @@ def _file_version():
 try:
     import tkinter as tk
     from tkinter import font as tkfont
+    from tkinter import filedialog
 
     from PIL import Image, ImageGrab, ImageDraw, ImageChops, ImageFilter, ImageTk
 
@@ -480,6 +481,9 @@ class Overlay:
                                                       # then the CLI default full-access mode
         self.pending_shot = None
         self.pending_images: list = []
+        self.pending_docs: list = []    # queued PDF/Word/PPT paths from the 📎 picker —
+                                        # kept apart from pending_images since they aren't
+                                        # decoded/validated the same way (see _pick_attachments)
         self._precaptured = None        # (shots, monotonic_ts) grabbed while typing
         self._sent_shot_hashes: dict = {}  # capture-target key → (sha256, perceptual hash) of
                                         # the last shot the model VERIFIABLY has in context;
@@ -1433,6 +1437,15 @@ class Overlay:
         self.gear.bind("<Enter>", lambda e: self.gear.configure(fg=T["accent"]))
         self.gear.bind("<Leave>", lambda e: self._paint_gear())
         self._paint_gear()
+        # Opens a native file picker for images/PDF/Word/PPT — the button form of what
+        # Ctrl+V already does for images (see _on_paste). attach_lbl (below) shows the
+        # queued count for both and clears them on click.
+        self.attach_btn = tk.Label(st, text="📎", bg=T["bg"], fg=T["muted"],
+                                   font=self.f_icon, cursor="hand2")
+        self.attach_btn.pack(side="left", padx=(self.px(10), self.px(2)), pady=pad)
+        self.attach_btn.bind("<Button-1>", lambda e: self._pick_attachments())
+        self.attach_btn.bind("<Enter>", lambda e: self.attach_btn.configure(fg=T["accent"]))
+        self.attach_btn.bind("<Leave>", lambda e: self.attach_btn.configure(fg=T["muted"]))
         self.attach_lbl = tk.Label(st, text="", bg=T["bg"], fg=T["accent"],
                                    font=self.f_small, cursor="hand2")
         self.attach_lbl.pack(side="left", padx=self.px(6), pady=pad)
@@ -2136,12 +2149,71 @@ class Overlay:
                 except Exception:
                     pass
 
+    def _pick_attachments(self):
+        """📎 button: a native file picker for images/PDF/Word/PPT — everything Ctrl+V
+        already handles for a pasted image, plus the formats that only reach the model
+        via _stash_attachments_bg. Reuses _paste_busy as the in-flight guard so a picker
+        run and a clipboard paste can never race on pending_images/pending_docs."""
+        if self._paste_busy:
+            return
+        exts = IMAGE_EXTS + DOC_EXTS
+        paths = filedialog.askopenfilenames(
+            parent=self.root, title="Attach files to Claude",
+            filetypes=[("Supported files", " ".join(f"*{e}" for e in exts)),
+                       ("All files", "*.*")])
+        if not paths:
+            return
+        self._paste_busy = True
+        threading.Thread(target=self._stash_attachments_bg, args=(list(paths),), daemon=True).start()
+
+    def _stash_attachments_bg(self, paths):
+        """Background side of the picker: route each picked file by extension — images
+        through _stash_image (same downscale/decompression-bomb guard as paste), PDF/
+        Word/PPT through a plain size check (worker.py does the real reading — as a
+        native document block for PDF, extracted text for .docx/.pptx). Always posts
+        ("attach", …) so _paste_busy is cleared even on failure."""
+        imgs, docs, failed = [], [], 0
+        try:
+            for p in paths:
+                ext = Path(p).suffix.lower()
+                if ext in IMAGE_EXTS:
+                    saved = self._stash_image(p)
+                    if saved:
+                        imgs.append(saved)
+                    else:
+                        failed += 1
+                elif ext in DOC_EXTS:
+                    try:
+                        size = Path(p).stat().st_size
+                    except OSError:
+                        size = 0
+                    cap = MAX_INLINE_PDF_BYTES if ext == ".pdf" else MAX_INLINE_IMAGE_BYTES
+                    if 0 < size <= cap:
+                        docs.append(p)
+                    else:
+                        failed += 1
+                else:
+                    failed += 1
+        except BaseException:
+            pass
+        finally:
+            self.ui_q.put(("attach", (imgs, failed, docs)))
+
     def _refresh_attach(self):
-        n = len(self.pending_images)
-        self.attach_lbl.configure(text=(f"📎 {n} image{'s' if n != 1 else ''}  ✕" if n else ""))
+        ni, nd = len(self.pending_images), len(self.pending_docs)
+        if not ni and not nd:
+            self.attach_lbl.configure(text="")
+            return
+        parts = []
+        if ni:
+            parts.append(f"{ni} image{'s' if ni != 1 else ''}")
+        if nd:
+            parts.append(f"{nd} file{'s' if nd != 1 else ''}")
+        self.attach_lbl.configure(text=f"📎 {', '.join(parts)}  ✕")
 
     def _clear_attachments(self):
         self.pending_images = []
+        self.pending_docs = []
         self._refresh_attach()
 
     # ── window drag / resize / rounding ──
@@ -3921,7 +3993,8 @@ class Overlay:
             return False
         # Nothing to send anyway (empty box, no auto-shot, no attachments): stay quiet and let
         # the normal empty-send no-op happen, so Enter on an empty box can't nag about login.
-        if not (self._entry_text() or self.auto_shot or self.pending_shot or self.pending_images):
+        if not (self._entry_text() or self.auto_shot or self.pending_shot
+                or self.pending_images or self.pending_docs):
             return False
         try:
             if authstate.dead_reason() is None:
@@ -3996,10 +4069,12 @@ class Overlay:
             shots = self.pending_shot
         self._precaptured = None
         images = list(self.pending_images)
-        if not text and not shots and not images:
+        docs = list(self.pending_docs)
+        if not text and not shots and not images and not docs:
             return None
         self.pending_shot = None
         self.pending_images = []
+        self.pending_docs = []
         self._refresh_attach()
         self.entry.delete("1.0", "end")
         self._ph_active = False
@@ -4007,7 +4082,7 @@ class Overlay:
                                            # whether this is the armed message or a different
                                            # one, the schedule has been overtaken and must
                                            # not fire later on its own
-        return {"text": text, "shots": shots, "images": images,
+        return {"text": text, "shots": shots, "images": images, "docs": docs,
                 "auto": bool(self.auto_shot)}
 
     def _deliver(self, item):
@@ -4016,7 +4091,7 @@ class Overlay:
         Dedupe runs NOW, not at collect time: it compares against the baseline the model
         verifiably holds, and for a queued message that baseline can change while it waits
         (the turn ahead may attach its own screenshots)."""
-        text, shots, images = item["text"], item["shots"], item["images"]
+        text, shots, images, docs = item["text"], item["shots"], item["images"], item["docs"]
         self._last_sent = (text, images)   # a turn refused for allowance never reached Claude;
                                            # _restore_draft hands the text back (see "result")
         # Auto-screenshots only: drop any capture that the model already has — the same bytes,
@@ -4030,11 +4105,13 @@ class Overlay:
         if item.get("auto") and shots and IMAGE_INPUT == "inline":
             shots, unchanged = self._dedupe_shots(shots)
         n = (len(shots) if shots else 0) + len(images)
-        label = text if text else "(look at my screens)"
+        label = text if text else ("(look at my screens)" if (shots or images) else "(look at my file)")
         if n:
             label += (f"   🖼×{n}" if n > 1 else "   🖼")
         elif unchanged:
             label += "   🖼 unchanged"
+        if docs:
+            label += (f"   📎×{len(docs)}" if len(docs) > 1 else "   📎")
         self.add_user(label)
         if self._resume_btn is not None:   # a NEW conversation is starting — resuming now
             try:                           # would silently discard it; retire the offer
@@ -4043,10 +4120,10 @@ class Overlay:
                 pass
             self._resume_btn = None
         if IMAGE_INPUT == "inline":
-            paths = [s["path"] for s in (shots or [])] + list(images)
-            self.worker.ask(self._inline_text(text, shots, images, unchanged), paths)
+            paths = [s["path"] for s in (shots or [])] + list(images) + list(docs)
+            self.worker.ask(self._inline_text(text, shots, images, unchanged, docs), paths)
         else:
-            self.worker.ask(self._build_prompt(text, shots, images), [])
+            self.worker.ask(self._build_prompt(text, shots, images, docs), [])
         self._set_busy(True)
 
     # ── the type-ahead line-up (the CLI's message queue) ──
@@ -4151,7 +4228,9 @@ class Overlay:
         edge, taking the remove affordance with it)."""
         body = " ".join((item["text"] or "(look at my screens)").split())
         n = (len(item["shots"]) if item["shots"] else 0) + len(item["images"])
+        nd = len(item.get("docs") or [])
         tail = ((f"  🖼×{n}" if n > 1 else "  🖼") if n else "")
+        tail += ((f"  📎×{nd}" if nd > 1 else "  📎") if nd else "")
         try:
             w = self.input_wrap.winfo_width()
         except Exception:
@@ -4257,12 +4336,13 @@ class Overlay:
         self._sent_shot_hashes.clear()
         self._pending_shot_hashes.clear()
 
-    def _inline_text(self, text, shots, images, unchanged=None):
-        """Short text companion for inline-image turns: the model sees the images
-        directly, so we only add a one-line note about what's attached. Deduped
-        captures (see _dedupe_shots) become an explicit "unchanged" pointer instead —
-        the model must know it can trust the previous screenshot, or it may assume it
-        has no current view of the screen at all."""
+    def _inline_text(self, text, shots, images, unchanged=None, docs=None):
+        """Short text companion for inline-attachment turns: the model sees the images/
+        PDF/Word/PPT directly (worker.py builds the actual content blocks), so we only
+        add a one-line note about what's attached. Deduped captures (see _dedupe_shots)
+        become an explicit "unchanged" pointer instead — the model must know it can
+        trust the previous screenshot, or it may assume it has no current view of the
+        screen at all."""
         note = []
         if unchanged:
             tags = ", ".join(
@@ -4282,10 +4362,13 @@ class Overlay:
             note.append(f"[Attached: a live screenshot of my screen — {tags}.]")
         if images:
             note.append(f"[Attached: {len(images)} pasted image(s).]")
+        if docs:
+            names = ", ".join(Path(p).name for p in docs)
+            note.append(f"[Attached: {len(docs)} file(s) — {names}.]")
         if text:
             body = text
-        elif shots or images:
-            body = ("Look at the attached screen(s)/image(s) and tell me "
+        elif shots or images or docs:
+            body = ("Look at the attached screen(s)/image(s)/file(s) and tell me "
                     "what's there / what I might want help with.")
         else:   # everything was deduped away — point at the context copy instead
             body = ("Look at my screen (the most recent screenshot earlier in this "
@@ -4334,7 +4417,7 @@ class Overlay:
         finally:
             self.ui_q.put(("precapture_done", shots))
 
-    def _build_prompt(self, text, shots, images=None):
+    def _build_prompt(self, text, shots, images=None, docs=None):
         parts = []
         lines = []
         if shots and shots[0].get("window") is not None:
@@ -4348,11 +4431,13 @@ class Overlay:
                 lines.append(f"- Monitor {s['index']} ({tag}): {s['path']}")
         for i, p in enumerate(images or [], 1):
             lines.append(f"- Pasted image {i}: {p}")
+        for i, p in enumerate(docs or [], 1):
+            lines.append(f"- File {i}: {p}")
         if lines:
             parts.append("[ATTACHMENTS] " + "\n".join(lines) +
                          "\nUse the Read tool on each of these exact paths to view them, then respond.")
         parts.append(text if text else
-                     "Look at the attached image(s)/screen(s) and tell me what's there / what I might want help with.")
+                     "Look at the attached image(s)/screen(s)/file(s) and tell me what's there / what I might want help with.")
         return "\n\n".join(parts)
 
     def _save_shot(self, img, stem: Path) -> Path:
@@ -5642,17 +5727,23 @@ class Overlay:
                 self._sent_shot_hashes.update(self._pending_shot_hashes)
                 self._pending_shot_hashes.clear()
             self._set_busy(False)
-        elif kind == "attach":          # background paste finished (paths, failed_count)
+        elif kind == "attach":          # background paste/picker finished: (images, failed[, docs])
             self._paste_busy = False
-            paths, failed = payload
+            paths, failed, docs = payload if len(payload) == 3 else (*payload, [])
             if paths:
                 room = max(0, MAX_PENDING_IMAGES - len(self.pending_images))
                 self.pending_images.extend(paths[:room])
                 if len(paths) > room:   # over the queue cap → count the rest as not attached
                     failed += len(paths) - room
+            if docs:
+                room = max(0, MAX_PENDING_IMAGES - len(self.pending_docs))
+                self.pending_docs.extend(docs[:room])
+                if len(docs) > room:
+                    failed += len(docs) - room
+            if paths or docs:
                 self._refresh_attach()
             if failed:
-                self.add_err(f"{failed} pasted image(s) couldn't be attached.")
+                self.add_err(f"{failed} attachment(s) couldn't be added.")
         elif kind == "precapture_done":
             self._capture_busy = False
             if payload:

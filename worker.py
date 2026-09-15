@@ -964,10 +964,17 @@ class ClaudeWorker(threading.Thread):
         return cr if cr else None
 
     def _build_query(self, text: str, image_paths: list):
-        """Return the prompt for client.query(). With inline images we yield a
-        structured user message (text + base64 image blocks) so the model sees
-        the screen directly — no per-turn Read round-trip. Otherwise a plain
-        string (the legacy "Read the PNG path" flow builds its own text upstream)."""
+        """Return the prompt for client.query(). With inline attachments we yield a
+        structured user message (text + per-file content blocks) so the model sees
+        them directly — no per-turn Read round-trip. Otherwise a plain string (the
+        legacy "Read the PNG path" flow builds its own text upstream).
+
+        Each path becomes one of: an image block (IMAGE_EXTS, base64 — the screen/
+        paste path this used to be the whole method), a PDF document block (native —
+        Claude extracts text and renders pages server-side, no local parsing needed),
+        or a text block (.docx/.pptx — the API has no native block for either, so the
+        text is pulled out locally with python-docx/python-pptx; charts, layout and
+        embedded images don't survive)."""
         if IMAGE_INPUT != "inline" or not image_paths:
             return text
         content: list = []
@@ -983,30 +990,22 @@ class ClaudeWorker(threading.Thread):
             if len(seen) > MAX_INLINE_IMAGES:   # cap count per turn
                 failed += 1
                 continue
-            try:
-                # Cap before reading: per-file AND aggregate, so a huge non-image file (per
-                # file) or many accumulated attachments (aggregate) can't be read whole into
-                # RAM and base64-expanded into one query.
-                size = Path(p).stat().st_size
-                if size > MAX_INLINE_IMAGE_BYTES or (total + size) > MAX_INLINE_TOTAL_BYTES:
-                    failed += 1
-                    continue
-                data = Path(p).read_bytes()
-            except Exception:
-                failed += 1
-                continue
-            if not data:            # 0-byte / unreadable-as-empty → don't send a blank block
-                failed += 1
-                continue
-            total += size
             ext = Path(p).suffix.lower()
-            mt = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
-                  ".gif": "image/gif"}.get(ext, "image/png")
-            content.append({"type": "image", "source": {
-                "type": "base64", "media_type": mt,
-                "data": base64.b64encode(data).decode()}})
-        if failed:   # tell the user their screen/image didn't actually attach
-            self.ui.put(("error", f"{failed} image(s) couldn't be read and were not sent."))
+            if ext in IMAGE_EXTS:
+                block, used = self._image_block(p, total)
+            elif ext == ".pdf":
+                block, used = self._pdf_block(p, total)
+            elif ext in (".docx", ".pptx"):
+                block, used = self._doc_text_block(p, ext), 0
+            else:
+                block, used = None, 0
+            if block is None:
+                failed += 1
+                continue
+            total += used
+            content.append(block)
+        if failed:   # tell the user an attachment didn't actually make it into the turn
+            self.ui.put(("error", f"{failed} attachment(s) couldn't be read and were not sent."))
         if not content:
             return text
         msg = {"type": "user",
@@ -1017,6 +1016,95 @@ class ClaudeWorker(threading.Thread):
             yield msg
 
         return _one()
+
+    @staticmethod
+    def _image_block(p, total):
+        """One IMAGE_EXTS path → a base64 image block, or (None, 0) on any failure.
+        Capped before reading — per-file AND aggregate — so a huge file (per file) or
+        many accumulated attachments (aggregate) can't be read whole into RAM and
+        base64-expanded into one query."""
+        try:
+            size = Path(p).stat().st_size
+            if size > MAX_INLINE_IMAGE_BYTES or (total + size) > MAX_INLINE_TOTAL_BYTES:
+                return None, 0
+            data = Path(p).read_bytes()
+        except Exception:
+            return None, 0
+        if not data:            # 0-byte / unreadable-as-empty → don't send a blank block
+            return None, 0
+        ext = Path(p).suffix.lower()
+        mt = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
+              ".gif": "image/gif"}.get(ext, "image/png")
+        return {"type": "image", "source": {
+            "type": "base64", "media_type": mt,
+            "data": base64.b64encode(data).decode()}}, size
+
+    @staticmethod
+    def _pdf_block(p, total):
+        """One .pdf path → Claude's native `document` content block. Unlike .docx/.pptx
+        below, no local parsing is needed: the API extracts text and renders pages
+        server-side. Same per-file/aggregate byte caps as images — both are base64
+        inline payloads and count against the same query-size budget."""
+        try:
+            size = Path(p).stat().st_size
+            if size > MAX_INLINE_PDF_BYTES or (total + size) > MAX_INLINE_TOTAL_BYTES:
+                return None, 0
+            data = Path(p).read_bytes()
+        except Exception:
+            return None, 0
+        if not data:
+            return None, 0
+        return {"type": "document", "source": {
+            "type": "base64", "media_type": "application/pdf",
+            "data": base64.b64encode(data).decode()}}, size
+
+    def _doc_text_block(self, p, ext):
+        """One .docx/.pptx path → a plain text block. The Claude API has no native
+        document block for either format (only PDF), so the text is pulled out locally
+        with python-docx/python-pptx — charts, layout and embedded images don't survive,
+        only the words. Headed with the filename so the model knows which attachment
+        it's reading when more than one is sent."""
+        try:
+            text = self._extract_docx(p) if ext == ".docx" else self._extract_pptx(p)
+        except ImportError:
+            self.ui.put(("error", f"{Path(p).name}: Word/PowerPoint support isn't "
+                                  "installed — run update.cmd, then try again."))
+            return None
+        except Exception:
+            return None
+        if not text or not text.strip():
+            return None
+        if len(text) > MAX_INLINE_DOC_CHARS:
+            text = text[:MAX_INLINE_DOC_CHARS] + "\n[... truncated ...]"
+        return {"type": "text", "text": f"[Attached file: {Path(p).name}]\n{text}"}
+
+    @staticmethod
+    def _extract_docx(p):
+        from docx import Document   # deferred: only needed when a .docx is actually sent
+        doc = Document(p)
+        parts = [para.text for para in doc.paragraphs if para.text]
+        for table in doc.tables:
+            for row in table.rows:
+                parts.append(" | ".join(cell.text for cell in row.cells))
+        return "\n".join(parts)
+
+    @staticmethod
+    def _extract_pptx(p):
+        from pptx import Presentation   # deferred: only needed when a .pptx is actually sent
+        prs = Presentation(p)
+        parts = []
+        for i, slide in enumerate(prs.slides, 1):
+            lines = [f"--- Slide {i} ---"]
+            for shape in slide.shapes:
+                if shape.has_text_frame and shape.text_frame.text:
+                    lines.append(shape.text_frame.text)
+                if shape.has_table:
+                    for row in shape.table.rows:
+                        lines.append(" | ".join(c.text for c in row.cells))
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame.text:
+                lines.append(f"[Notes] {slide.notes_slide.notes_text_frame.text}")
+            parts.append("\n".join(lines))
+        return "\n\n".join(parts)
 
     @staticmethod
     def _msg_has_tool(msg):
