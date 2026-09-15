@@ -363,7 +363,7 @@ def _import_smoke():
     same module search path — which is the whole point of the check."""
     try:
         r = subprocess.run(
-            [sys.executable, "-c", "import claude_overlay; print('import OK', claude_overlay.__version__)"],
+            [sys.executable, "-c", "import claude_overlay, worker; print('import OK', claude_overlay.__version__)"],
             cwd=repo_dir(), capture_output=True, text=True, timeout=120,
             env=dict(os.environ, CLAUDE_OVERLAY_DIALOG="0"))   # never pop a modal in a report
         out = (r.stdout or "") + (r.stderr or "")

@@ -144,6 +144,12 @@ def _clean_overlay(ov):
     ov._quota = None                    # allowance readings are per-test: a leaked one would
     ov._quota_polled = None             # take the gauge slot away from the next test's context
     ov._quota_said = None
+    ov._ring_explained = False          # the ring introduces itself once; a leaked flag would
+                                        # silence the introduction in whichever test runs next
+    try:
+        ov._mark_leave()                # a test that hovered the mark must not leave the
+    except Exception:                   # usage panel placed over the next test's chat
+        pass
     ov.pending_images = []
     ov.pending_docs = []
     ov.pending_bad = []                 # refused-file rows are per-test: they ACCUMULATE

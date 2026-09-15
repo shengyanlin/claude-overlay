@@ -110,6 +110,35 @@ def _file_version():
         return ""
 
 
+# ── the worker's import, off the critical path ──
+# `from worker import ClaudeWorker` used to sit in the block below, and its chain
+# (claude_agent_sdk → mcp → requests → pydantic → truststore) is ~500 of this module's
+# ~630 import milliseconds — paid before there was a window to show. It now runs on a
+# background thread started HERE, before the main thread pays for tkinter and PIL, so the
+# two chains overlap; Overlay.__init__ builds and paints the whole UI first and only then
+# joins this import (see _make_worker), so the window appears without waiting for it.
+#
+# ClaudeWorker stays a module attribute because it is a PATCH POINT: the test suite
+# setattr's a FakeWorker over it before building its Overlay. The thread therefore stashes
+# the real class in _worker_import rather than assigning the global — assigning it would
+# race that patch and could hand a test a real worker with a real `claude` connection.
+ClaudeWorker = None
+_worker_import = {}                # "cls" on success, "err" on failure — set exactly once
+_worker_ready = threading.Event()
+
+
+def _import_worker_bg():
+    try:
+        from worker import ClaudeWorker as _W
+        _worker_import["cls"] = _W
+    except BaseException as e:     # even SystemExit/KeyboardInterrupt: the waiter must not hang
+        _worker_import["err"] = e
+    finally:
+        _worker_ready.set()
+
+
+threading.Thread(target=_import_worker_bg, name="worker-import", daemon=True).start()
+
 try:
     import tkinter as tk
     from tkinter import font as tkfont
@@ -122,7 +151,6 @@ try:
     from debuglog import dbg, DEBUG_LOG
     from win32utils import *
     from win32utils import _user32, _gdi32
-    from worker import ClaudeWorker
     import authstate
     import modelresolve
     import sessions
@@ -450,6 +478,20 @@ def _contrast(a, b):
     return (max(p, q) + 0.05) / (min(p, q) + 0.05)
 
 
+# Radii and stroke widths as fractions of a 32px mark, the size they were tuned at; the mark
+# is drawn at _MARK_PX and these scale with it. Inner track is the 5-hour window and is the
+# thicker of the two — it is the one that ends the session you are sitting in.
+_RING_GEOM = (("five_hour", 10.5 / 32, 3 / 32), ("week", 14.5 / 32, 2 / 32))
+_SPARK_R = 5.75 / 32           # small enough to leave clear air inside the 5h track:
+                               # when that arc goes amber it is T["accent"], the same
+                               # colour as the mark, and touching arc and mark merge
+_RING_SS = 4                      # supersample factor, then downsample: Tk's create_arc has
+                                  # no antialiasing on Windows and a 3px arc on a 36px circle
+                                  # comes out a visible staircase
+_MARK_PX = 36                     # two legible arcs plus a readable ✻ need this much room;
+                                  # the titlebar is 44px tall, so this is the largest that fits
+
+
 def _binding_window(windows):
     """The one window that earns the statusline's single text slot: whichever is furthest
     along, because the binding constraint is the limit you reach first and the rest are noise
@@ -471,11 +513,21 @@ def _binding_window(windows):
         w = (windows or {}).get(name)
         if not isinstance(w, dict):
             continue
-        u = w.get("utilization")
-        if isinstance(u, bool) or not isinstance(u, (int, float)):
+        # Compared through _quota_pct — the ONE validator — never through float(u) on the
+        # raw value: this sees POLLED data before any other validation runs (_quota_text →
+        # _gauge_quota → here is the first thing _refresh_statusline evaluates), and
+        # float() on a json-legal absurd int raises OverflowError on the Tk thread inside
+        # the ui_q drain. Comparing on the whole percent also means two readings that
+        # ROUND equal are equal, which is the tie the five_hour-first iteration order is
+        # for. The winning window is returned as it arrived, raw value and all — every
+        # consumer of the reading (the text, its colour, the ring) validates for itself,
+        # and handing them a value this function had already rewritten would hide where a
+        # bad reading came from.
+        pct = _quota_pct(w.get("utilization"))
+        if pct is None:
             continue
-        if best is None or u > best[1]:
-            best = (name, float(u))
+        if best is None or pct > best[1]:
+            best = (name, pct)
     return dict(windows[best[0]], window=best[0]) if best else None
 
 
@@ -522,9 +574,12 @@ class Overlay:
         # Resolve the remembered Read-only toggle BEFORE the worker exists: the session
         # must be LAUNCHED in the remembered mode (a plan-launched session can't be
         # elevated to bypassPermissions at run time, only started in it).
-        self.read_only, _launch_mode = _startup_permission_mode()
-        self.worker = ClaudeWorker(self.ui_q, permission_mode=_launch_mode)
-        self.worker.start()
+        self.read_only, self._launch_mode = _startup_permission_mode()
+        # The worker is NOT built here any more: its import is still finishing on the
+        # background thread started at module load, and building the whole UI first means
+        # the window is on screen while that import completes instead of after it. It is
+        # created right after the first paint at the end of _build() — before mainloop()
+        # processes any user event, so nothing that reaches self.worker can find it missing.
 
         self.auto_shot = AUTO_SCREENSHOT_DEFAULT
         self.window_shot = (SHOT_SCOPE == "window")   # True → capture only the active window
@@ -598,6 +653,8 @@ class Overlay:
                                         # Kept apart from _quota, not merged into it: this one is
                                         # fresher and so wins the DISPLAY, while everything that
                                         # speaks or sends still reads the CLI's own event above.
+        self._ring_explained = False    # the ring names itself once, when there is finally
+                                        # something to point at (see _maybe_explain_ring)
         self._quota_said = None         # status already announced, so each transition speaks once
         self._last_sent = None          # (text, images) of the last message handed to the worker,
                                         # so a refusal that never reached Claude can give it back
@@ -784,6 +841,29 @@ class Overlay:
             self.add_sys(f"⚠ {USER_CONFIG_FILE.name}: {w}")
         self._maybe_offer_resume()
 
+        # First paint, THEN the worker. update() maps and draws the window built above, so
+        # the user sees the overlay while _make_worker joins the background import — on a
+        # cold start (an EDR scanning ~800 modules) that join is the slow part, and it used
+        # to run before a single widget existed. Nothing user-driven can slip in between:
+        # the handlers update() can dispatch this early (Map/Configure/FocusIn) never touch
+        # self.worker, and everything that does is an event processed only once mainloop()
+        # runs — by which point the worker below exists.
+        # Input-disabled across the paint, at the OS level: update() is a nested event
+        # loop, so a queued mouse press COULD be dispatched by it — to a Resume button, a
+        # mode chip, any handler that touches the self.worker that does not exist yet.
+        # One update() on a window that has only just appeared makes that a
+        # millisecond-scale race nobody will ever lose, but disabled-while-building makes
+        # it not a race at all, and it costs two lines. (-disabled is Windows-specific Tk,
+        # which this whole app already is.)
+        self.root.attributes("-disabled", True)
+        try:
+            self.root.update_idletasks()
+            self.root.update()
+            self.worker = self._make_worker(self._launch_mode)
+            self.worker.start()
+        finally:
+            self.root.attributes("-disabled", False)
+
         self.root.after(130, lambda: (self.root.focus_force(), self.entry.focus_set()))
         self.root.bind("<Configure>", self._on_configure)
         self.root.bind("<Map>", self._on_map, add="+")   # restore (incl. from taskbar) re-asserts the frameless look
@@ -796,6 +876,25 @@ class Overlay:
         self._usage_poll = usage.Poller(self.ui_q)
         self._start_usage_poll()
         self._start_hang_watchdog()    # diagnostic: dumps all-thread stacks if the UI pump stalls
+
+    def _make_worker(self, mode):
+        """The worker class, from wherever it is by now.
+
+        The module global wins when set — that is the test suite's patch point (conftest
+        setattr's a FakeWorker over it), and monkeypatch restores it to None afterwards so
+        a real overlay can never inherit a stub. Otherwise wait for the background import
+        started at module load: on a warm machine it finished while the UI above was being
+        built, and on a cold one this wait is the same stall the old module-level import
+        was — minus everything that has now painted first. A failure is reported through
+        the exact channel the module-level import used, so a missing claude_agent_sdk
+        still produces the dialog that names update.cmd rather than a blank window."""
+        cls = ClaudeWorker
+        if cls is None:
+            _worker_ready.wait()
+            if "err" in _worker_import:
+                _report_import_failure(_worker_import["err"])
+            cls = _worker_import["cls"]
+        return cls(self.ui_q, permission_mode=mode)
 
     def _start_usage_poll(self):
         """Start the allowance poll, so the gauge has a number before the first message.
@@ -1118,11 +1217,34 @@ class Overlay:
         self.titlebar = bar
         bar.pack_propagate(False)
         self._bind_drag(bar)
+        sz = self.px(_MARK_PX)
+        mark = tk.Canvas(bar, width=sz, height=sz, bg=T["bg"], highlightthickness=0)
+        mark.pack(side="left", padx=(self.px(10), self.px(7)))
+        # The whole mark — allowance arcs AND the ✻ — is one supersampled image rather than
+        # Tk canvas primitives, so every curve is antialiased. See _paint_quota_ring.
+        self._mark, self._mark_sz = mark, sz
+        self._paint_quota_ring()
+        # The ring can carry the numbers but not their name. A pointer cursor says it answers
+        # to something, and <Enter> is where the answer arrives — see _usage_panel_text.
+        mark.configure(cursor="hand2")
+        mark.bind("<Enter>", self._mark_enter, add="+")
+        mark.bind("<Leave>", self._mark_leave, add="+")
+        # Deliberately a child of root rather than a Toplevel. The capture exclusion that keeps
+        # the overlay out of screen shares — and out of the screenshots we send Claude — is set
+        # on the root HWND (see _apply_share_visibility) and a new top-level window does not
+        # inherit it: the panel would show up in a Teams share while the overlay itself did not,
+        # and would land inside our own grabs, because capture() skips its withdraw dance
+        # whenever the exclusion is active. A placed child inherits all of that for nothing.
+        self._usage_panel = tk.Label(self.root, text="", bg=T["tool_bg"], fg=T["text"],
+                                     font=self.f_mono, justify="left", anchor="w",
+                                     padx=self.px(10), pady=self.px(8),
+                                     highlightthickness=1, highlightbackground=T["border"])
+        self._bind_drag(mark)
         # The title doubles as the rename target: click it (without dragging) to edit this
         # overlay's name; dragging it still moves the window (moved-detection, like the orb).
         self.title_lbl = tk.Label(bar, text=self.overlay_name or "Claude", bg=T["bg"],
                                   fg=T["text"], font=self.f_title, cursor="hand2")
-        self.title_lbl.pack(side="left", padx=(self.px(10), 0))
+        self.title_lbl.pack(side="left")
         self.title_lbl.bind("<ButtonPress-1>", self._title_press)
         self.title_lbl.bind("<B1-Motion>", self._title_drag)
         self.title_lbl.bind("<ButtonRelease-1>", self._title_release)
@@ -5217,6 +5339,7 @@ class Overlay:
         q = self._quota_text()
         self.quota_lbl.configure(text=(f"·   {q}" if q else ""), fg=self._gauge_color())
         self.ver_lbl.configure(text=f"·   {ver}", fg=T["muted"])
+        self._paint_quota_ring()
 
     # ── the middle of the statusline ──
     def _ctx_text(self):
@@ -5232,10 +5355,12 @@ class Overlay:
         """The allowance segment: which window, how far through it, and — only once it is
         worth planning around — when it comes back.
 
-        The window is NAMED rather than implied by position. That is the whole reason this is
-        text again: two arcs could carry both figures at once but neither label, so an unnamed
-        reading had to be dropped instead of drawn, and a "week/opus" window had nowhere to
-        say so. Reset time is held back until the warning tier because it is the longest part
+        The window is NAMED rather than implied by position — the one thing text does that
+        the ring on ✻ cannot: an arc carries no label, so an unnamed reading is dropped from
+        the ring rather than drawn, and a "week/opus" window has nowhere on it to say what it
+        is. The two are layers, not copies: the ring shows both windows at a glance, this
+        segment names the binding one and carries its reset time. Which is also why the reset
+        time is held back until the warning tier — it is the longest part
         of the string and useless while you have most of the allowance left — the row has to
         stay narrow enough that the version does not clip."""
         q = self._gauge_quota()
@@ -5305,6 +5430,186 @@ class Overlay:
             if st == "allowed_warning" or pct >= _QUOTA_WARN * 100:
                 return T["accent"]
         return T["muted"]
+
+    def _quota_windows(self):
+        """Every allowance window we can place on the ring, keyed by name — each one already
+        validated through _quota_pct and carrying utilization as a clean 0-1 float.
+
+        The poll carries all of them. The CLI's own event carries exactly one, and only
+        sometimes names it — an unnamed one is DROPPED rather than parked on whichever track
+        is handy, because putting a weekly reading on the 5-hour arc would be a lie the user
+        has no way to see through. The statusline text still prints that number, so staying
+        silent here costs nothing.
+
+        Validation happens HERE, at the source, and nowhere downstream: the ring, the hover
+        panel and _binding_window all read what this returns, on the Tk thread inside the
+        ui_q drain, where one exception kills the callback that delivers every other queued
+        event. The first restored cut of this did `float(u)` on whatever arrived, and a
+        json-legal absurd int overflows float() — the exact class of latent crash _quota_pct
+        was written to end. A window whose reading fails the validator is dropped whole,
+        reset time included: a reset clock on a reading that isn't a reading labels nothing.
+        """
+        w = (self._quota_polled or {}).get("windows")
+        if isinstance(w, dict):
+            out = {}
+            for name, win in w.items():
+                pct = _quota_pct(win.get("utilization")) if isinstance(win, dict) else None
+                if pct is not None:
+                    out[name] = dict(win, utilization=pct / 100.0)
+            if out:
+                return out
+        q = self._quota or {}
+        pct = _quota_pct(q.get("utilization"))
+        if q.get("window") in _QUOTA_WINDOWS and pct is not None:
+            return {q["window"]: {"utilization": pct / 100.0, "resets_at": q.get("resets_at")}}
+        return {}
+
+    def _ring_color(self, u, quiet):
+        """Recessive until it isn't. An arc carries no number, so colour is the only channel
+        it has for urgency — hence its own amber step rather than waiting for the CLI's."""
+        if u >= _QUOTA_HOT:
+            return T["err"]
+        if u >= _QUOTA_WARN:
+            return T["accent"]
+        return quiet
+
+    def _ring_track(self):
+        """The empty part of a gauge, in a tone you can actually see.
+
+        The first cut used T["border"], which is 1.2:1 against the surface — exactly right for
+        a hairline between two panels and completely invisible as a track, so a fresh overlay
+        with no reading yet drew a mark that looked untouched. _contrast pins the replacement
+        rather than trusting the eye that missed it the first time."""
+        return _mix(T["bg"], T["faint"], 0.70)   # 1.8:1 light, 2.1:1 dark — seen, not shouted
+
+    def _ring_windows(self):
+        """The two tracks, each resolved to the one window it stands for. Shared by the ring
+        and by the hover text so a number and its label can never come from different windows."""
+        wins = self._quota_windows()
+        return {"five_hour": wins.get("five_hour"),
+                "week": _binding_window({k: v for k, v in wins.items() if k != "five_hour"})}
+
+    def _ring_arcs(self):
+        """What each track should show: {track: (fraction, colour)}, tracks with nothing to
+        say left out. Kept separate from the drawing so the numbers and colours can be tested
+        without decoding a bitmap."""
+        out = {}
+        for key, w in self._ring_windows().items():
+            u = (w or {}).get("utilization")
+            if isinstance(u, bool) or not isinstance(u, (int, float)) or u <= 0.005:
+                continue           # a hairline at 0% would read as "something is used"
+            out[key] = (min(1.0, float(u)), self._ring_color(u, T["muted"]))
+        return out
+
+    def _paint_quota_ring(self):
+        """The ✻ mark, ringed by two allowance gauges: the 5-hour window inside, the weekly
+        one outside.
+
+        WHY TWO, AND WHY A RING WHEN THE ROW HAS TEXT. The statusline's allowance segment
+        stays, and stays text: it is the only place the window's NAME and its reset time fit,
+        and an unnamed or "week/opus" reading has nowhere on an arc to say what it is. What
+        the text cannot do is carry more than one window, and the one its binding-window rule
+        hides is the 5-hour gauge for exactly as long as it sits below the weekly number —
+        which is where it is every time you sit down to work. Two fixed tracks show both at
+        once without needing a label each: position IS the label, and the thicker inner one
+        is the window that ends the session you are sitting in. The two displays are layers,
+        not copies — the ring is the glance, the text is the sentence.
+
+        Two arcs are also the honest reading of the data. The weekly window climbs slowly in
+        the background; the 5-hour one can go from a tenth to spent in an afternoon. Both are
+        the same unit (share of an allowance) on the same 0-1 scale, so drawing them together
+        is one scale, not two. The sweep runs clockwise from 12 o'clock, the direction a
+        clock face reads, which is what a window that empties and refills on a timer is.
+
+        WHY AN IMAGE. Tk's create_arc is not antialiased on Windows, and a 3px stroke on a
+        36px circle comes out a visible staircase — the first cut of this was drawn with
+        canvas primitives and was unreadable at real size. Everything is rendered at
+        _RING_SS× into one PIL image, downsampled, and placed as a single canvas item, so
+        every curve (including the ✻ itself) is smooth. The photo is kept on the instance
+        because Tk holds only a weak claim on a PhotoImage — drop the Python reference and
+        the mark goes blank.
+        """
+        c = getattr(self, "_mark", None)
+        if c is None:              # a repaint can land before the titlebar is built
+            return
+        sz = self._mark_sz
+        S = sz * _RING_SS
+        im = Image.new("RGB", (S, S), T["bg"])
+        d = ImageDraw.Draw(im)
+        arcs, track = self._ring_arcs(), self._ring_track()
+        for key, rf, wf in _RING_GEOM:
+            r, lw = S * rf, max(1, round(S * wf))
+            box = [S / 2 - r, S / 2 - r, S / 2 + r, S / 2 + r]
+            # The empty track is always drawn: an arc with nothing behind it reads as a
+            # fragment of something rather than as "this much of that".
+            d.arc(box, 0, 360, fill=track, width=lw)
+            a = arcs.get(key)
+            if a:
+                d.arc(box, -90, -90 + 360 * a[0], fill=a[1], width=lw)
+        self._draw_spark_pil(d, S)
+        self._ring_photo = ImageTk.PhotoImage(im.resize((sz, sz), Image.LANCZOS))
+        c.delete("ring")
+        c.create_image(sz / 2, sz / 2, image=self._ring_photo, tags="ring")
+
+    def _draw_spark_pil(self, d, S):
+        """The ✻ at the centre of the mark, into the same supersampled image as the rings.
+        Round tips are ellipses because PIL has no cap style; at _RING_SS× they land as the
+        same shape Tk's capstyle="round" used to give."""
+        import math
+        cx = cy = S / 2
+        r, w = S * _SPARK_R, max(1, round(S * 2 / 32))
+        for i in range(12):
+            a = math.pi * i / 6
+            r1 = r if i % 2 == 0 else r * 0.5
+            x, y = cx + r1 * math.cos(a), cy + r1 * math.sin(a)
+            d.line([cx, cy, x, y], fill=T["accent"], width=w)
+            d.ellipse([x - w / 2, y - w / 2, x + w / 2, y + w / 2], fill=T["accent"])
+
+    def _usage_panel_text(self):
+        """Everything about usage, in one aligned block, for the panel the mark opens.
+
+        No unlabelled gauge explains itself. What makes one learnable is being able to
+        interrogate it, and the answer belongs where the asking happened — beside the mark,
+        not down in a status row that then reflows under the cursor. Both allowance windows
+        and context sit here together because they are the same question asked three ways,
+        and because context's turns figure lives here rather than making the row grow."""
+        rows = []
+        wins = self._ring_windows()
+        for key, label in (("five_hour", "5h"), ("week", "week")):
+            u = (wins.get(key) or {}).get("utilization")
+            if isinstance(u, bool) or not isinstance(u, (int, float)):
+                continue
+            rows.append((label, f"{u * 100:.0f}%", self._quota_resets_text(wins[key])))
+        if not rows:
+            rows.append(("allowance", "—", "no reading yet"))
+        p = self._ctx_pct
+        if isinstance(p, (int, float)):
+            left = self._ctx_turns_left()
+            rows.append(("context", f"{p:.0f}%",
+                         f"~{left} turn{'' if left == 1 else 's'} left" if left is not None else ""))
+        w = max(len(r[0]) for r in rows)
+        return "\n".join(f"{a.ljust(w)}   {b:>4}   {c}".rstrip() for a, b, c in rows)
+
+    def _mark_enter(self, _e=None):
+        self._usage_panel.configure(text=self._usage_panel_text())
+        # Just under the titlebar, left-aligned with the mark it belongs to.
+        self._usage_panel.place(x=self.px(10), y=self.px(42))
+        self._usage_panel.lift()
+
+    def _mark_leave(self, _e=None):
+        self._usage_panel.place_forget()
+
+    def _maybe_explain_ring(self):
+        """Name the ring once, the first time there is something to point at.
+
+        A first-time reader has no way to guess that two arcs around a logo are a plan
+        allowance — the shape can carry the numbers but not their meaning. One sentence, said
+        once, is the only thing that closes that gap; after that the hover carries it."""
+        if self._ring_explained or not self._ring_arcs():
+            return
+        self._ring_explained = True
+        self.add_sys("◔ The ring on ✻ is your plan allowance — the inner arc is the 5-hour "
+                     "window, the outer one is weekly. Hover the mark for the numbers.")
 
     def _ctx_color(self):
         p = self._ctx_pct
@@ -5981,6 +6286,7 @@ class Overlay:
         elif kind == "quota":
             self._quota = payload if isinstance(payload, dict) else None
             self._refresh_statusline()
+            self._maybe_explain_ring()
             self._announce_quota()
             # The CLI saying the allowance is no longer rejected beats waiting for a clock we
             # only ever got a prediction of. A retry is only ever armed after a rejection, so
@@ -6003,6 +6309,7 @@ class Overlay:
             if isinstance(payload, dict):
                 self._quota_polled = payload
                 self._refresh_statusline()
+                self._maybe_explain_ring()
         elif kind == "turn_done":
             self._md_finalize()          # the turn ended → give the last line full block styling
             self._finish_turn_copy()     # then a Copy button under the reply
@@ -6272,6 +6579,62 @@ class Overlay:
         self.root.mainloop()
 
 
+def _write_interpreter_cache():
+    """Record which interpreter is running the app, for the launcher's fast path.
+
+    Every `call python -c "pass"` probe in `Start Claude Overlay.cmd` is a full process
+    spawn through the endpoint scanner — measured 1-8s EACH on this machine — and the
+    launcher runs one per candidate on every start, to answer a question that stops being
+    open the moment the app is actually running. So the app answers it here: the launcher
+    reads this file and starts the recorded interpreter directly behind a plain `if exist`
+    (a file stat, not a spawn). A stale or deleted path fails that check and the launcher
+    falls back to its full scan, so the worst case is exactly the old behaviour.
+
+    Split from _remember_interpreter (the thread wrapper) so a test can call the write
+    synchronously. Same folder crashreport uses — %LOCALAPPDATA% is local, never OneDrive."""
+    # ASCII-only, and encoded BEFORE the file is opened. There is no codec that reliably
+    # matches the reader: `set /p` on redirected input decodes in the CONSOLE code page
+    # (OEM, changeable with chcp), not the ANSI one, so any non-ASCII byte can arrive as
+    # a different character on the other side and fail the launcher's `if exist` — while
+    # ASCII is the same bytes in every OEM and ANSI page there is. A non-ASCII
+    # interpreter path therefore writes NOTHING: encoding first means the raise happens
+    # before open() can truncate an existing record into a zero-byte file, so the cache
+    # is either a complete usable line or absent — never half. That machine keeps the
+    # full scan, which is slower and correct.
+    data = sys.executable.encode("ascii")   # raises before any file is touched
+    d = Path(os.environ["LOCALAPPDATA"]) / "claude-overlay"
+    d.mkdir(parents=True, exist_ok=True)
+    # No trailing newline: cmd's `set /p` reads one line, and a bare path is one line.
+    (d / "pythonw_path.txt").write_bytes(data)
+
+
+def _worth_caching(exe):
+    """Only a WINDOWLESS interpreter earns the cache. The launcher's last-resort console
+    fallback runs `python.exe`, which reaches __main__ like any launch — and remembering
+    it would pin a console flash onto every future start, even after a pythonw.exe is
+    installed, because the fast path never scans. (pyw launches also land here as
+    pythonw.exe: the py launcher execs the real interpreter, and sys.executable is what
+    actually runs.) A machine whose only Python IS python.exe just keeps the full scan —
+    slower, but never wrong."""
+    return os.path.basename(str(exe)).lower().startswith("pythonw")
+
+
+def _remember_interpreter():
+    """_write_interpreter_cache off the UI thread, failure swallowed: the cache is an
+    optimisation, and a machine where it can't be written just keeps the full scan."""
+    if not _worth_caching(sys.executable):
+        return
+    def w():
+        try:
+            _write_interpreter_cache()
+        except Exception:
+            pass
+    try:
+        threading.Thread(target=w, name="interp-cache", daemon=True).start()
+    except Exception:
+        pass
+
+
 def _selfheal_taskbar_shortcut():
     """Make sure the Start Menu shortcut (matching AppUserModelID) exists so the overlay
     pins to the taskbar correctly — relaunches when closed and shows the Clawd icon, not
@@ -6294,6 +6657,8 @@ if __name__ == "__main__":
         set_dpi_awareness()
         set_app_user_model_id()   # before any window, so the taskbar uses our icon
         _selfheal_taskbar_shortcut()
+        _remember_interpreter()    # __main__ only: a pytest import must never cache the
+                                   # console python.exe it runs under as the app's launcher
         try:
             Overlay().run()
         except KeyboardInterrupt:
