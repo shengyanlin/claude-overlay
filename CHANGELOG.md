@@ -3,7 +3,7 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.21.0] - 2026-09-15
 
 Attach files, not just screenshots — and the plan allowance comes back to the
 statusline as text.
