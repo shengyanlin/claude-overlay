@@ -1,0 +1,25 @@
+# Optional: Word (.docx) and PowerPoint (.pptx) attachment support for the attach button.
+#
+# WHY THIS IS A SEPARATE FILE.
+# update.cmd installs requirements.txt and treats ANY failure as fatal - deliberately,
+# because pip removes the old version before installing the new one, so a half-finished
+# upgrade leaves an install that cannot start, and "[OK] Updated" printed over the top of
+# that is worse than an error. That policy is right for the three packages the app cannot
+# run without. It is wrong for these two.
+#
+# python-docx and python-pptx both pull in lxml, which is a COMPILED extension. Where
+# lxml has no wheel for the Python in use - a version too new, an unusual platform, a
+# proxy that blocks the sdist - pip fails, and with these two in requirements.txt that
+# failure would abort the whole updater and block the app itself over a file-attachment
+# convenience nobody may even use. So they get their own pass, and its failure is only a
+# warning.
+#
+# Everything is already built for them being absent: the imports in worker.py are
+# deferred to the moment a .docx/.pptx is actually sent, preflight.py reports each as a
+# WARN rather than a FAIL, and _doc_text_block catches ImportError and names the command
+# that installs them. PDF and image attachments do not touch either package.
+#
+# Not pinned, for the same reason as requirements.txt: floors, so a clean CI runner tests
+# what a new user would actually get.
+python-docx>=1.0.0
+python-pptx>=0.6.23

@@ -37,8 +37,8 @@ def gauge(overlay):
 
 
 class TestGaugeText:
-    """The allowance has no visible gauge; the row keeps context, which says nothing about
-    the allowance either. _announce_quota (TestAnnouncements) is what still speaks it."""
+    """Context keeps this slot unconditionally. The allowance has a slot of its own beside
+    it (TestAllowanceSegment) instead of competing for this one."""
 
     def test_context_falls_back_when_no_event_has_arrived(self, gauge):
         # An older CLI, or a session that hasn't transitioned yet. An empty gauge would be
@@ -54,7 +54,7 @@ class TestGaugeText:
 
     def test_context_no_longer_has_to_earn_the_slot(self, gauge):
         """It used to be squeezed out by the allowance and let back in only above its own
-        warning line. With the allowance on the ring there is nothing left to compete with."""
+        warning line. The allowance has its own label now, so nothing competes for this."""
         gauge._ctx_pct = 2
         gauge._handle("quota", _q(util=0.78))
         assert "context 2%" in gauge.ctx_lbl.cget("text")
@@ -63,7 +63,111 @@ class TestGaugeText:
         gauge._ctx_pct = 88
         gauge._handle("quota", _q(util=0.30))
         text = gauge.ctx_lbl.cget("text")
-        assert "context 88%" in text and "quota" not in text
+        assert "context 88%" in text and "5h" not in text
+
+
+class TestAllowanceSegment:
+    """The allowance, back in the statusline as text after a spell as two arcs on the
+    titlebar mark. Text because a number needs its window NAMED: position can label two
+    fixed tracks, but it cannot say "week/opus", and an unnamed reading had to be dropped
+    rather than drawn onto whichever arc was handy."""
+
+    def test_it_names_the_window_and_the_number(self, gauge):
+        gauge._handle("quota", _q(util=0.61, window="five_hour"))
+        assert "5h 61%" in gauge.quota_lbl.cget("text")
+
+    def test_a_weekly_window_says_so(self, gauge):
+        gauge._handle("quota", _q(util=0.44, window="seven_day"))
+        assert "week 44%" in gauge.quota_lbl.cget("text")
+
+    def test_per_model_weekly_windows_keep_their_qualifier(self, gauge):
+        """The thing two arcs could not express: which weekly allowance this is."""
+        gauge._handle("quota", _q(util=0.5, window="seven_day_opus"))
+        assert "week/opus 50%" in gauge.quota_lbl.cget("text")
+
+    def test_nothing_to_report_leaves_the_segment_empty(self, gauge):
+        gauge._ctx_pct = 20
+        gauge._refresh_statusline()
+        assert gauge.quota_lbl.cget("text") == ""
+
+    def test_a_barely_touched_allowance_stays_quiet(self, gauge):
+        """"5h 0%" is chrome that says nothing, and it would cost the row width on a narrow
+        overlay — which is what pushed the version off the end the first time round."""
+        gauge._handle("quota", _q(util=0.001))
+        assert gauge.quota_lbl.cget("text") == ""
+
+    def test_a_malformed_reading_is_dropped_not_printed(self, gauge):
+        gauge._handle("quota", {"status": "allowed", "utilization": None})
+        assert gauge.quota_lbl.cget("text") == ""
+
+    def test_a_boolean_is_not_a_percentage(self, gauge):
+        gauge._handle("quota", {"status": "allowed", "utilization": True, "window": "five_hour"})
+        assert gauge.quota_lbl.cget("text") == ""
+
+    def test_context_and_allowance_are_shown_together(self, gauge):
+        """They answer different questions — how big this conversation is, versus how much
+        of the plan is left — so neither is a duplicate of the other."""
+        gauge._ctx_pct = 34
+        gauge._handle("quota", _q(util=0.61))
+        assert "context 34%" in gauge.ctx_lbl.cget("text")
+        assert "5h 61%" in gauge.quota_lbl.cget("text")
+
+    def test_reset_time_is_held_back_until_it_matters(self, gauge):
+        gauge._handle("quota", _q(util=0.20))
+        assert "resets" not in gauge.quota_lbl.cget("text")
+
+    def test_reset_time_appears_once_you_need_to_plan_around_it(self, gauge):
+        gauge._handle("quota", _q(util=0.80))
+        assert "resets" in gauge.quota_lbl.cget("text")
+
+    def test_the_polled_reading_wins_the_segment(self, gauge):
+        """usage.py polls every minute; the CLI speaks only on transitions, so its copy can
+        be hours stale — and idle hours are exactly when the number is worth a look."""
+        gauge._handle("quota", _q(util=0.10, window="five_hour"))
+        gauge._handle("quota_poll", {"windows": {
+            "five_hour": {"utilization": 0.55, "resets_at": None},
+            "seven_day": {"utilization": 0.20, "resets_at": None}}})
+        assert "5h 55%" in gauge.quota_lbl.cget("text")
+
+    def test_the_binding_window_is_the_one_shown(self, gauge):
+        gauge._handle("quota_poll", {"windows": {
+            "five_hour": {"utilization": 0.20, "resets_at": None},
+            "seven_day": {"utilization": 0.71, "resets_at": None}}})
+        assert "week 71%" in gauge.quota_lbl.cget("text")
+
+
+class TestAllowanceColour:
+
+    def test_quiet_below_the_warning_line(self, gauge):
+        gauge._handle("quota", _q(util=0.30))
+        assert gauge.quota_lbl.cget("fg") == co.T["muted"]
+
+    def test_the_cli_saying_warning_turns_it_amber(self, gauge):
+        gauge._handle("quota", _q(status="allowed_warning", util=0.30))
+        assert gauge.quota_lbl.cget("fg") == co.T["accent"]
+
+    def test_a_statusless_polled_reading_still_earns_amber(self, gauge):
+        """A poll carries no status at all. Without a threshold of our own, a polled 80%
+        would sit in muted grey right up to _QUOTA_HOT."""
+        gauge._handle("quota_poll", {"windows": {
+            "five_hour": {"utilization": 0.80, "resets_at": None}}})
+        assert gauge.quota_lbl.cget("fg") == co.T["accent"]
+
+    def test_red_at_the_hot_line_even_while_the_cli_says_allowed(self, gauge):
+        gauge._handle("quota", _q(status="allowed", util=0.94))
+        assert gauge.quota_lbl.cget("fg") == co.T["err"]
+
+    def test_rejected_is_red_whatever_the_number(self, gauge):
+        gauge._handle("quota", _q(status="rejected", util=0.10))
+        assert gauge.quota_lbl.cget("fg") == co.T["err"]
+
+    def test_context_does_not_follow_the_allowance(self, gauge):
+        """Two numbers, two tiers, two labels. One recolouring for the other's sake is how
+        a row starts lying about which figure is the problem."""
+        gauge._ctx_pct = 10
+        gauge._handle("quota", _q(status="rejected", util=1.0))
+        assert gauge.quota_lbl.cget("fg") == co.T["err"]
+        assert gauge.ctx_lbl.cget("fg") == co.T["muted"]
 
 
 class TestGaugeColour:

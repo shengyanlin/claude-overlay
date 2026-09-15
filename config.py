@@ -248,14 +248,30 @@ DOC_EXTS = (".pdf", ".docx", ".pptx")   # non-image files the 📎 picker accept
                             # python-pptx) and sent as plain text - charts/layout are lost.
 MAX_INLINE_PDF_BYTES = 32 * 1024 * 1024   # Claude's own per-PDF ceiling; refuse locally with
                             # a clear message instead of spending the upload on a rejection
+MAX_INLINE_DOC_BYTES = 64 * 1024 * 1024   # .docx/.pptx are gated on FILE size only to keep an
+                            # absurd file from being unzipped at all — nothing like it is
+                            # uploaded, since only the extracted text is sent and that has its
+                            # own char caps below. Deliberately far looser than the image and
+                            # PDF ceilings, which are real payload limits: a 40MB deck of
+                            # screenshots may hold two pages of words, and refusing it on
+                            # weight alone tells the user their file is too big to send when
+                            # the thing we would send is tiny.
 MAX_INLINE_DOC_CHARS = 200_000   # cap extracted Word/PPT text (~50k tokens) so one huge
                             # attachment can't blow past the context on its own
+MAX_INLINE_DOC_TOTAL_CHARS = 400_000   # ... and an aggregate, because the per-file cap alone
+                            # multiplies: MAX_PENDING_IMAGES docs each just under the per-file
+                            # limit would be ~800k tokens of text, which no context survives.
+                            # Bytes cannot express this — the aggregate byte budget sees
+                            # extracted text as a rounding error while the model sees a flood.
 TOOL_IDLE_TIMEOUT = 1800    # once a tool call is in flight, allow a much longer silent gap
                             # (a long build/test can legitimately stream nothing for minutes)
 COMPACT_IDLE_TIMEOUT = 600  # /compact is one big summarization round-trip that streams nothing
                             # for a while (≈30s even on a small context); bound it generously
 MAX_PASTE_SOURCES = 8       # cap how many files one paste fans out into
-MAX_PENDING_IMAGES = 16     # cap total queued attachments (a hostile clipboard can't pile up)
+MAX_PENDING_IMAGES = 16     # cap total queued attachments (a hostile clipboard can't pile up).
+                            # ONE budget shared by pasted images and 📎 files, not 16 of each —
+                            # the name predates files being attachable at all. Kept rather
+                            # than renamed so an existing config.json override keeps working.
 QUEUE_MESSAGES = True       # Enter while a reply is streaming LINES THE MESSAGE UP (the
                             # Claude Code CLI's behaviour) instead of interrupting the turn:
                             # you can type two or three follow-ups ahead and they go out one
@@ -266,7 +282,8 @@ MAX_QUEUED = 10             # cap the line-up; past this Enter says so and keeps
 MAX_PASTE_PIXELS = 32_000_000   # reject a pasted image above this pixel count BEFORE decode/
                             # thumbnail — a "decompression bomb" PNG decodes to a huge bitmap
                             # (Pillow only *warns*, doesn't raise, below ~178M px)
-MAX_INLINE_IMAGES = 16      # cap images per turn (count) ...
+MAX_INLINE_IMAGES = 16      # cap ATTACHMENTS per turn (count) — images, PDFs and extracted
+                            # Word/PPT text all share it; the name predates the last two ...
 MAX_INLINE_TOTAL_BYTES = 32 * 1024 * 1024   # ... and aggregate bytes (the per-file cap alone
                             # doesn't bound many-attachment memory blow-up)
 MAX_UPDATE_BODY = 1 * 1024 * 1024   # cap the update-check response body before json.loads

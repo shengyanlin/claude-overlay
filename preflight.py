@@ -79,18 +79,24 @@ def _console_twin(interpreter):
     return interpreter
 
 
-def pip_command(interpreter=None):
+def pip_command(interpreter=None, req="requirements.txt"):
     """The install command for THIS interpreter. Spelled with a full path rather than
     a bare `pip`, because "I already installed it" almost always means "into the other
     Python" — this is the only form that can't land in the wrong one. The path is the
     console twin of the interpreter (see _console_twin): same environment, visible output.
 
-    Installs from requirements.txt rather than naming the packages, so following this
+    Installs from a requirements file rather than naming the packages, so following this
     advice cannot land a version the app was never tested against. Naming them here is how
-    the pinned file ended up constraining nobody."""
+    the pinned file ended up constraining nobody.
+
+    `req` chooses WHICH file, because there is now more than one and the remedy has to
+    match the problem: the optional Word/PowerPoint packages live in requirements-docs.txt,
+    so handing out the default command for a missing python-docx would be advice that
+    provably cannot fix it. A remedy that doesn't work is worse than none — it spends the
+    reader's trust before they find out."""
     return '"%s" -m pip install --upgrade -r "%s"' % (
         _console_twin(interpreter or sys.executable),
-        os.path.join(repo_dir(), "requirements.txt"))
+        os.path.join(repo_dir(), req))
 
 
 def required_sdk_symbols():
@@ -264,14 +270,19 @@ def check():
             f"still runs, but the Ctrl+Alt+Space global hotkey won't work",
             pip_command()))
 
+    # Optional by design, so WARN not FAIL - and the remedy points at the file these two
+    # actually live in (requirements-docs.txt), which is NOT the one the default command
+    # installs. They pull in lxml, a compiled extension, so "missing" here is an ordinary
+    # outcome on a Python with no lxml wheel rather than a broken install.
     try:
         import docx  # noqa: F401
     except Exception as e:
         problems.append(Problem(
             WARN, "python-docx",
             f"the `python-docx` package isn't usable ({e.__class__.__name__}) - the "
-            f"overlay still runs, but attaching a .docx file will fail",
-            pip_command()))
+            f"overlay still runs and images/PDFs still attach, but attaching a .docx "
+            f"file will report that support is missing",
+            pip_command(req="requirements-docs.txt")))
 
     try:
         import pptx  # noqa: F401
@@ -279,8 +290,9 @@ def check():
         problems.append(Problem(
             WARN, "python-pptx",
             f"the `python-pptx` package isn't usable ({e.__class__.__name__}) - the "
-            f"overlay still runs, but attaching a .pptx file will fail",
-            pip_command()))
+            f"overlay still runs and images/PDFs still attach, but attaching a .pptx "
+            f"file will report that support is missing",
+            pip_command(req="requirements-docs.txt")))
 
     # --- am I even inspecting the right Python? ---------------------------------
     # Reported as a WARN, not a FAIL: this report may legitimately be run by a different
