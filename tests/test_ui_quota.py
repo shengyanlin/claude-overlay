@@ -201,6 +201,21 @@ class TestAllowanceColour:
         gauge._handle("quota", _q(status="rejected", util=0.10))
         assert gauge.quota_lbl.cget("fg") == co.T["err"]
 
+    def test_the_tier_follows_the_number_on_screen_not_the_raw_reading(self, gauge):
+        """0.749 renders as "75%" and goes amber, even though 0.749 < _QUOTA_WARN. That is
+        the intended reading of the rule, not a rounding accident: a label showing "75%" in
+        muted grey is the same defect _QUOTA_HOT's own comment names one tier up — a grey
+        94% reads as nothing being wrong. Colour and number have to agree, and the number is
+        the one on screen. Pinned so the half-percent isn't "corrected" back later."""
+        gauge._handle("quota", _q(status="allowed", util=0.749))
+        assert "75%" in gauge.quota_lbl.cget("text")
+        assert gauge.quota_lbl.cget("fg") == co.T["accent"]
+
+    def test_a_reading_that_rounds_below_the_tier_stays_quiet(self, gauge):
+        gauge._handle("quota", _q(status="allowed", util=0.744))
+        assert "74%" in gauge.quota_lbl.cget("text")
+        assert gauge.quota_lbl.cget("fg") == co.T["muted"]
+
     def test_a_reading_the_text_refuses_is_not_coloured_as_spent(self, gauge):
         """Colour and text go through ONE validator. The second copy drifted at once: the
         colour check accepted any int-or-float, so True read as 100% and infinity read as

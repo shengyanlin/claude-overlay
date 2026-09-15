@@ -415,6 +415,14 @@ def _quota_pct(u):
     Clamped at 100 the way the arcs were (min(1.0, u)): an allowance can be reported past
     its limit, and "5h 340%" reads as a bug in the overlay rather than a fact about the
     account.
+
+    Rounding here shifts the tier boundaries by half a percent, and that is deliberate:
+    every caller compares against THIS number, so 0.749 rounds to 75 and goes amber where
+    a raw `0.749 >= 0.75` would not. Keep it. The alternative is a label reading "75%" in
+    muted grey, which is the same defect _QUOTA_HOT's comment already names one tier up —
+    a grey 94% reads as nothing being wrong. Colour and number must agree, and the number
+    is the one on screen. Half a percent of earliness costs nothing; a gauge that
+    contradicts itself costs the reader's trust in the whole row.
     """
     if isinstance(u, bool) or not isinstance(u, (int, float)):
         return None
