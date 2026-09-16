@@ -3,6 +3,30 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Anonymous usage reporting, and it is on by default.** One `GET` per launch carrying
+  four values — the overlay version, a random per-install `uuid4`, the OS build, and your
+  Python `major.minor` — to `https://claude-overlay-telemetry.paperlane.workers.dev/v`.
+  Nothing you type, nothing the model replies, no screenshots, no paths, no usernames: the
+  request is built by one function that is handed a version and an id and can reach
+  nothing else, and a test pins the field set so a fifth cannot arrive quietly. The values
+  travel in the query string rather than a body so you can paste the URL into a browser
+  and watch exactly what leaves.
+
+  **This is opt-out and there is no dialog.** [PRIVACY.md](PRIVACY.md) is the disclosure
+  that replaces one, and reading it before upgrading is the point of this entry being
+  first. `DO_NOT_TRACK=1` wins over everything; `CLAUDE_OVERLAY_TELEMETRY=0` or
+  `{"TELEMETRY": false}` also stops it; so does `{"TELEMETRY_URL": ""}`. All three are
+  re-read on every launch, so switching it off takes effect on the next start rather than
+  the next reinstall, and `Diagnose` prints a `telemetry` line naming whichever gate
+  decided. The endpoint must be `https` or the ping is refused rather than sent in clear,
+  and a redirect is never followed — the install id goes to the host in `config.py` or
+  nowhere. Point `TELEMETRY_URL` at your own collector if you would rather have your own
+  numbers. What the page cannot promise, it says it cannot promise: the receiving server's
+  source is not published.
+
 ## [1.22.1] - 2026-09-16
 
 ### Fixed

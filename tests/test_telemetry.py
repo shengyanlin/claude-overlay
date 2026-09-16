@@ -2,10 +2,13 @@
 drive it.
 
 Nothing here opens a socket: `send` is exercised through a fake opener and the Overlay
-tests stub the module's `ping`. The most important test in the file is the dullest one —
-`test_shipped_defaults_send_nothing` — because the claim in PRIVACY.md is not "we send
-very little", it is "a stock build sends nothing", and that claim is only worth what a
-test makes of it.
+tests stub the module's `ping`. The two most important tests are the dullest ones —
+`test_the_committed_endpoint_is_the_one_privacy_md_names` and
+`test_the_committed_default_really_does_send` — because since the endpoint was filled in
+the claim in PRIVACY.md is no longer "a stock build sends nothing" but "a stock build
+sends exactly this, to exactly here". Both halves have to be pinned against the real
+committed config rather than a test-local copy of it, or the page and the code can drift
+apart without anything going red.
 """
 import os
 import tempfile
@@ -360,20 +363,19 @@ class TestOverlayInstallId:
 
 
 class TestOverlayPing:
-    def test_the_committed_endpoint_is_empty(self):
-        """The claim PRIVACY.md makes, pinned against the file rather than a copy of it.
+    def test_the_committed_endpoint_is_the_one_privacy_md_names(self):
+        """WHERE a stock build reports to, pinned against the file rather than a copy.
 
         Read out of a FRESH config module with no user config and no env override, so it
-        cannot be satisfied by whatever this process happens to have imported. The first
-        version of this test monkeypatched the URL to "" and then asserted nothing was
-        sent — which would have stayed green on the day someone committed a live
-        endpoint, i.e. exactly the day it needed to fail.
+        cannot be satisfied by whatever this process happens to have imported. Until the
+        endpoint was filled in this test asserted the URL was empty, as the tripwire for
+        the day it stopped being — that day came, so the tripwire moved rather than went
+        away: it now pins the exact host.
 
-        This is a tripwire, not a prohibition. When an endpoint is genuinely added, this
-        test SHOULD fail: that failure is the prompt to update PRIVACY.md's "Status" line
-        and README's short version in the same commit — this being opt-out, filling in
-        the URL is the moment reporting actually starts for everyone who hasn't turned it
-        off, not a moment that waits on any further code.
+        It should still fail loudly if the endpoint ever changes, because PRIVACY.md and
+        the README name this URL in prose and the collector is not open to inspection.
+        A silent repoint would send every install's id somewhere the published page does
+        not describe. If the change is deliberate, both documents move in the same commit.
         """
         import importlib
         import sys
@@ -385,21 +387,37 @@ class TestOverlayPing:
             with mock.patch.dict(os.environ, env, clear=True):
                 sys.modules.pop("config", None)
                 fresh = importlib.import_module("config")
-                assert fresh.TELEMETRY_URL == ""
+                assert fresh.TELEMETRY_URL == (
+                    "https://claude-overlay-telemetry.paperlane.workers.dev/v")
+                assert not telemetry.bad_url(fresh.TELEMETRY_URL)
         finally:
             sys.modules = saved
 
-    def test_nothing_is_sent_with_every_other_gate_open(self, overlay, monkeypatch):
-        """The behavioural half: with TELEMETRY on and nothing recorded in state.json,
-        the committed endpoint is the ONLY thing left holding the ping back — so this
-        exercises the real default rather than a test-only stand-in for it."""
+    def test_the_committed_default_really_does_send(self, overlay, monkeypatch):
+        """The behavioural half, and the honest one: with TELEMETRY on and nothing
+        recorded in state.json — a fresh install that has touched no setting — the
+        committed endpoint is reached and the ping goes out. Run against
+        `config.TELEMETRY_URL` rather than a literal, so it is the shipped default being
+        exercised and not a test-local stand-in that could stay green after a repoint."""
         sent = []
         monkeypatch.setattr(telemetry, "ping", lambda *a: sent.append(a))
         monkeypatch.setattr(co, "TELEMETRY", True)
         monkeypatch.setattr(co, "TELEMETRY_URL", config.TELEMETRY_URL)   # not a literal
         co._save_state(telemetry_consent=None)   # STATE_FILE is shared across the whole
         overlay._ping_telemetry()                # suite — clear a leaked opt-out from
-        assert sent == []                        # whatever test happened to run before this one
+        assert len(sent) == 1                    # whatever test happened to run before this one
+        assert sent[0][0] == config.TELEMETRY_URL
+
+    def test_clearing_the_url_in_the_json_config_is_honoured(self):
+        """"" is a typo for every other string setting and a value for this one. Since
+        the shipped default is now live, a user who writes {"TELEMETRY_URL": ""} to turn
+        reporting off must actually turn it off — the generic _v_str would have rejected
+        it, kept the live endpoint, and filed a warning nobody reads."""
+        assert config._v_telemetry_url("") == ""
+        assert config._v_telemetry_url("   ") == ""
+        assert config._v_telemetry_url(None) is config._BAD
+        off, _ = telemetry.state(True, config._v_telemetry_url(""), None)
+        assert off is False
 
     def test_sends_by_default_with_no_recorded_decision(self, overlay, monkeypatch):
         """This IS the opt-out model end to end: a fresh install that has never touched

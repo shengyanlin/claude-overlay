@@ -350,11 +350,23 @@ def _consent(tmp_path, monkeypatch, value):
     monkeypatch.setattr(config, "STATE_FILE", state)
 
 
-def test_telemetry_line_reports_the_shipped_default(tmp_path, monkeypatch):
+def test_telemetry_line_reports_a_cleared_endpoint_as_off(tmp_path, monkeypatch):
     import config
     _consent(tmp_path, monkeypatch, True)         # even a yes reads as off with no endpoint
     monkeypatch.setattr(config, "TELEMETRY_URL", "")
     assert "no endpoint" in preflight.telemetry_line()
+
+
+def test_telemetry_line_reports_the_shipped_default_as_on(tmp_path, monkeypatch):
+    # The shipped default is a live endpoint, so the honest Diagnose answer is "on", and
+    # it must be read from config rather than a literal — a repoint has to show up here.
+    import config
+    import telemetry
+    _state_file(tmp_path, monkeypatch, install_id=telemetry.new_id())
+    monkeypatch.setattr(config, "TELEMETRY", True)
+    monkeypatch.delenv("DO_NOT_TRACK", raising=False)
+    line = preflight.telemetry_line()
+    assert line.startswith("on -") and config.TELEMETRY_URL in line
 
 
 def _state_file(tmp_path, monkeypatch, **fields):

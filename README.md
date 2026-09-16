@@ -444,10 +444,12 @@ The settings themselves:
   line-up, with the texts listed in the transcript so nothing is silently lost.
 - `TELEMETRY` / `TELEMETRY_URL` — anonymous usage reporting: one request per launch
   carrying the version, a random install id, the OS build and the Python version, and
-  nothing else — no prompts, no replies, no screenshots, no paths. **Nothing is sent in
-  this release**: `TELEMETRY_URL` ships empty. When a future release configures one, it
-  is **opt-out** — `DO_NOT_TRACK=1` or `CLAUDE_OVERLAY_TELEMETRY=0` turns it off, checked
-  fresh on every launch. Full details: [PRIVACY.md](PRIVACY.md).
+  nothing else — no prompts, no replies, no screenshots, no paths. It is **on** in this
+  release and it is **opt-out**: `DO_NOT_TRACK=1` or `CLAUDE_OVERLAY_TELEMETRY=0` turns
+  it off, checked fresh on every launch. `TELEMETRY_URL` names the endpoint, and
+  `"TELEMETRY_URL": ""` is a second way to switch it off — or point it at your own
+  collector if you'd rather have your own numbers. Full details:
+  [PRIVACY.md](PRIVACY.md).
 - `EFFORT` — reasoning-effort ceiling for overlay sessions: `"low"`, `"medium"`,
   `"high"`, `"xhigh"`, `"max"`, or `""` (default) to inherit your CLI's setting
   (`effortLevel` in `~/.claude/settings.json`, or the CLI default). The same dial as the
@@ -549,11 +551,12 @@ are skipped entirely, and every failure just leaves the gauge as it was. It's al
 
 Claude Overlay can report anonymous usage counts — how many people use it and which
 version they run: a version string, a random per-install id, the OS build, the Python
-version, nothing else. **Nothing is sent in this release** (no endpoint is configured).
-When a future release turns it on, it is **opt-out**, disclosed here rather than behind
-a first-run dialog — `DO_NOT_TRACK=1` or `CLAUDE_OVERLAY_TELEMETRY=0` switches it off,
-checked fresh on every launch. Full details, including exactly what is and isn't sent:
-[PRIVACY.md](PRIVACY.md).
+version, nothing else. **It is on in this release**, and it is **opt-out** — disclosed
+here rather than behind a first-run dialog: `DO_NOT_TRACK=1` or
+`CLAUDE_OVERLAY_TELEMETRY=0` switches it off, checked fresh on every launch, and it takes
+effect on the next start rather than the next reinstall. Nothing you type, nothing the
+model says and no part of your screen is in it. Full details, including where it goes and
+what that page cannot promise: [PRIVACY.md](PRIVACY.md).
 
 ## Contributing
 
