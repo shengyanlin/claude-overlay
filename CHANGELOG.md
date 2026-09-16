@@ -3,7 +3,10 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.22.0] - 2026-09-16
+
+The allowance ring returns to the titlebar — and the app starts fast: the window
+paints ~4× sooner, and the launcher stops paying 1–8 s per Python probe.
 
 ### Added
 - **The titlebar allowance ring is back** — the ✻ mark in the top-left corner, ringed by
