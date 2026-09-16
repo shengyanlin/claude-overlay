@@ -115,6 +115,8 @@ def test_every_interpreter_invocation_goes_through_call():
     _if = r'if\s+(?:not\s+)?'
     prefixes = (_if + r'defined\s+\S+', _if + r'errorlevel\s+\d+',
                 _if + r'(?:/i\s+)?\S+==\S+',
+                _if + r'exist\s+(?:"[^"]*"|\S+)',   # decides WHETHER, like `if defined`:
+                                                    # a file stat, never an invocation
                 r'for\s+/\S+\s+(?:"[^"]*"\s+)?%%\w+\s+in\s+\(.*?\)\s+do',
                 r'\(')
     # `start` spawns a new process, so control transfer is not a concern there. `set`,
@@ -582,6 +584,70 @@ def test_a_pythonw_with_no_python_exe_beside_it_still_launches(tmp_path):
     app, marker, env = _sandbox(tmp_path, "onlypythonw")
     rc, out = _run(app, env, tmp_path)
     assert _wait_for(marker), f"launcher refused a usable pythonw\n--- output ---\n{out}"
+
+
+@windows_only
+def test_the_interpreter_cache_skips_the_scan(tmp_path):
+    """The fast path: claude_overlay.py records its own sys.executable on every real
+    launch, and the launcher trusts that file behind a plain `if exist` — a file stat in
+    place of a probe that is a full process spawn through the endpoint scanner (measured
+    1-8s EACH on a managed machine). Discrimination here: the one pythonw on PATH is
+    BROKEN, so the scan cannot be what produced the marker — only the cache can."""
+    app, marker, env = _sandbox(tmp_path, "onpath", shim_body="@exit /b 9009\n")
+    cached = tmp_path / "cachedpython"
+    cached.mkdir()
+    (cached / "pythonw.bat").write_text(_working_shim(), encoding="ascii")
+    d = os.path.join(env["LOCALAPPDATA"], "claude-overlay")
+    os.makedirs(d, exist_ok=True)
+    cache_file = os.path.join(d, "pythonw_path.txt")
+    with open(cache_file, "w", encoding="ascii") as fh:
+        fh.write(str(cached / "pythonw.bat"))          # no trailing newline, like the app
+    # Read-only, deliberately: plain `del` reports success while leaving a read-only file
+    # alive, which would turn "single-use" into "every launch". The launcher's /f must
+    # take it anyway — and the consumed-file assertion below is what proves it did.
+    os.chmod(cache_file, 0o444)
+    rc, out = _run(app, env, tmp_path)
+    assert _wait_for(marker), f"cache fast path did not launch\n--- output ---\n{out}"
+    # Single-use: the launcher consumes the record and the real app reissues it. (The
+    # stub app here writes no cache, so the file being gone proves the DELETE ran, not
+    # that something rewrote it.)
+    assert not os.path.exists(cache_file), "the cache must be consumed when read"
+
+
+@windows_only
+def test_a_broken_cached_interpreter_costs_exactly_one_launch(tmp_path):
+    """`if exist` proves the cached file is there, not that it runs. A cached interpreter
+    that exists but is corrupt or blocked starts nothing — and because the fast path
+    skips the scan, an earlier cut of this walled such a machine on EVERY launch. The
+    single-use contract bounds the damage: launch #1 fails silently (accepted), launch #2
+    finds no cache and scans its way to the working PATH pythonw."""
+    app, marker, env = _sandbox(tmp_path, "onpath")
+    broken = tmp_path / "brokenpython"
+    broken.mkdir()
+    (broken / "pythonw.bat").write_text("@exit /b 9009\n", encoding="ascii")
+    d = os.path.join(env["LOCALAPPDATA"], "claude-overlay")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "pythonw_path.txt"), "w", encoding="ascii") as fh:
+        fh.write(str(broken / "pythonw.bat"))
+    rc, out = _run(app, env, tmp_path)
+    assert not _wait_for(marker, seconds=3), "a broken cache must not fall through mid-run"
+    rc, out = _run(app, env, tmp_path)
+    assert _wait_for(marker), f"second launch did not self-heal\n--- output ---\n{out}"
+
+
+@windows_only
+def test_a_stale_interpreter_cache_falls_back_to_the_scan(tmp_path):
+    """The other half: a cache pointing at an interpreter that is GONE must cost nothing
+    but the failed stat — the scan below it still finds the working PATH pythonw and the
+    app still starts. A fast path that can strand the launch is worse than no fast path."""
+    app, marker, env = _sandbox(tmp_path, "onpath")
+    d = os.path.join(env["LOCALAPPDATA"], "claude-overlay")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "pythonw_path.txt"), "w", encoding="ascii") as fh:
+        fh.write(str(tmp_path / "uninstalled" / "pythonw.exe"))
+    rc, out = _run(app, env, tmp_path)
+    assert _wait_for(marker), f"stale cache stranded the launch\n--- output ---\n{out}"
+    assert "Could not start Claude Overlay" not in out
 
 
 @windows_only

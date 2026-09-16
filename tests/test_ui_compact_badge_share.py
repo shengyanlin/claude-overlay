@@ -669,9 +669,13 @@ def modes(overlay):
 
 
 def _packed_chips(ov):
-    """Chip texts actually on the status bar, in left-to-right bar order."""
+    """Chip texts actually on the status bar, in left-to-right bar order.
+
+    Read from mode_frame, the container the chips were moved into so they would keep
+    their packing priority over the right-packed grip. Reading status_frame instead
+    returns [] unconditionally -- which the one test expecting [] passed on happily."""
     lbls = set(ov.mode_lbls.values())
-    return [w.cget("text") for w in ov.status_frame.pack_slaves()
+    return [w.cget("text") for w in ov.mode_frame.pack_slaves()
             if w in lbls and w.winfo_manager() == "pack"]
 
 
@@ -679,6 +683,11 @@ def test_no_mode_chips_when_everything_is_default(modes):
     """A stock overlay shows an empty strip -- the whole point of chipping only deviations."""
     ov = modes()
     assert _packed_chips(ov) == [], f"stock overlay is showing chips: {_packed_chips(ov)!r}"
+    # Control group: an empty answer must mean "no chips", not "the reader is looking in
+    # the wrong container". Turning one on has to make this same reader non-empty.
+    ov.read_only = True
+    ov._paint_modes()
+    assert _packed_chips(ov), "_packed_chips is not reading where the chips live"
 
 
 @pytest.mark.parametrize("key", ["read_only", "window_shot", "share_visible"])
@@ -720,11 +729,63 @@ def test_turning_a_mode_off_removes_its_chip(modes):
     assert _packed_chips(ov) == [f"{g} {lbl}"], f"got {_packed_chips(ov)!r}"
 
 
-def test_mode_chips_sit_before_the_attachment_label(modes):
-    """The strip belongs next to the ⚙ it explains, not after the 📎 count."""
+def test_mode_chips_sit_after_the_gear_they_explain(modes):
+    """The strip belongs next to the ⚙ whose menu spells the same three settings out.
+    It used to need a `before=` anchor on the attachment label to land there; with the
+    📎 button and its label gone from the bar the gear IS the end of the left-packed
+    run, so a plain side="left" is enough -- and this pins that it still lands right.
+
+    The chips live in a container packed ONCE, so what is asserted is the container's
+    position -- after the gear and, crucially, BEFORE the right-packed grip.
+
+    The earlier version of this test asserted pack order relative to the gear only, which
+    passed while the real defect was live: pack allocates the cavity in packing order, so
+    chips re-packed onto the bar on every repaint ended up behind the grip and a narrow
+    bar starved the CHIPS instead of the grip. A dropped chip reports its mode as OFF,
+    and Read-only is the safety state."""
     ov = modes(read_only=True)
     order = ov.status_frame.pack_slaves()
-    assert order.index(ov.mode_lbls["read_only"]) < order.index(ov.attach_lbl)
+    assert order.index(ov.gear) < order.index(ov.mode_frame)
+    assert order.index(ov.mode_frame) < order.index(ov.grip), (
+        "the chips must out-rank the resize grip for cavity space")
+
+
+def test_repainting_the_chips_does_not_cost_them_their_slot(modes):
+    """_paint_modes runs on every <Configure> and on every toggle. The container must not
+    move in the packing order when it does -- that movement IS the defect."""
+    ov = modes(read_only=True)
+    before = ov.status_frame.pack_slaves().index(ov.mode_frame)
+    ov._paint_modes()
+    ov._paint_modes()
+    ov.root.update_idletasks()
+    assert ov.status_frame.pack_slaves().index(ov.mode_frame) == before
+    assert ov.status_frame.pack_slaves().index(ov.mode_frame) < \
+        ov.status_frame.pack_slaves().index(ov.grip)
+
+
+def test_modes_fit_does_not_count_the_chips_own_container(overlay):
+    """mode_frame's requested width IS the chips' width, so counting it would feed the
+    fit decision its own output -- the feedback loop the chip exclusion exists to stop."""
+    overlay.status_frame.winfo_width = lambda: 4000
+    try:
+        assert overlay._modes_fit(["\u2298 Read-only"]) is True
+        assert overlay.mode_frame in (
+            set(overlay.mode_lbls.values()) | {overlay.mode_frame})
+    finally:
+        del overlay.status_frame.winfo_width
+
+
+def test_the_paperclip_is_gone_from_the_status_bar(overlay):
+    """A bare 📎 next to a gear, in a row of words, said nothing about what it did --
+    and 42CE is not in Segoe Fluent Icons, so f_icon fell through to the colour emoji and
+    it did not even match the monochrome gear beside it. Attaching is a named menu row now.
+    Pinned because deleting a widget is easy to half-do: leave the attribute behind and
+    the old click target is still live, just invisible."""
+    assert not hasattr(overlay, "attach_btn")
+    assert not hasattr(overlay, "attach_lbl")
+    texts = [w.cget("text") for w in overlay.status_frame.pack_slaves()
+             if "text" in w.configure()]
+    assert not any("📎" in (t or "") for t in texts), texts
 
 
 @pytest.mark.parametrize("painter", ["_paint_window_toggle", "_paint_share_toggle",

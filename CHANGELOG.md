@@ -3,6 +3,65 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **The titlebar allowance ring is back** — the ✻ mark in the top-left corner, ringed by
+  two gauges: the 5-hour window on the thicker inner arc, the weekly one outside, drawn
+  clockwise from 12 like the clock they empty and refill on. Removed in 1.21.0 along with
+  the usage panel it opened; both return, hover the mark for the numbers (both windows,
+  reset times, and the context turns-left estimate). This time the statusline keeps its
+  allowance text too: the ring shows both windows at a glance, the text names the binding
+  one and carries its reset time — layers, not copies. The restored reading path now runs
+  through the same total validator as the text (`_quota_pct`), so a malformed reading that
+  the old ring would have crashed on is dropped instead.
+
+### Changed
+- **The overlay window appears ~4× sooner.** `claude_agent_sdk`'s import chain (mcp,
+  requests, pydantic, truststore — ~500 of the ~630ms it took to import the app, multiplied
+  several-fold on a cold start under endpoint security scanning) used to be paid before a
+  single widget existed. It now runs on a background thread that overlaps the UI imports
+  and the window build, and the worker is created only after the first paint — so the
+  window is on screen while the import finishes instead of after it. `preflight`'s import
+  smoke imports `worker` explicitly, so "the app loads" still covers the whole app.
+- **The launcher skips its Python hunt once one has worked.** Every `call python -c "pass"`
+  probe in `Start Claude Overlay.cmd` is a full process spawn through the endpoint
+  scanner — measured 1–8 s *per probe* on a managed machine. The app now records its own
+  interpreter path on every real windowless launch, and the launcher trusts that record
+  behind a plain `if exist` (a file stat). The record is single-use — consumed when read,
+  reissued by the app — so a cached interpreter that exists but no longer runs costs one
+  launch, never the machine; a deleted path falls straight through to the unchanged full
+  scan.
+- **Attaching files moved out of the status bar and into the ⚙ menu**, as
+  **⚙ → Attach files…**. The bare 📎 button is gone. It said nothing about what it did —
+  a paperclip glyph next to a gear, in a row of words, reads as decoration — and 📎 is
+  not in Segoe Fluent Icons, so it fell through to the colour emoji and did not even
+  match the monochrome gear beside it. The three existing toggles keep their order and
+  position; the two actions sit below a new separator.
+- **Queued attachments are a named strip above the input box**, one row per file with
+  its filename and size and its own **✕**, plus a **Clear all**. It replaces a single
+  status-bar label that read `📎 2 images, 1 file ✕` — which named no file, gave no
+  size, and whose one ✕ cleared everything. Pasted images have no filename to show (the
+  clipboard has none) and say so. Capped at 4 rows with the rest counted, because 16
+  queued files would take more than half the window to say what one line says.
+- **A file the picker refuses now stays on that strip**, in red, with its reason — next
+  to the files that did make it. It used to be an error block in the transcript, which
+  scrolled away while the files it was about were still queued below it.
+- Picking a file that is already attached no longer queues it twice. It was never going
+  to be sent twice (the request builder deduplicates paths), and a second row meant
+  either row's ✕ removed both.
+
+### Fixed
+- Removing the 📎 button and its label frees ~150px on the status bar, which at 420px
+  wide was full enough that the attachment label — packed last — was the first thing to
+  clip.
+
+### Known
+- **⚙ → Attach files…** still opens a native Windows file dialog, which blocks the UI
+  thread while it is open: a reply streaming in the background will stall until you
+  pick or cancel. Moving the entry point into the menu does not change that; it needs a
+  different picker.
+
 ## [1.21.0] - 2026-09-15
 
 Attach files, not just screenshots — and the plan allowance comes back to the

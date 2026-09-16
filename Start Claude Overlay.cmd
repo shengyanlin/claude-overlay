@@ -33,6 +33,33 @@ rem was just installed is to ask again, and to reach it through the folder scan 
 rem than through PATH. Jumping back here re-runs every probe from scratch (`set "PYW="`
 rem clears the state), which is also why the answer comes from re-measuring rather than
 rem from whatever setup.cmd reported about itself.
+rem ---- fast path: the interpreter that ran the app last time. claude_overlay.py
+rem writes its own sys.executable to this file on every real launch, which answers the
+rem question the scan below exists to ask -- so a plain `if exist` (a file stat) replaces
+rem a probe that is a full process spawn through the endpoint scanner (measured 1-8s per
+rem probe on a managed machine). A missing or stale path falls through to the scan, and
+rem the next successful start rewrites the cache; worst case is exactly the old start.
+rem Placed BEFORE :findpython so the give-up path's re-entry after setup.cmd rescans for
+rem real instead of re-trusting a cache that just failed to produce a window.
+set "PYW="
+if exist "%LOCALAPPDATA%\claude-overlay\pythonw_path.txt" set /p PYW=<"%LOCALAPPDATA%\claude-overlay\pythonw_path.txt"
+rem The cache is SINGLE-USE: consumed (deleted) the moment it is read, and reissued by
+rem the app itself on every start that actually runs. `if exist` proves the file is
+rem there, not that it runs -- a cached interpreter that exists but is corrupt or
+rem blocked would otherwise skip the scan on every launch and wall this machine
+rem forever. Deleting first bounds that damage at exactly one silent launch: the next
+rem double-click finds no cache and scans for real.
+rem
+rem Consumption is PROVEN, not assumed: `del` reports success (errorlevel 0) even when
+rem a read-only attribute or an ACL kept the file alive, and an unconsumable record
+rem would re-wall the machine on every launch -- the exact loop the delete exists to
+rem break. /f takes the read-only case; the `if exist` recheck refuses to trust
+rem whatever survives for any other reason.
+if defined PYW del /f "%LOCALAPPDATA%\claude-overlay\pythonw_path.txt" >nul 2>nul
+if exist "%LOCALAPPDATA%\claude-overlay\pythonw_path.txt" set "PYW="
+if defined PYW if exist "!PYW!" goto launch
+set "PYW="
+
 :findpython
 
 rem ---- BEGIN find-pythonw (kept identical in Diagnose.cmd, update.cmd and setup.cmd) ----

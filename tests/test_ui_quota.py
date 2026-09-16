@@ -32,6 +32,10 @@ def gauge(overlay):
     ov._ctx_pct = None
     ov._ctx_hist.clear()
     ov._ctx_warned = 0.0
+    ov._ring_explained = True       # the ring's one-time introduction says "allowance" into
+                                    # the chat these tests count; this file pins the TEXT
+                                    # segment and the announcements, and the introduction has
+                                    # its own tests in test_ui_quota_gauge.py
     ov._refresh_statusline()
     return ov
 

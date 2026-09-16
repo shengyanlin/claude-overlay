@@ -53,8 +53,8 @@ so it uses your **existing Claude subscription — no API key, no metered billin
   losing your context.
 - 💸 **No API key, no extra cost.** Runs on your existing Claude subscription.
 - 🖼️ **Screenshots, pasted images, and files.** It grabs your screen automatically on
-  every message, or paste any image with **Ctrl+V** to ask about it. Click **📎** to
-  attach a PDF, Word or PowerPoint file from this machine — PDFs go to Claude whole,
+  every message, or paste any image with **Ctrl+V** to ask about it. Pick **⚙ → Attach
+  files…** to send a PDF, Word or PowerPoint file from this machine — PDFs go whole,
   pages and all; Word and PowerPoint have their text pulled out locally, so the words
   arrive and the charts and layout don't. If your screen hasn't changed since the last
   message, the duplicate isn't re-sent (Claude is told to keep using the one it already
@@ -356,14 +356,17 @@ script here *scans* that folder and uses whatever runs, no matter how it got the
 | New line | `Shift+Enter` |
 | Stop a running reply | click **Stop** (the ↑ becomes ■ while busy) or press `Esc` — either also drops the queued line-up, listing the texts in the transcript and putting the first back in the box |
 | Paste an image | **Ctrl+V** (or `Shift+Insert`) |
-| Attach a file | click **📎** — images, PDF, `.docx`, `.pptx`, multi-select allowed. Anything that can't be attached says which file and why, rather than just how many failed |
-| Clear what's attached | click the **📎 2 images, 1 file ✕** count next to the button (the button itself opens the picker) |
+| Attach a file | **⚙ → Attach files…** — images, PDF, `.docx`, `.pptx`, multi-select allowed |
+| See what's attached | a strip above the input box, one row per file with its name and size. Files that couldn't be attached sit there too, in red, each saying why |
+| Remove one attachment | that row's **✕** |
+| Clear them all | **Clear all** at the right of the strip |
 | Toggle auto-screenshot | **◉ / ○ Auto-shot** (orange = on) |
-| Settings menu | click **⚙** — Window-only, Shareable, Read-only (✓ = on); the gear turns orange while Read-only is on |
+| Settings menu | click **⚙** — Window-only, Shareable, Read-only (✓ = on), then **Attach files…** and **Past conversations…**; the gear turns orange while Read-only is on |
 | &nbsp;&nbsp;• Capture only the active window | **⚙ → Window-only** (window only; off = every monitor) |
 | &nbsp;&nbsp;• Show / hide in screen shares | **⚙ → Shareable** (visible to Teams/Zoom/OBS; off = private, the default) |
 | &nbsp;&nbsp;• Lock Claude read-only | **⚙ → Read-only** ("plan" mode: looks and answers, changes nothing; off = the configured `PERMISSION_MODE`) |
 | Switch model | click the **statusline** (`model ▾`) — the list shows the model families **your** login can actually pick, read from the CLI's own record of them, so it can't offer you a model that would silently fall back to another one |
+| Glance the allowance | the ring on the titlebar **✻** — inner arc is the 5-hour window, outer is weekly, amber near the limit, red past it. **Hover** it for the numbers: both windows, reset times, and roughly how many turns of context are left |
 | See how much allowance is left | the statusline's `5h 61%` — the window is **named**, so you always know whether you're looking at the 5-hour allowance or a weekly one, and whichever you'll hit first is the one shown. Filled in from your account the moment the overlay opens, so it's there **before** you send anything, and refreshed every minute while it sits idle; amber as you approach a limit, red once it's gone, and the reset time joins it only once that's worth planning around. It speaks up once per transition, and a message refused for allowance is put back in the box rather than lost |
 | Retry when the allowance returns | a refused message offers **⏱ Send it automatically at &lt;time&gt;** — opt-in, one click, and it stands down the moment you type something else, send by hand, or Clear |
 | See how much context is left | the statusline's `context 72%` — its own segment, beside the allowance rather than competing with it: the allowance is your plan, context is the size of *this* conversation, and Clear or Compact hands context back while the spend stays spent. A note at 70% and again at 85% says when compacting is worth it |

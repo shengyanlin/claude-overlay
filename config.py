@@ -242,7 +242,7 @@ MAX_CHAT_LINES = 4000       # cap the rendered transcript; prune oldest lines pa
 MAX_CHAT_CHARS = 350_000    # also cap by characters — one giant whitespace-free assistant
                             # line counts as 1 line and would otherwise bypass the line cap
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
-DOC_EXTS = (".pdf", ".docx", ".pptx")   # non-image files the 📎 picker accepts. PDFs go to
+DOC_EXTS = (".pdf", ".docx", ".pptx")   # non-image files the picker accepts. PDFs go to
                             # Claude as a native document block; .docx/.pptx have no such
                             # block, so their text is extracted locally (python-docx /
                             # python-pptx) and sent as plain text - charts/layout are lost.
@@ -269,9 +269,17 @@ COMPACT_IDLE_TIMEOUT = 600  # /compact is one big summarization round-trip that 
                             # for a while (≈30s even on a small context); bound it generously
 MAX_PASTE_SOURCES = 8       # cap how many files one paste fans out into
 MAX_PENDING_IMAGES = 16     # cap total queued attachments (a hostile clipboard can't pile up).
-                            # ONE budget shared by pasted images and 📎 files, not 16 of each —
+                            # ONE budget shared by pasted images and picked files, not 16 of each —
                             # the name predates files being attachable at all. Kept rather
                             # than renamed so an existing config.json override keeps working.
+MAX_ATTACH_ROWS = 4         # how many attachment rows the strip above the input box DRAWS;
+                            # the rest are counted on one "＋N more" line. This is a display
+                            # cap, not a queue cap — MAX_PENDING_IMAGES above is the queue,
+                            # and at 16 rows the strip would take ~350px of a 620px window,
+                            # i.e. more than half the transcript, to say something a count
+                            # says in one line. Kept well under _QUEUE_ROWS_SHOWN (6) because
+                            # attachments arrive in bulk from one picker run while queued
+                            # messages are typed one at a time.
 QUEUE_MESSAGES = True       # Enter while a reply is streaming LINES THE MESSAGE UP (the
                             # Claude Code CLI's behaviour) instead of interrupting the turn:
                             # you can type two or three follow-ups ahead and they go out one

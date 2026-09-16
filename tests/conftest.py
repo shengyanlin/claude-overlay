@@ -144,12 +144,26 @@ def _clean_overlay(ov):
     ov._quota = None                    # allowance readings are per-test: a leaked one would
     ov._quota_polled = None             # take the gauge slot away from the next test's context
     ov._quota_said = None
+    ov._ring_explained = False          # the ring introduces itself once; a leaked flag would
+                                        # silence the introduction in whichever test runs next
+    try:
+        ov._mark_leave()                # a test that hovered the mark must not leave the
+    except Exception:                   # usage panel placed over the next test's chat
+        pass
     ov.pending_images = []
     ov.pending_docs = []
+    ov.pending_bad = []                 # refused-file rows are per-test: they ACCUMULATE
+    ov._attach_names = {}               # (the handler extends the list), so a leaked one puts
+                                        # another test's rejection on this test's strip — and
+                                        # a leaked name re-labels a path this test reuses
     ov.pending_shot = None
     ov._precaptured = None
     try:
         ov._refresh_queue()             # the line-up strip must not stay packed above the input
+    except Exception:
+        pass
+    try:
+        ov._refresh_attach()            # …and the attachment strip must not stay drawn above it
     except Exception:
         pass
     ov._sent_shot_hashes = {}           # screenshot dedupe memory must not leak across tests
