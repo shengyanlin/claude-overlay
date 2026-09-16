@@ -3,7 +3,7 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.22.1] - 2026-09-16
 
 ### Fixed
 - **You can see what you're selecting inside a code block again.** Tk creates the `sel`
