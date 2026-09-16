@@ -16,6 +16,7 @@ import os
 import queue
 import sys
 import tempfile
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -63,6 +64,48 @@ class FakeWorker:
     def join(self, *a, **k):    self._rec("join")
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _no_real_telemetry():
+    """Hard floor: no test may reach the real collector, whatever else it stubs.
+
+    Stubbing `Overlay._ping_telemetry` in the singleton fixture below covers the call
+    site somebody remembered. This covers the ones nobody did — it wraps
+    `telemetry.send` itself, so a test that reaches the shipped endpoint fails the test
+    that made the request instead of silently appending a row to the live database.
+
+    Not hypothetical. `test_ui_markdown.py::test_selection_outranks_code_block_background`
+    builds a real Tk root and drains its after() queue, so the app's
+    `root.after(1800, self._ping_telemetry)` fired against production, once per suite
+    run, with a fresh install id each time because STATE_FILE points at a temp dir. Four
+    rows of a developer's own test noise were indistinguishable from the first four real
+    users — and nothing failed, because every failure on that path is swallowed by
+    design. An accidental send has to be loud somewhere, so it is loud here.
+
+    Anything aimed at example.invalid still goes through to the real `send`: the point is
+    to block one host, not to stop `send` from being tested.
+    """
+    import config
+    import telemetry
+
+    real = telemetry.send
+    host = urlsplit(config.TELEMETRY_URL).hostname
+
+    def guarded(url, fields):
+        if host and urlsplit(url).hostname == host:
+            raise AssertionError(
+                "This test sent telemetry to the REAL endpoint (%s). Stub "
+                "telemetry.ping or telemetry.send, or point the URL at "
+                "https://example.invalid/v." % url)
+        return real(url, fields)
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(telemetry, "send", guarded)
+    try:
+        yield
+    finally:
+        mp.undo()
+
+
 @pytest.fixture(scope="session")
 def _overlay_singleton():
     """The one Overlay/Tk root for the session. Built with side effects patched out."""
@@ -78,6 +121,17 @@ def _overlay_singleton():
     # usage.Poller because this fixture is session-scoped — stubbing the class here would
     # leave it stubbed for every later unit test of the class itself.
     mp.setattr(co.Overlay, "_start_usage_poll", lambda self: None)
+    # Same reason, third network call: the anonymous usage ping. It cannot be stubbed for
+    # the session, because several tests call _ping_telemetry directly and it is the thing
+    # they are testing. But __init__ schedules it with root.after(1800, ...), and any test
+    # that builds a live root and lets the after() queue drain then fires it FOR REAL —
+    # which is what test_ui_markdown's selection test was doing, putting one row per suite
+    # run into the live collector. `root.after(1800, self._ping_telemetry)` resolves the
+    # attribute when it SCHEDULES, so stubbing it across construction alone is enough: the
+    # queued timer holds the no-op forever, and the method is restored immediately after
+    # for the tests that want the real one.
+    _real_ping = co.Overlay._ping_telemetry
+    mp.setattr(co.Overlay, "_ping_telemetry", lambda self: None)
     # Point the persisted-UI-state store at a throwaway path: the suite must neither
     # read this machine's real toggle state nor overwrite it from toggle tests.
     import tempfile
@@ -91,6 +145,7 @@ def _overlay_singleton():
         # makes Win32/ctypes calls that could raise something else on a bare runner.)
         mp.undo()
         pytest.skip(f"Overlay/Tk unavailable (no display?): {type(e).__name__}: {e}")
+    mp.setattr(co.Overlay, "_ping_telemetry", _real_ping)   # see the note above
     ov.root.withdraw()
     ov.root.update_idletasks()
     try:

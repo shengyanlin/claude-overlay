@@ -408,6 +408,14 @@ class TestOverlayPing:
         assert len(sent) == 1                    # whatever test happened to run before this one
         assert sent[0][0] == config.TELEMETRY_URL
 
+    def test_the_suite_cannot_reach_the_real_endpoint(self):
+        """The conftest guard, tested. A tripwire nobody tests is a tripwire that has
+        quietly stopped working, and this one's entire job is to be the only thing that
+        notices — every failure on the send path is swallowed by design, so an accidental
+        request to production is silent everywhere else."""
+        with pytest.raises(AssertionError, match="REAL endpoint"):
+            telemetry.send(config.TELEMETRY_URL, {"v": "1"})
+
     def test_clearing_the_url_in_the_json_config_is_honoured(self):
         """"" is a typo for every other string setting and a value for this one. Since
         the shipped default is now live, a user who writes {"TELEMETRY_URL": ""} to turn
