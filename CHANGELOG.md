@@ -3,6 +3,21 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **You can see what you're selecting inside a code block again.** Tk creates the `sel`
+  tag with the widget and ranks tags by creation order, so every tag the transcript
+  configures afterwards outranked it — and any tag carrying a background (fenced code
+  blocks, inline code, tool lines) painted straight over the selection highlight. Dragging
+  across a code block *did* select the text and Ctrl+C *did* copy it, but nothing on screen
+  moved, so a drafted email or a config snippet read as flatly uncopyable. `sel` is now
+  re-raised on every selection change — an event rather than a one-shot raise, because
+  `compact` and `compact_bar` are minted at runtime and would climb back over it. The
+  highlight also survives losing focus: Tk leaves `inactiveselectbackground` empty by
+  default, which blanked the selection the moment you clicked the input box. And the
+  transcript's cursor is an I-beam now, so text that was always selectable finally looks it.
+
 ## [1.22.0] - 2026-09-16
 
 The allowance ring returns to the titlebar — and the app starts fast: the window

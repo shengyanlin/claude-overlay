@@ -128,6 +128,28 @@ def test_fenced_code_block_tag(overlay):
     assert _tag_present(overlay, "md_codeblock")
 
 
+def test_selection_outranks_code_block_background(overlay):
+    """Selecting inside a fenced block must actually LOOK selected.
+
+    Tk creates "sel" with the widget and orders tags by creation, so every tag configured
+    afterwards outranks it — md_codeblock's background used to paint straight over the
+    highlight, making a code block read as un-selectable (and so un-copyable).
+    tag_names() returns lowest-priority first, so "sel" has to sort after md_codeblock.
+    """
+    overlay.add_delta("```\nsome code\n```\n")
+    overlay._md_finalize()
+    start = overlay.chat.tag_ranges("md_codeblock")[0]
+    overlay.chat.tag_add("sel", start, f"{start}+4c")
+    overlay.chat.update()                     # let <<Selection>> fire
+    names = overlay.chat.tag_names()
+    assert names.index("sel") > names.index("md_codeblock")
+
+
+def test_selection_survives_focus_loss(overlay):
+    """Clicking the input box after selecting must not blank the highlight."""
+    assert overlay.chat.cget("inactiveselectbackground") != ""
+
+
 def test_fence_stars_literal(overlay):
     """**stars** inside a fenced block must NOT be parsed as bold."""
     overlay.add_delta("```\n**not bold**\n```\n")

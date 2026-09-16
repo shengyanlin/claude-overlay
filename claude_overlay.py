@@ -1383,8 +1383,12 @@ class Overlay:
         self.scrollbar.bind("<Leave>", lambda e: (setattr(self, "_sb_hover", False), self._sb_redraw()))
         self.chat = tk.Text(
             wrap, bg=T["bg"], fg=T["text"], bd=0, padx=self.px(18), pady=self.px(12),
-            wrap="word", font=self.f_body, highlightthickness=0, cursor="arrow",
+            wrap="word", font=self.f_body, highlightthickness=0, cursor="xterm",
             width=1, height=1, selectbackground=T["sel"], selectforeground=T["text"],
+            # Tk defaults this to "", which stops drawing the highlight the moment the widget
+            # loses focus — so selecting a reply and then clicking the input box makes the
+            # selection look like it never happened, even though it is still there.
+            inactiveselectbackground=T["sel"],
             spacing1=self.px(2), spacing3=self.px(3),
         )
         self.chat.pack(side="left", fill="both", expand=True)
@@ -1438,6 +1442,14 @@ class Overlay:
         self.chat.tag_configure("md_codeblock", font=self.f_code, background=code_bg,
                                 lmargin1=self.px(20), lmargin2=self.px(20), rmargin=self.px(14),
                                 spacing1=self.px(1), spacing3=self.px(1))
+        # Tk creates "sel" with the widget and orders tags by creation, so every tag above
+        # outranks it. Any tag carrying a `background` (md_codeblock, md_code, tool, user)
+        # therefore PAINTS OVER the selection highlight — dragging across a fenced code block
+        # or a tool line did select the text but showed nothing, which reads as "this content
+        # can't be selected, let alone copied". Re-raise on every selection change rather than
+        # once here, because tags minted later at runtime (compact, compact_bar) would climb
+        # back over a one-shot raise. sel only carries fg/bg, so md_* fonts/margins are safe.
+        self.chat.bind("<<Selection>>", lambda e: self.chat.tag_raise("sel"), add="+")
 
     # ── custom scrollbar (right edge of the chat) ──
     def _sb_set(self, first, last):
