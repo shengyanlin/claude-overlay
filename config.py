@@ -303,6 +303,23 @@ CLI_UPDATE_CHECK = _env_bool("CLAUDE_OVERLAY_CLI_UPDATE_CHECK", True)   # on lau
                             # the overlay current never advances the CLI, and an old CLI silently
                             # runs an older model. Set CLAUDE_OVERLAY_CLI_UPDATE_CHECK=0 to disable
                             # (e.g. a locked-down box where global npm installs aren't allowed)
+TELEMETRY = _env_bool("CLAUDE_OVERLAY_TELEMETRY", True)   # master switch for the anonymous
+                            # usage ping (telemetry.py has the complete payload and PRIVACY.md
+                            # the plain-English version). This is OPT-OUT: True plus the endpoint
+                            # below is the whole condition, so a stock build DOES send one GET
+                            # per launch. Set CLAUDE_OVERLAY_TELEMETRY=0, or the standard
+                            # DO_NOT_TRACK=1 which wins over everything, to hold it off
+TELEMETRY_URL = (os.environ.get("CLAUDE_OVERLAY_TELEMETRY_URL")
+                 or "https://claude-overlay-telemetry.paperlane.workers.dev/v").strip()
+                            # The author's collector. Must be https (the install id would
+                            # otherwise travel in clear text) — telemetry.bad_url refuses
+                            # anything else, and a redirect away from this host is never
+                            # followed. Overridable per machine like everything else, so an
+                            # organisation that wants its own numbers can point it at its own
+                            # collector. A BLANK env var reads as unset here, exactly like every
+                            # other env var in this file; to turn reporting off use
+                            # CLAUDE_OVERLAY_TELEMETRY=0, or "TELEMETRY_URL": "" in the JSON --
+                            # the one string setting where empty is a value and not a typo
 RESUME_OFFER = _env_bool("CLAUDE_OVERLAY_RESUME_OFFER", True)   # on launch, when the previous
                             # run left a conversation behind, show a one-click "Resume last
                             # conversation" button in the chat. The session id is remembered
@@ -427,6 +444,15 @@ def _v_num(lo, hi, cast):
     return check
 
 
+def _v_telemetry_url(v):
+    """_v_str, except "" is a VALUE here rather than a typo. Every other string setting
+    treats blank as a mistake and keeps the default; this is the one whose blank is the
+    entire point — since the shipped default is a live endpoint, rejecting "" would
+    answer somebody switching reporting off with a warning they may never read and leave
+    the pings flowing."""
+    return v.strip() if isinstance(v, str) else _BAD
+
+
 def _v_str_list(v):
     if isinstance(v, list) and v and all(isinstance(s, str) and s.strip() for s in v):
         return list(v)
@@ -484,6 +510,8 @@ _USER_CONFIG_KEYS = {
     "STRICT_MCP_CONFIG": _v_bool,
     "MCP_SERVERS": _v_mcp_servers,             # {name: {...}} — loads even under strict
     "CLI_UPDATE_CHECK": _v_bool,
+    "TELEMETRY": _v_bool,                      # false = never send the anonymous usage ping
+    "TELEMETRY_URL": _v_telemetry_url,         # "" = no endpoint; https only, see telemetry.state
     # capture
     "AUTO_SCREENSHOT_DEFAULT": _v_bool,
     "SHOT_SCOPE": _v_choice("screens", "window"),
@@ -513,6 +541,8 @@ _ENV_BEATS_JSON = {
     "SHOT_SCOPE": "CLAUDE_OVERLAY_SHOT_SCOPE",
     "STRICT_MCP_CONFIG": "CLAUDE_OVERLAY_STRICT_MCP",
     "CLI_UPDATE_CHECK": "CLAUDE_OVERLAY_CLI_UPDATE_CHECK",
+    "TELEMETRY": "CLAUDE_OVERLAY_TELEMETRY",
+    "TELEMETRY_URL": "CLAUDE_OVERLAY_TELEMETRY_URL",
 }
 
 

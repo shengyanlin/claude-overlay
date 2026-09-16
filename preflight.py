@@ -399,6 +399,51 @@ def model_menu_line():
         return f"(could not be determined: {type(e).__name__}: {e})"
 
 
+def telemetry_line():
+    """One line saying whether this machine reports usage, and why.
+
+    "Is this thing phoning home?" should be answerable from a Diagnose report without
+    reading source. This is opt-out, not opt-in, so "on" is the answer as soon as an
+    endpoint exists — each gate that can turn it off produces its own reason, so the
+    line names the one that actually decided it rather than a flat on/off — and it
+    prints the endpoint, because a machine pointed at a self-hosted collector reads
+    identically otherwise. Fully guarded, like every other line here."""
+    try:
+        import config
+        import telemetry
+        state = _state()
+        sending, why = telemetry.state(config.TELEMETRY, config.TELEMETRY_URL,
+                                       state.get("telemetry_consent"))
+        if not sending:
+            return why
+        # The policy gates are not the whole story: a report also needs an install id
+        # that PERSISTED, and on a machine where the state file can't be written there
+        # will never be one. Saying a flat "on" there would report a machine as
+        # reporting when every launch silently declines to.
+        if not telemetry.valid_id(state.get("install_id")):
+            return (f"enabled for {config.TELEMETRY_URL}, but no install id is stored yet"
+                    " - one is minted on the next launch, and nothing is sent if it"
+                    " cannot be saved")
+        return f"on - reporting version and a random install id to {config.TELEMETRY_URL}"
+    except Exception as e:                                     # pragma: no cover - defensive
+        return f"(could not be determined: {type(e).__name__}: {e})"
+
+
+def _state():
+    """The persisted UI state, read WITHOUT importing claude_overlay — preflight runs when
+    the app may be what's broken, so it re-reads the file rather than borrowing the app's
+    reader. Any problem yields {}, exactly as _load_state does."""
+    try:
+        import json
+        import config
+        if config.STATE_FILE.stat().st_size > 64 * 1024:
+            return {}
+        data = json.loads(config.STATE_FILE.read_text("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def run(deep=True):
     """Produce the report and the verdict together: (text, ok).
 
@@ -412,6 +457,7 @@ def run(deep=True):
     lines += environment_block()
     lines += [f"install dir  : {repo_dir()}"]
     lines += [f"model menu   : {model_menu_line()}"]
+    lines += [f"telemetry    : {telemetry_line()}"]
 
     problems = check()
     ok = not any(p.level == FAIL for p in problems)
