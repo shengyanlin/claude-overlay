@@ -3,7 +3,11 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.23.0] - 2026-09-17
+
+This release starts reporting anonymous usage counts, on by default. Read the
+Privacy section below before you update, not after: there is no dialog, and one
+environment variable turns it off.
 
 ### Added
 - **Anonymous usage reporting, and it is on by default.** One `GET` per launch carrying
