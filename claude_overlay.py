@@ -154,6 +154,7 @@ try:
     import authstate
     import modelresolve
     import sessions
+    import telemetry
     import usage
 except Exception as _e:
     _report_import_failure(_e)
@@ -873,6 +874,9 @@ class Overlay:
         self.root.after(220, self._install_taskbar_button)
         self.root.after(1200, self._check_for_update)
         self.root.after(1500, self._check_cli_update)
+        self.root.after(1800, self._ping_telemetry)   # last of the three launch pings, and the
+                                                      # only one the user gets nothing from —
+                                                      # so it goes behind the two that serve them
         self._usage_poll = usage.Poller(self.ui_q)
         self._start_usage_poll()
         self._start_hang_watchdog()    # diagnostic: dumps all-thread stacks if the UI pump stalls
@@ -971,6 +975,65 @@ class Overlay:
             except Exception:
                 pass
         threading.Thread(target=work, daemon=True).start()
+
+    def _install_id(self):
+        """This copy's random id for the usage ping, minted on first use and remembered in
+        STATE_FILE. Returns "" when there isn't one and one can't be made.
+
+        STATE_FILE and not a file of its own, for the property its own comment already
+        claims: it lives OUTSIDE the repo, so a `git pull` can't carry an id into an
+        update and copying the folder to a second machine can't clone an identity onto
+        it. A stored value that isn't the shape `telemetry.new_id()` issues is replaced
+        rather than sent — the file is editable by hand, and the one thing that must
+        never reach a URL is whatever somebody typed in there.
+
+        "" is a refusal, not a fallback: a ping with no id counts as a launch but not as
+        a person, and quietly sending one would inflate the only number that matters.
+
+        Which is why the fresh id is READ BACK before it is used. `_save_state` is
+        best-effort and swallows its failures by design, so on a machine where
+        STATE_FILE can't be written — a locked-down profile, a full disk, an antivirus
+        holding the file — minting and returning would hand out a NEW id on every single
+        launch, and one user would arrive as a hundred. That failure is invisible in the
+        data: the counts just quietly read high, and nothing distinguishes it from
+        growth. An id that didn't persist is not an id.
+        """
+        try:
+            current = _load_state().get("install_id")
+            if telemetry.valid_id(current):
+                return current
+            fresh = telemetry.new_id()
+            _save_state(install_id=fresh)
+            return fresh if _load_state().get("install_id") == fresh else ""
+        except Exception:
+            return ""
+
+    def _ping_telemetry(self):
+        """Report this launch: opt-out, not opt-in — no first-run dialog asks first, and
+        PRIVACY.md is where that is disclosed. Sends if the policy gates in
+        telemetry.state() pass AND an install id can be stored; the id is as much a gate
+        as the others, because without one there is nothing to count. On a stock build
+        none of this matters: no endpoint ships configured, so that gate alone stops it.
+
+        Reads STATE_FILE on every launch rather than caching anything at import: a
+        recorded opt-out (or, later, a config.json TELEMETRY=false) has to take effect
+        on the next start, not the next reinstall. Silent either way — a usage ping is
+        the app's business, never the user's problem, so there is no notice, no retry
+        and nothing in the chat.
+        """
+        try:
+            sending, why = telemetry.state(TELEMETRY, TELEMETRY_URL,
+                                           _load_state().get("telemetry_consent"))
+            if not sending:
+                dbg(f"telemetry: {why}")
+                return
+            iid = self._install_id()
+            if not iid:
+                dbg("telemetry: no install id could be stored - not sending")
+                return
+            telemetry.ping(TELEMETRY_URL, telemetry.fields(__version__, iid))
+        except Exception:
+            pass
 
     def _check_cli_update(self):
         """Best-effort, background: if the installed `claude` CLI is behind the latest npm

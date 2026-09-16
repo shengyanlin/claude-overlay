@@ -14,6 +14,7 @@ Two things are being protected here:
      wrong, which is the same as not checking.
 """
 import ast
+import json
 import os
 import sys
 
@@ -336,3 +337,109 @@ def test_model_menu_line_never_raises(monkeypatch):
         raise RuntimeError("nope")
     monkeypatch.setattr(mr, "entitled_families", boom)
     assert "could not be determined" in preflight.model_menu_line()
+
+
+# ── "is this thing phoning home?" ──────────────────────────────────────────────────
+# A Diagnose report has to answer that without the reader opening any source, and the
+# four gates have four different answers — so the line names the one that decided it.
+
+def _consent(tmp_path, monkeypatch, value):
+    import config
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"telemetry_consent": value}), "utf-8")
+    monkeypatch.setattr(config, "STATE_FILE", state)
+
+
+def test_telemetry_line_reports_the_shipped_default(tmp_path, monkeypatch):
+    import config
+    _consent(tmp_path, monkeypatch, True)         # even a yes reads as off with no endpoint
+    monkeypatch.setattr(config, "TELEMETRY_URL", "")
+    assert "no endpoint" in preflight.telemetry_line()
+
+
+def _state_file(tmp_path, monkeypatch, **fields):
+    import config
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps(fields), "utf-8")
+    monkeypatch.setattr(config, "STATE_FILE", state)
+
+
+def test_telemetry_line_names_the_endpoint_when_it_is_on(tmp_path, monkeypatch):
+    # Printed because a machine pointed at a self-hosted collector would otherwise read
+    # identically to one reporting to the author.
+    import config
+    import telemetry
+    _state_file(tmp_path, monkeypatch, telemetry_consent=True, install_id=telemetry.new_id())
+    monkeypatch.setattr(config, "TELEMETRY", True)
+    monkeypatch.setattr(config, "TELEMETRY_URL", "https://example.invalid/v")
+    monkeypatch.delenv("DO_NOT_TRACK", raising=False)
+    line = preflight.telemetry_line()
+    assert line.startswith("on -") and "https://example.invalid/v" in line
+
+
+def test_telemetry_line_does_not_claim_on_without_a_stored_id(tmp_path, monkeypatch):
+    # The policy gates are not the whole story: a report also needs an id that persisted.
+    # On a machine whose state file can't be written there will never be one, and a flat
+    # "on" would report it as reporting when every launch silently declines to.
+    import config
+    _state_file(tmp_path, monkeypatch, telemetry_consent=True)      # consent, but no id
+    monkeypatch.setattr(config, "TELEMETRY", True)
+    monkeypatch.setattr(config, "TELEMETRY_URL", "https://example.invalid/v")
+    monkeypatch.delenv("DO_NOT_TRACK", raising=False)
+    line = preflight.telemetry_line()
+    assert not line.startswith("on -")
+    assert "no install id" in line and "cannot be saved" in line
+
+
+def test_telemetry_line_rejects_a_stored_id_that_is_not_a_uuid4(tmp_path, monkeypatch):
+    import config
+    import uuid
+    _state_file(tmp_path, monkeypatch, telemetry_consent=True, install_id=str(uuid.uuid1()))
+    monkeypatch.setattr(config, "TELEMETRY", True)
+    monkeypatch.setattr(config, "TELEMETRY_URL", "https://example.invalid/v")
+    monkeypatch.delenv("DO_NOT_TRACK", raising=False)
+    assert "no install id" in preflight.telemetry_line()
+
+
+def test_telemetry_line_says_on_with_no_recorded_decision(tmp_path, monkeypatch):
+    # Opt-out, not opt-in: nobody having said anything is not a reason to withhold "on".
+    import config
+    import telemetry
+    _state_file(tmp_path, monkeypatch, install_id=telemetry.new_id())   # no telemetry_consent key at all
+    monkeypatch.setattr(config, "TELEMETRY", True)
+    monkeypatch.setattr(config, "TELEMETRY_URL", "https://example.invalid/v")
+    monkeypatch.delenv("DO_NOT_TRACK", raising=False)
+    assert preflight.telemetry_line().startswith("on -")
+
+
+def test_telemetry_line_distinguishes_no_decision_from_a_recorded_opt_out(tmp_path, monkeypatch):
+    import config
+    import telemetry
+    monkeypatch.setattr(config, "TELEMETRY", True)
+    monkeypatch.setattr(config, "TELEMETRY_URL", "https://example.invalid/v")
+    monkeypatch.delenv("DO_NOT_TRACK", raising=False)
+    _state_file(tmp_path, monkeypatch, install_id=telemetry.new_id())
+    assert preflight.telemetry_line().startswith("on -")
+    _consent(tmp_path, monkeypatch, False)
+    assert "opted out" in preflight.telemetry_line()
+
+
+def test_telemetry_line_reads_state_without_importing_the_app(tmp_path, monkeypatch):
+    # preflight runs when the app may be what's broken, so an unreadable state file has
+    # to degrade to "no recorded decision", not to an exception — which, being opt-out,
+    # means the install-id gate is what's left to answer, not a consent question.
+    import config
+    bad = tmp_path / "state.json"
+    bad.write_text("{not json", "utf-8")
+    monkeypatch.setattr(config, "STATE_FILE", bad)
+    monkeypatch.setattr(config, "TELEMETRY", True)
+    monkeypatch.setattr(config, "TELEMETRY_URL", "https://example.invalid/v")
+    monkeypatch.delenv("DO_NOT_TRACK", raising=False)
+    assert preflight._state() == {}
+    assert "no install id" in preflight.telemetry_line()
+
+
+def test_telemetry_line_never_raises(monkeypatch):
+    import telemetry as tl
+    monkeypatch.setattr(tl, "state", lambda *a: (_ for _ in ()).throw(RuntimeError("nope")))
+    assert "could not be determined" in preflight.telemetry_line()

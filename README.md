@@ -406,7 +406,8 @@ to change, using the constant names below — for example:
 
 Overridable: `WORKING_DIR`, `MODEL`, `MODEL_MENU_FILTER`, `QUEUE_MESSAGES`, `EFFORT`,
 `PERMISSION_MODE`,
-`SKILLS`, `STRICT_MCP_CONFIG`, `CLI_UPDATE_CHECK`, `AUTO_SCREENSHOT_DEFAULT`, `SHOT_SCOPE`,
+`SKILLS`, `STRICT_MCP_CONFIG`, `CLI_UPDATE_CHECK`, `TELEMETRY`, `TELEMETRY_URL`,
+`AUTO_SCREENSHOT_DEFAULT`, `SHOT_SCOPE`,
 `SHOT_FORMAT`, `SHOT_JPEG_QUALITY`, `SHOT_DEDUPE_BITS`, `HIDE_SCREENSHOT_TOOL`, `THEME`,
 `SHOW_IN_SCREEN_SHARE_DEFAULT`, `TASKBAR_BUTTON`, `HOTKEY`, `WINDOW_ALPHA`,
 `CORNER_RADIUS`, `ORB_SIZE`, `FONT_SANS` / `FONT_SERIF` / `FONT_MONO`.
@@ -441,6 +442,12 @@ The settings themselves:
   Code CLI's type-ahead behaviour). Set it to `false` to restore the old meaning of
   `Enter` mid-reply: interrupt. Stopping (the ■ button or `Esc`) always drops the
   line-up, with the texts listed in the transcript so nothing is silently lost.
+- `TELEMETRY` / `TELEMETRY_URL` — anonymous usage reporting: one request per launch
+  carrying the version, a random install id, the OS build and the Python version, and
+  nothing else — no prompts, no replies, no screenshots, no paths. **Nothing is sent in
+  this release**: `TELEMETRY_URL` ships empty. When a future release configures one, it
+  is **opt-out** — `DO_NOT_TRACK=1` or `CLAUDE_OVERLAY_TELEMETRY=0` turns it off, checked
+  fresh on every launch. Full details: [PRIVACY.md](PRIVACY.md).
 - `EFFORT` — reasoning-effort ceiling for overlay sessions: `"low"`, `"medium"`,
   `"high"`, `"xhigh"`, `"max"`, or `""` (default) to inherit your CLI's setting
   (`effortLevel` in `~/.claude/settings.json`, or the CLI default). The same dial as the
@@ -537,6 +544,16 @@ can't spend, change or send anything, and no token is ever refreshed (that stays
 CLI's job). Accounts authenticating another way — API key, Bedrock, Vertex, a gateway —
 are skipped entirely, and every failure just leaves the gauge as it was. It's all in
 [`usage.py`](usage.py), which is short and commented for exactly this reason.
+
+## Privacy
+
+Claude Overlay can report anonymous usage counts — how many people use it and which
+version they run: a version string, a random per-install id, the OS build, the Python
+version, nothing else. **Nothing is sent in this release** (no endpoint is configured).
+When a future release turns it on, it is **opt-out**, disclosed here rather than behind
+a first-run dialog — `DO_NOT_TRACK=1` or `CLAUDE_OVERLAY_TELEMETRY=0` switches it off,
+checked fresh on every launch. Full details, including exactly what is and isn't sent:
+[PRIVACY.md](PRIVACY.md).
 
 ## Contributing
 

@@ -303,6 +303,18 @@ CLI_UPDATE_CHECK = _env_bool("CLAUDE_OVERLAY_CLI_UPDATE_CHECK", True)   # on lau
                             # the overlay current never advances the CLI, and an old CLI silently
                             # runs an older model. Set CLAUDE_OVERLAY_CLI_UPDATE_CHECK=0 to disable
                             # (e.g. a locked-down box where global npm installs aren't allowed)
+TELEMETRY = _env_bool("CLAUDE_OVERLAY_TELEMETRY", True)   # master switch for the anonymous
+                            # usage ping (telemetry.py has the complete payload and PRIVACY.md
+                            # the plain-English version). This being True does NOT mean anything
+                            # is sent: the ping also needs an endpoint below AND an explicit
+                            # opt-in remembered in STATE_FILE, so a stock build reports nothing.
+                            # Set CLAUDE_OVERLAY_TELEMETRY=0 (or the standard DO_NOT_TRACK=1) to
+                            # hold it off regardless of what the other two say
+TELEMETRY_URL = (os.environ.get("CLAUDE_OVERLAY_TELEMETRY_URL") or "").strip()
+                            # "" = never send, which is the shipped default. Must be https (the
+                            # install id would otherwise travel in clear text). Overridable per
+                            # machine like everything else, so an organisation that wants its own
+                            # numbers can point this at its own collector instead of the author's
 RESUME_OFFER = _env_bool("CLAUDE_OVERLAY_RESUME_OFFER", True)   # on launch, when the previous
                             # run left a conversation behind, show a one-click "Resume last
                             # conversation" button in the chat. The session id is remembered
@@ -484,6 +496,8 @@ _USER_CONFIG_KEYS = {
     "STRICT_MCP_CONFIG": _v_bool,
     "MCP_SERVERS": _v_mcp_servers,             # {name: {...}} — loads even under strict
     "CLI_UPDATE_CHECK": _v_bool,
+    "TELEMETRY": _v_bool,                      # false = never send the anonymous usage ping
+    "TELEMETRY_URL": _v_str,                   # "" ships; https only, enforced in telemetry.state
     # capture
     "AUTO_SCREENSHOT_DEFAULT": _v_bool,
     "SHOT_SCOPE": _v_choice("screens", "window"),
@@ -513,6 +527,8 @@ _ENV_BEATS_JSON = {
     "SHOT_SCOPE": "CLAUDE_OVERLAY_SHOT_SCOPE",
     "STRICT_MCP_CONFIG": "CLAUDE_OVERLAY_STRICT_MCP",
     "CLI_UPDATE_CHECK": "CLAUDE_OVERLAY_CLI_UPDATE_CHECK",
+    "TELEMETRY": "CLAUDE_OVERLAY_TELEMETRY",
+    "TELEMETRY_URL": "CLAUDE_OVERLAY_TELEMETRY_URL",
 }
 
 

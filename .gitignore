@@ -39,3 +39,10 @@ Thumbs.db
 # architecture rather than inherit whichever one happened to get committed.
 offline/*.zip
 offline/*.tar.gz
+
+# wrangler's local cache/state — NEVER commit this. It holds the Cloudflare account id
+# AND the email the account is registered under ("<name>@gmail.com's Account") after a
+# single wrangler run. The collector itself lives in a private repo and nothing here
+# should need wrangler at all — which is exactly why this stays: the one time it appears
+# will be the time nobody was expecting it.
+.wrangler/
