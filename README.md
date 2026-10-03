@@ -13,6 +13,8 @@
 
 <p align="center"><sub><b>Windows 10 / 11</b> only (for now) · runs on your existing Claude subscription — no API key</sub></p>
 
+https://github.com/user-attachments/assets/498f9f03-1ded-4177-93a4-60fe406b16c9
+
 <p align="center">
   <img src="docs/demo.gif" alt="Browsing the Google Cloud AI agent handbook, then summoning the overlay to ask what the page is about — it reads the screen, answers, and offers to translate" width="640">
 </p>
