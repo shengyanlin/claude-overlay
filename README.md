@@ -15,10 +15,6 @@
 
 https://github.com/user-attachments/assets/498f9f03-1ded-4177-93a4-60fe406b16c9
 
-<p align="center">
-  <img src="docs/demo.gif" alt="Browsing the Google Cloud AI agent handbook, then summoning the overlay to ask what the page is about — it reads the screen, answers, and offers to translate" width="640">
-</p>
-
 **Claude Overlay** is a frameless, always-on-top chat window that floats over
 everything you do. Ask a question, and Claude looks at your **real
 screen** — every monitor — to answer. No copy-pasting error messages, no
