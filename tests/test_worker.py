@@ -355,6 +355,22 @@ class TestMakeOptions:
         opts = w._make_options()
         assert opts.model == "claude-opus-4-8"
 
+    def test_pins_the_cli_found_on_path(self, monkeypatch):
+        # Without cli_path the SDK runs the claude.exe bundled in its wheel, which `claude
+        # update` never touches — a newer model then 400s with "Claude Code 2.1.150 does not
+        # support this model". The session must run the same CLI modelresolve probes.
+        monkeypatch.setattr(worker_module.shutil, "which",
+                            lambda name, *a, **k: r"C:\npm\claude.cmd" if name == "claude" else None)
+        opts = make_worker()._make_options()
+        assert str(opts.cli_path) == r"C:\npm\claude.cmd"
+
+    def test_no_cli_on_path_leaves_sdk_discovery_alone(self, monkeypatch):
+        # Nothing on PATH: pass nothing, so the SDK's bundled CLI is still a fallback
+        # rather than the overlay refusing to start.
+        monkeypatch.setattr(worker_module.shutil, "which", lambda *a, **k: None)
+        opts = make_worker()._make_options()
+        assert opts.cli_path is None
+
     def test_has_cwd_attribute(self):
         w = make_worker()
         opts = w._make_options()

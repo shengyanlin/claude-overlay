@@ -3,6 +3,18 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.23.1] - 2026-10-04
+
+### Fixed
+- **"API Error: 400 Claude Code 2.1.150 does not support this model" even after
+  `claude update`.** The Agent SDK prefers a `claude.exe` bundled inside its own Python
+  package over the `claude` on your PATH, and that bundled copy only changes when the SDK
+  is reinstalled. So updating Claude Code — by hand or from the overlay's own update
+  notice — upgraded a CLI the overlay never ran, and the model picker (which probes the
+  PATH `claude`) chose a model the bundled one was too old to serve. The overlay now tells
+  the SDK to use the `claude` on your PATH, so updating Claude Code is enough. If no
+  `claude` is on PATH, the SDK's own lookup still applies.
+
 ## [1.23.0] - 2026-09-17
 
 This release starts reporting anonymous usage counts, on by default. Read the

@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -322,6 +323,15 @@ class ClaudeWorker(threading.Thread):
                            "append": SYSTEM_APPEND, "exclude_dynamic_sections": True},
         )
         opts["max_buffer_size"] = MAX_BUFFER_SIZE
+        cli = shutil.which("claude")
+        if cli:
+            # Pin the CLI on PATH. Left unset, the SDK prefers a `claude.exe` bundled INSIDE
+            # its own wheel, which only moves when the SDK is reinstalled — so `claude
+            # update` (and the overlay's own CLI-update notice) upgrade a copy the overlay
+            # never runs, and a model newer than the bundled CLI fails with "API Error: 400
+            # Claude Code 2.1.150 does not support this model". modelresolve also probes
+            # shutil.which("claude"), so this keeps the probe and the session on ONE CLI.
+            opts["cli_path"] = cli
         if EFFORT:
             # Same dial as the CLI's --effort flag, scoped to this overlay session. ""
             # (default) passes nothing, so the CLI keeps honouring the user's own
