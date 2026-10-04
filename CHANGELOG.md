@@ -3,6 +3,15 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.23.2] - 2026-10-04
+
+### Fixed
+- **"Could not start Claude: Refusing to execute batch script … claude.CMD" after
+  updating to 1.23.1.** A global npm install puts `claude.cmd` on PATH, and newer
+  `claude-agent-sdk` releases refuse to run `.cmd`/`.bat` files. 1.23.1 handed the SDK that
+  shim directly. The overlay now passes the native `claude.exe` the shim forwards to, and
+  if there is none it passes nothing and lets the SDK find a CLI itself.
+
 ## [1.23.1] - 2026-10-04
 
 ### Fixed
