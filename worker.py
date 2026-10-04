@@ -24,6 +24,21 @@ os.environ["PATH"] = os.pathsep.join(filter(None, [
     os.environ.get("PATH", ""),
 ]))
 
+
+def _native_cli():
+    """The `claude` on PATH as something the SDK will actually execute, or None.
+
+    A global npm install puts `claude.cmd` on PATH, and newer SDKs refuse to run .cmd/.bat
+    (cmd.exe argument injection) — "Refusing to execute batch script". That shim only
+    forwards to the native exe inside the package, so resolve to it. None (no CLI, or a
+    shim with no exe behind it) leaves the SDK's own discovery in charge."""
+    cli = shutil.which("claude")
+    if not cli or os.path.splitext(cli)[1].lower() not in (".cmd", ".bat"):
+        return cli
+    exe = os.path.join(os.path.dirname(cli), "node_modules", "@anthropic-ai",
+                       "claude-code", "bin", "claude.exe")
+    return exe if os.path.isfile(exe) else None
+
 # Spawn the `claude` CLI subprocess with no console window. Without this, running
 # under pythonw (no console) makes Windows pop a CMD window for the console-mode CLI.
 # Best-effort: if a future anyio drops/renames open_process, degrade gracefully
@@ -323,7 +338,7 @@ class ClaudeWorker(threading.Thread):
                            "append": SYSTEM_APPEND, "exclude_dynamic_sections": True},
         )
         opts["max_buffer_size"] = MAX_BUFFER_SIZE
-        cli = shutil.which("claude")
+        cli = _native_cli()
         if cli:
             # Pin the CLI on PATH. Left unset, the SDK prefers a `claude.exe` bundled INSIDE
             # its own wheel, which only moves when the SDK is reinstalled — so `claude

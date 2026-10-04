@@ -360,9 +360,26 @@ class TestMakeOptions:
         # update` never touches — a newer model then 400s with "Claude Code 2.1.150 does not
         # support this model". The session must run the same CLI modelresolve probes.
         monkeypatch.setattr(worker_module.shutil, "which",
-                            lambda name, *a, **k: r"C:\npm\claude.cmd" if name == "claude" else None)
+                            lambda name, *a, **k: r"C:\bin\claude.exe" if name == "claude" else None)
         opts = make_worker()._make_options()
-        assert str(opts.cli_path) == r"C:\npm\claude.cmd"
+        assert str(opts.cli_path) == r"C:\bin\claude.exe"
+
+    def test_npm_cmd_shim_resolves_to_the_exe_behind_it(self, monkeypatch, tmp_path):
+        # Newer SDKs refuse to run a .cmd ("Refusing to execute batch script"), and a global
+        # npm install's PATH entry IS claude.cmd — pass the native exe it forwards to.
+        exe = tmp_path / "node_modules" / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe"
+        exe.parent.mkdir(parents=True)
+        exe.write_bytes(b"")
+        monkeypatch.setattr(worker_module.shutil, "which",
+                            lambda *a, **k: str(tmp_path / "claude.CMD"))
+        opts = make_worker()._make_options()
+        assert str(opts.cli_path) == str(exe)
+
+    def test_cmd_shim_with_no_exe_behind_it_is_never_passed(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(worker_module.shutil, "which",
+                            lambda *a, **k: str(tmp_path / "claude.cmd"))
+        opts = make_worker()._make_options()
+        assert opts.cli_path is None
 
     def test_no_cli_on_path_leaves_sdk_discovery_alone(self, monkeypatch):
         # Nothing on PATH: pass nothing, so the SDK's bundled CLI is still a fallback
