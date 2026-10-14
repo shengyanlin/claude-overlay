@@ -243,23 +243,38 @@ class ClaudeWorker(threading.Thread):
         self.req.put(("set_effort", level))
 
     async def _do_set_effort(self, level):
-        """Apply a new effort level. --effort is a launch flag — the SDK exposes no runtime
-        control for it (checked: set_model and set_permission_mode exist, set_effort does
-        not) — so the only way to change it is to relaunch the CLI. _reconnect does that
-        WITH the session id, so the conversation carries over; the cost is one connect
-        (~10s here). Before the first connect there is nothing to relaunch: the value just
-        waits for _open to pick it up. The UI learns the outcome from the ("effort", …)
-        event, never from its own click, so the ⚡ label can't claim a level the CLI
-        isn't running."""
+        """Apply a new effort level to the live session.
+
+        Fast path: the CLI's own `/effort <level>` command, sent as a query. It is marked
+        supportsNonInteractive in the CLI, so it works over the SDK's stream, applies in
+        ~0.1s with no relaunch, and answers "Set effort level to <level> (this session
+        only)…" — that reply is the confirmation we key on (measured 2026-10-14: the next
+        turn's thinking/verbosity changed accordingly). The SDK itself has no control
+        request for effort (set_model and set_permission_mode exist; set_effort does not),
+        which is why this goes through a query rather than a client method.
+
+        Slow path, kept for two cases the command can't serve: "" (back to the CLI's own
+        settings.json effortLevel — there is no slash form for "unset"), and an older CLI
+        with no /effort, whose reply won't match. Those relaunch via _reconnect WITH the
+        session id, so the conversation carries over at the cost of one connect (~10-14s).
+        Before the first connect there is nothing to change yet: the value just waits for
+        _open, which reads self._effort. Either way the UI learns the outcome from the
+        ("effort", …) event, never from its own click, so the ⚡ label can't claim a level
+        the CLI isn't running."""
         level = level or ""
         old = self._effort
-        self._effort = level           # BEFORE the reconnect: _make_options reads it
         if self._client is None:
+            self._effort = level
             self.ui.put(("effort", level))
             self.ui.put(("status", ""))
             return
-        label = next((lbl for lbl, v in EFFORT_LEVELS if v == level), level or "default")
         try:
+            if level and await self._slash_effort(level):
+                self._effort = level    # also what any later reconnect relaunches with
+                self.ui.put(("effort", level))
+                return
+            self._effort = level        # BEFORE the reconnect: _make_options reads it
+            label = next((lbl for lbl, v in EFFORT_LEVELS if v == level), level or "default")
             await self._reconnect(note=f"⚡ Effort → {label} — relaunching Claude and "
                                        "resuming the conversation…")
             if self._client is None:
@@ -271,6 +286,34 @@ class ClaudeWorker(threading.Thread):
             self.ui.put(("effort", old))   # re-sync the label with what is actually running
         finally:
             self.ui.put(("status", ""))
+
+    async def _slash_effort(self, level):
+        """`/effort <level>` on the live client → True only when the CLI confirmed THAT
+        level. Anything else is False and the caller relaunches instead: an error result,
+        a reply that isn't the confirmation (an older CLI has no /effort and would hand the
+        text to the model as a prompt — its answer won't start with the magic words), or no
+        reply at all within EFFORT_SLASH_TIMEOUT (the relaunch's _close then clears the
+        stuck client). Never raises: a failed fast path is just a slow path."""
+        try:
+            async def _exchange():
+                await self._client.query(f"/effort {level}")
+                text = ""
+                async for msg in self._client.receive_response():
+                    if isinstance(msg, AssistantMessage):
+                        text += "".join(b.text for b in (msg.content or [])
+                                        if isinstance(b, TextBlock))
+                    elif isinstance(msg, ResultMessage):
+                        if getattr(msg, "is_error", False):
+                            return ""
+                        return text or str(getattr(msg, "result", "") or "")
+                return text
+            reply = await asyncio.wait_for(_exchange(), EFFORT_SLASH_TIMEOUT)
+            ok = reply.strip().lower().startswith(f"set effort level to {level.lower()}")
+            dbg("effort_slash", f"{level} ok={ok} | {reply[:120]}")
+            return ok
+        except Exception as e:
+            dbg("effort_slash", f"{level} failed: {type(e).__name__}: {e}")
+            return False
 
     async def _do_set_permission_mode(self, client, mode):
         if mode == "bypassPermissions" and not self._bypass_capable:

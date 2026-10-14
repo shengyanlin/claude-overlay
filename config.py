@@ -239,6 +239,8 @@ MAX_BUFFER_SIZE = 64 * 1024 * 1024   # the SDK aborts a turn with CLIJSONDecodeE
 CONNECT_TIMEOUT = 30        # connect() that hasn't resolved by here ⇒ wedged transport
 QUERY_TIMEOUT = 60          # sending the request is near-instant; bound it anyway
 DISCONNECT_TIMEOUT = 10     # don't let a stuck disconnect hang shutdown/reconnect
+EFFORT_SLASH_TIMEOUT = 15   # `/effort <level>` is handled locally by the CLI (~0.1s measured);
+                            # no reply by then ⇒ give up on the fast path and relaunch instead
 RECV_IDLE_TIMEOUT = 300     # no stream activity for this long ⇒ treat the transport as dead
                             # (generous: a long-running tool can legitimately go quiet a while)
 MAX_INLINE_IMAGE_BYTES = 16 * 1024 * 1024   # never base64-inline a local file bigger than this

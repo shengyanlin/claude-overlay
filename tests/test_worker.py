@@ -476,9 +476,11 @@ class TestMakeOptions:
 
 class TestSetEffort:
     """The SDK has set_model and set_permission_mode but no set_effort (checked against
-    0.2.163): effort only exists as --effort on the spawned CLI. So the switch is a
-    reconnect carrying the session, and the UI must learn the result from the ('effort',
-    …) event — the label may never claim a level the running CLI doesn't have."""
+    0.2.163). The CLI does have `/effort <level>` marked supportsNonInteractive, so the
+    switch is that command over the live session (~0.1s, measured 2026-10-14), with a
+    session-carrying reconnect as the fallback for "" (no slash form for "unset") and for
+    a CLI whose reply isn't the confirmation. Either way the UI learns the result from the
+    ('effort', …) event — the label may never claim a level the running CLI doesn't have."""
 
     def test_enqueue(self):
         w = make_worker()
@@ -486,7 +488,7 @@ class TestSetEffort:
         assert w.req.get_nowait() == ("set_effort", "high")
 
     def test_before_first_connect_just_stores_and_confirms(self):
-        # Nothing to relaunch yet: the value waits for _open, which reads self._effort.
+        # Nothing to change yet: the value waits for _open, which reads self._effort.
         w = make_worker()
         assert w._client is None
         asyncio.run(w._do_set_effort("medium"))
@@ -494,9 +496,40 @@ class TestSetEffort:
         assert w._make_options().extra_args == {"effort": "medium"}
         assert ("effort", "medium") in _drain(w.ui)
 
-    def test_connected_relaunches_with_the_new_level_and_confirms(self):
+    @staticmethod
+    def _slash(w, result):
+        """Stub the fast path with a fixed outcome and record the levels it was asked for."""
+        asked = []
+
+        async def fake(level):
+            asked.append(level)
+            return result
+        w._slash_effort = fake
+        return asked
+
+    def test_connected_uses_the_slash_command_and_does_not_relaunch(self):
         w = make_worker()
         w._client = object()                          # "connected"
+        asked = self._slash(w, True)
+
+        async def must_not(note=None):
+            raise AssertionError("relaunched although /effort worked")
+        w._reconnect = must_not
+        asyncio.run(w._do_set_effort("xhigh"))
+        assert asked == ["xhigh"]
+        assert w._effort == "xhigh"
+        assert w._make_options().extra_args == {"effort": "xhigh"}   # a later hiccup-reconnect keeps it
+        events = _drain(w.ui)
+        assert ("effort", "xhigh") in events
+        assert ("status", "") in events                # clears "switching effort…"
+        assert not any(k == "system" for k, _ in events)   # no "relaunching…" line
+
+    def test_unconfirmed_slash_falls_back_to_a_relaunch(self):
+        # An older CLI without /effort hands the text to the model, whose answer is not the
+        # confirmation → False → the universal slow path, carrying the session.
+        w = make_worker()
+        w._client = object()
+        self._slash(w, False)
         seen = {}
 
         async def fake_reconnect(note=None):
@@ -510,15 +543,29 @@ class TestSetEffort:
         asyncio.run(w._do_set_effort("xhigh"))
         assert seen["opts_at_relaunch"].extra_args == {"effort": "xhigh"}
         assert "Extra high" in seen["note"] and "resum" in seen["note"].lower()
-        events = _drain(w.ui)
-        assert ("effort", "xhigh") in events
-        assert ("status", "") in events                # clears "switching effort…"
+        assert ("effort", "xhigh") in _drain(w.ui)
+
+    def test_inherit_never_tries_the_slash_and_relaunches(self):
+        # "" has no /effort form (there is no "unset"); it must go straight to the relaunch.
+        w = ClaudeWorker(queue.Queue(), effort="high")
+        w._client = object()
+        asked = self._slash(w, True)
+
+        async def fake_reconnect(note=None):
+            w._client = object()
+        w._reconnect = fake_reconnect
+        asyncio.run(w._do_set_effort(""))
+        assert asked == []
+        assert w._effort == ""
+        assert not getattr(w._make_options(), "extra_args", None)
+        assert ("effort", "") in _drain(w.ui)
 
     def test_failed_relaunch_reverts_and_resyncs_the_label(self):
         # A relaunch that leaves no client must not be remembered as the new level —
         # the UI would persist a choice that never took and show a label that lies.
         w = ClaudeWorker(queue.Queue(), effort="low")
         w._client = object()
+        self._slash(w, False)
 
         async def dead_reconnect(note=None):
             w._client = None
@@ -537,6 +584,66 @@ class TestSetEffort:
         asyncio.run(w._do_set_effort(None))
         assert w._effort == ""
         assert not getattr(w._make_options(), "extra_args", None)
+
+
+class TestSlashEffort:
+    """_slash_effort keys on the CLI's own confirmation text, because that is the only
+    signal the stream carries: a local command answers with an AssistantMessage + a
+    success ResultMessage whose text starts "Set effort level to <level>"."""
+
+    class _Client:
+        def __init__(self, *msgs, hang=False):
+            self.sent, self.msgs, self.hang = [], msgs, hang
+
+        async def query(self, text):
+            self.sent.append(text)
+
+        async def receive_response(self):
+            if self.hang:
+                await asyncio.sleep(3600)
+            for m in self.msgs:
+                yield m
+
+    @staticmethod
+    def _reply(text, is_error=False):
+        from claude_agent_sdk import AssistantMessage, TextBlock, ResultMessage
+        return (AssistantMessage(content=[TextBlock(text=text)], model="m"),
+                ResultMessage(subtype="success", duration_ms=1, duration_api_ms=0,
+                              is_error=is_error, num_turns=1, session_id="s", result=text))
+
+    def _run(self, client, level):
+        w = make_worker()
+        w._client = client
+        return asyncio.run(w._slash_effort(level))
+
+    def test_confirmation_is_true_and_sends_the_command(self):
+        c = self._Client(*self._reply("Set effort level to high (this session only): Deeper reasoning"))
+        assert self._run(c, "high") is True
+        assert c.sent == ["/effort high"]
+
+    def test_confirmation_for_another_level_is_false(self):
+        # Belt and braces: the CLI confirming a level we didn't ask for is not a success.
+        c = self._Client(*self._reply("Set effort level to low (this session only): Quick"))
+        assert self._run(c, "high") is False
+
+    def test_a_model_answer_is_false(self):
+        # Older CLI: no such command, so the model got "/effort high" as a prompt.
+        c = self._Client(*self._reply("I can't change my effort level, but I can help with…"))
+        assert self._run(c, "high") is False
+
+    def test_an_error_result_is_false(self):
+        c = self._Client(*self._reply("Set effort level to high", is_error=True))
+        assert self._run(c, "high") is False
+
+    def test_no_reply_is_false_not_a_hang(self, monkeypatch):
+        monkeypatch.setattr(worker_module, "EFFORT_SLASH_TIMEOUT", 0.05)
+        assert self._run(self._Client(hang=True), "high") is False
+
+    def test_a_raising_client_is_false(self):
+        class Boom:
+            async def query(self, text):
+                raise RuntimeError("transport gone")
+        assert self._run(Boom(), "high") is False
 
 
 # ---------------------------------------------------------------------------
