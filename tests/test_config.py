@@ -416,22 +416,33 @@ class TestUserConfig:
         assert len(c.USER_CONFIG_WARNINGS) == 1
         assert "PERMISSION_MODE" in c.USER_CONFIG_WARNINGS[0]
 
-    def test_effort_defaults_to_inherit(self):
-        # "" = pass nothing, so the CLI keeps honouring the user's own settings.json
-        # effortLevel. The overlay must never silently override a reasoning-depth choice.
-        assert config.EFFORT == ""
+    def test_effort_defaults_to_low(self):
+        # Measured 2026-10-14: an inherited xhigh turned a one-line rewrite into 14-24s
+        # (thinking plus a tool detour); "low" answered the same in 3-4s. The overlay is a
+        # quick-turn chat, so it ships low and the ⚡ menu raises it per session.
+        assert config.EFFORT == "low"
+
+    def test_effort_menu_offers_exactly_the_accepted_values(self):
+        # The ⚡ menu and the config validator must agree, or the menu could launch the
+        # CLI with a flag value config.json is not allowed to set (or vice versa). Pinned
+        # to the validator's own allowed set — rule, not a second copy of the list.
+        offered = [v for _, v in config.EFFORT_LEVELS]
+        assert set(offered) == set(config._USER_CONFIG_KEYS["EFFORT"].allowed)
+        assert len(offered) == len(set(offered))
+        assert "" in offered                    # "inherit the CLI" stays reachable
 
     def test_effort_override_is_accepted_and_canonical(self, load_cfg):
         c = load_cfg({"EFFORT": "Medium"})
         assert c.EFFORT == "medium"
         assert c.USER_CONFIG_WARNINGS == []
 
-    def test_effort_typo_warns_and_keeps_inherit(self, load_cfg):
-        # A rejected value must fall back to "" (inherit), not to some fixed effort — and
-        # it must be SEEN: an unnoticed typo here would otherwise quietly change how long
-        # the model thinks on every single message.
+    def test_effort_typo_warns_and_keeps_the_default(self, load_cfg):
+        # A rejected value must fall back to the shipped default, not to some other fixed
+        # effort — and it must be SEEN: an unnoticed typo here would otherwise quietly
+        # change how long the model thinks on every single message.
         c = load_cfg({"EFFORT": "ultra"})
-        assert c.EFFORT == ""
+        assert c.EFFORT == "low"       # the shipped default, spelled out: load_cfg reloads
+                                       # the module, so comparing to config.EFFORT is a tautology
         assert any("EFFORT" in w for w in c.USER_CONFIG_WARNINGS)
 
     def test_unknown_key_warns(self, load_cfg):

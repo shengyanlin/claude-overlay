@@ -562,6 +562,17 @@ def _startup_permission_mode():
     return ro, ("plan" if ro else full)
 
 
+def _startup_effort():
+    """The effort to LAUNCH the worker with: the remembered ⚡ choice — a deliberate user
+    choice, like Read-only and Window-only — over the config default, which seeds the
+    first launch. Only a level the menu can offer is honoured: a hand-edited or stale
+    state.json must not launch the CLI with a flag value it would reject."""
+    saved = _load_state().get("effort")
+    if isinstance(saved, str) and saved in {v for _, v in EFFORT_LEVELS}:
+        return saved
+    return EFFORT
+
+
 def round_rect(c, x1, y1, x2, y2, r, **kw):
     pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
            x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
@@ -587,6 +598,9 @@ class Overlay:
         if not SHOT_SCOPE_FORCED:                     # remembered toggle choice survives a
             self.window_shot = bool(_load_state().get("window_shot", self.window_shot))
                                                       # relaunch; an explicit env var beats it
+        self.effort = _startup_effort()   # the ⚡ level the worker is LAUNCHED with; the
+                                          # statusline menu changes it via the worker
+                                          # (confirmed async) and confirmed changes persist
         self.share_visible = SHOW_IN_SCREEN_SHARE_DEFAULT   # True → overlay shows in screen shares
         # self.read_only was set above (worker launch); the toggle flips it via the
         # worker (confirmed async) and each confirmed change is persisted.
@@ -898,7 +912,7 @@ class Overlay:
             if "err" in _worker_import:
                 _report_import_failure(_worker_import["err"])
             cls = _worker_import["cls"]
-        return cls(self.ui_q, permission_mode=mode)
+        return cls(self.ui_q, permission_mode=mode, effort=self.effort)
 
     def _start_usage_poll(self):
         """Start the allowance poll, so the gauge has a number before the first message.
@@ -1771,6 +1785,13 @@ class Overlay:
                                    font=self.f_small, anchor="w", cursor="hand2")
         self.statusline.pack(side="left", padx=(self.px(16), 0), pady=(0, self.px(6)))
         self.statusline.bind("<Button-1>", self._model_menu)
+        # Effort gets its own click target right after the model — together they read as
+        # "what is answering me, and how hard is it thinking". One click shows the level,
+        # one more changes it (same popup pattern as the model switcher).
+        self.effort_lbl = tk.Label(sl, text="", bg=T["bg"], fg=T["faint"],
+                                   font=self.f_small, anchor="w", cursor="hand2")
+        self.effort_lbl.pack(side="left", padx=(self.px(9), 0), pady=(0, self.px(6)))
+        self.effort_lbl.bind("<Button-1>", self._effort_menu)
         # The context gauge is its OWN label so it can go amber/red on its own: recolouring one
         # line to warn about one number would have dragged the model name and version with it.
         # It also keeps the model menu's click target on the model, where it belongs.
@@ -5410,6 +5431,7 @@ class Overlay:
         # version goes last so it clips first if the window is narrow; ⬆ flags an update
         ver = f"v{__version__}" + ("  ⬆" if self._update_available else "")
         self.statusline.configure(text=f"{self._model or 'Claude'} ▾", fg=T["muted"])
+        self.effort_lbl.configure(text=f"·   ⚡ {self.effort or 'default'} ▾", fg=T["muted"])
         self.ctx_lbl.configure(text=f"·   {self._gauge_text()}", fg=self._ctx_color())
         q = self._quota_text()
         self.quota_lbl.configure(text=(f"·   {q}" if q else ""), fg=self._gauge_color())
@@ -6199,6 +6221,45 @@ class Overlay:
         self._set_status("switching model…")
         self.worker.set_model(val)
 
+    # ── ⚡ effort switcher (statusline) ──
+    def _effort_items(self):
+        """The (label, value) rows of the ⚡ menu, the ACTIVE level ticked. Split out from
+        _effort_menu so it's unit-testable without popping a real Tk menu (same split as
+        _gear_items). The tick follows the CONFIRMED level, never a pending click."""
+        return [(("✓  " if v == self.effort else "      ") + lbl, v) for lbl, v in EFFORT_LEVELS]
+
+    def _effort_menu(self, e):
+        m = tk.Menu(self.root, tearoff=0, bg=T["field"], fg=T["text"],
+                    activebackground=T["accent"], activeforeground=T["on_accent"], bd=0)
+        for lbl, val in self._effort_items():
+            m.add_command(label=lbl, command=lambda v=val: self._switch_effort(v))
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+
+    def _switch_effort(self, val):
+        if val == self.effort:
+            return                      # picking the ticked row must not relaunch anything
+        if self.busy:   # the switch relaunches the CLI; mid-stream that kills the reply
+            self.add_sys("⏳ Finish (or Stop) the current reply before changing effort.")
+            return
+        self._set_status("switching effort…")
+        self.worker.set_effort(val)     # the label follows the worker's confirmation
+
+    def _apply_effort(self, level):
+        """Worker confirmed the effort the session is running at: sync the ⚡ label and,
+        when it actually changed, persist it and say so in-chat (the switch itself is
+        invisible on screen). Only CONFIRMED switches are remembered, never requests, so
+        a relaunch that failed can't be saved as a choice that took."""
+        changed = (level != self.effort)
+        self.effort = level
+        self._refresh_statusline()
+        if changed:
+            _save_state(effort=level)
+            label = next((lbl for lbl, v in EFFORT_LEVELS if v == level), level or "default")
+            self.add_sys(f"⚡ Effort is now {label}.")
+
     def _on_wheel(self, e):
         # Same scroll as before (no "break", so behavior is unchanged) — but timed. Tk
         # relayouts a Text holding many embedded canvases (our message bubbles + tool
@@ -6584,6 +6645,8 @@ class Overlay:
             self._set_status(str(payload))
         elif kind == "permission_mode":
             self._apply_permission_mode(str(payload))
+        elif kind == "effort":
+            self._apply_effort(str(payload or ""))
         elif kind == "system":
             self.add_sys(str(payload))
         elif kind == "update":

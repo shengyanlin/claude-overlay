@@ -3,6 +3,25 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **⚡ effort switcher on the statusline.** Next to the model: `⚡ low ▾` — click for
+  Low / Medium / High / Extra high / Max, or Default (your CLI's own `effortLevel`). Effort
+  is a launch flag with no live control in the Agent SDK, so a switch relaunches Claude
+  **with the conversation resumed** (one connect, ~10s) and the label changes only once
+  the new CLI is actually up — it never claims a level the session isn't running. The
+  choice is remembered across launches; `EFFORT` in config now seeds just the first one.
+
+### Changed
+- **Effort now defaults to `low` instead of inheriting your CLI's setting.** Measured on
+  2026-10-14 with the same model and the same one-line "rewrite this as a slide title":
+  inherited `xhigh` took 14–24s per reply — several seconds of thinking, then a tool call
+  it decided the answer deserved, then a 600-token answer to a request for one line — and
+  `low` took 3–4s for the same title. The overlay is a quick-turn chat; the ⚡ menu is how
+  you buy depth for the turns that need it. Set `"EFFORT": ""` in config.json to get the
+  old inherit-everything behaviour back as your starting point.
+
 ## [1.23.2] - 2026-10-04
 
 ### Fixed

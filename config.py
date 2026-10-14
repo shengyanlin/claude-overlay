@@ -66,16 +66,23 @@ MODELS = [("Opus", "opus"), ("Opus (1M)", "opus[1m]"),
 # need the unfiltered list back — e.g. an entitlement the cache hasn't caught up with yet.
 MODEL_MENU_FILTER = _env_bool("CLAUDE_OVERLAY_MODEL_FILTER", True)
 
-# Reasoning-effort ceiling for overlay sessions: "low" | "medium" | "high" | "xhigh" |
-# "max", or "" (default) to inherit whatever the CLI would use — your
-# ~/.claude/settings.json `effortLevel`, or the CLI's own default. This is the same dial
-# as the CLI's `--effort` flag, scoped to the overlay only. Why it exists: a floating
-# screen-chat lives on quick turnaround, and a global effortLevel tuned for deep terminal
-# work (e.g. "xhigh") makes the model think for many extra seconds before EVERY overlay
-# reply — measured 2026-08: at xhigh even a trivial one-liner spent 6-11s thinking first.
-# Setting a lower ceiling here buys that time back without touching your CLI sessions.
-# Applied at session start (connect/reconnect), not mid-conversation.
-EFFORT = ""
+# Reasoning-effort for overlay sessions: "low" | "medium" | "high" | "xhigh" | "max", or
+# "" to inherit whatever the CLI would use — your ~/.claude/settings.json `effortLevel`,
+# or the CLI's own default. This is the same dial as the CLI's `--effort` flag, scoped to
+# the overlay only. Why it exists: a floating screen-chat lives on quick turnaround, and a
+# global effortLevel tuned for deep terminal work (e.g. "xhigh") makes the model think for
+# many extra seconds before EVERY overlay reply — measured 2026-08: at xhigh even a trivial
+# one-liner spent 6-11s thinking first. Measured again 2026-10-14 on a one-line "rewrite
+# this as a slide title": inherited xhigh took 14-24s per reply (thinking, plus a detour
+# through a tool call it decided the answer deserved); "low" took 3-4s with the same model
+# and an answer of the same quality. So the overlay now ships at "low": the chat is for
+# quick turns, and the statusline's ⚡ menu raises it for the turns that need depth (the
+# choice is remembered across launches; this constant seeds the first one). Effort is a
+# CLI launch flag, so changing it relaunches the session — the conversation is resumed.
+EFFORT = "low"
+EFFORT_LEVELS = [("Low", "low"), ("Medium", "medium"), ("High", "high"),
+                 ("Extra high", "xhigh"), ("Max", "max"),
+                 ("Default (your CLI setting)", "")]   # the ⚡ statusline menu, in this order
 PERMISSION_MODE = "bypassPermissions"
                                  # the STARTUP permission mode; flip it at run time with the
                                  # status-bar "Read-only" toggle (◉ = "plan", a read-only agent

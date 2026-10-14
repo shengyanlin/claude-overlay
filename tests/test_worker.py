@@ -459,6 +459,85 @@ class TestMakeOptions:
         assert opts.model == config.MODEL          # the rest of the options survived
         assert "AskUserQuestion" in (opts.disallowed_tools or [])
 
+    def test_effort_launch_kwarg_beats_the_config_constant(self, monkeypatch):
+        # The UI launches the worker with the REMEMBERED ⚡ choice; that must win over
+        # config.EFFORT, or a user who picked High last time would silently get Low back.
+        monkeypatch.setattr(worker_module, "EFFORT", "low")
+        opts = ClaudeWorker(queue.Queue(), effort="high")._make_options()
+        assert getattr(opts, "extra_args", None) == {"effort": "high"}
+        # ...and "" from the UI means inherit, exactly like "" in config.
+        opts = ClaudeWorker(queue.Queue(), effort="")._make_options()
+        assert not getattr(opts, "extra_args", None)
+
+
+# ---------------------------------------------------------------------------
+# 5a. set_effort — a relaunch, because --effort is a launch flag
+# ---------------------------------------------------------------------------
+
+class TestSetEffort:
+    """The SDK has set_model and set_permission_mode but no set_effort (checked against
+    0.2.163): effort only exists as --effort on the spawned CLI. So the switch is a
+    reconnect carrying the session, and the UI must learn the result from the ('effort',
+    …) event — the label may never claim a level the running CLI doesn't have."""
+
+    def test_enqueue(self):
+        w = make_worker()
+        w.set_effort("high")
+        assert w.req.get_nowait() == ("set_effort", "high")
+
+    def test_before_first_connect_just_stores_and_confirms(self):
+        # Nothing to relaunch yet: the value waits for _open, which reads self._effort.
+        w = make_worker()
+        assert w._client is None
+        asyncio.run(w._do_set_effort("medium"))
+        assert w._effort == "medium"
+        assert w._make_options().extra_args == {"effort": "medium"}
+        assert ("effort", "medium") in _drain(w.ui)
+
+    def test_connected_relaunches_with_the_new_level_and_confirms(self):
+        w = make_worker()
+        w._client = object()                          # "connected"
+        seen = {}
+
+        async def fake_reconnect(note=None):
+            seen["note"] = note
+            # what the real _reconnect does that matters here: it rebuilds the client from
+            # _make_options — which must already carry the NEW level at this point.
+            seen["opts_at_relaunch"] = w._make_options()
+            w._client = object()
+
+        w._reconnect = fake_reconnect
+        asyncio.run(w._do_set_effort("xhigh"))
+        assert seen["opts_at_relaunch"].extra_args == {"effort": "xhigh"}
+        assert "Extra high" in seen["note"] and "resum" in seen["note"].lower()
+        events = _drain(w.ui)
+        assert ("effort", "xhigh") in events
+        assert ("status", "") in events                # clears "switching effort…"
+
+    def test_failed_relaunch_reverts_and_resyncs_the_label(self):
+        # A relaunch that leaves no client must not be remembered as the new level —
+        # the UI would persist a choice that never took and show a label that lies.
+        w = ClaudeWorker(queue.Queue(), effort="low")
+        w._client = object()
+
+        async def dead_reconnect(note=None):
+            w._client = None
+
+        w._reconnect = dead_reconnect
+        asyncio.run(w._do_set_effort("max"))
+        assert w._effort == "low"
+        events = _drain(w.ui)
+        assert ("effort", "low") in events
+        assert any(k == "error" and "effort" in str(p) for k, p in events)
+
+    def test_none_means_inherit(self):
+        # The UI's "Default (your CLI setting)" row sends ""; a None from anywhere must
+        # collapse to the same thing rather than put "None" on the command line.
+        w = make_worker()
+        asyncio.run(w._do_set_effort(None))
+        assert w._effort == ""
+        assert not getattr(w._make_options(), "extra_args", None)
+
 
 # ---------------------------------------------------------------------------
 # 5b. _allow_tool (permission callback / interactive-tool guard)

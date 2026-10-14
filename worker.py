@@ -104,7 +104,7 @@ def _stat_reason(exc):
 
 
 class ClaudeWorker(threading.Thread):
-    def __init__(self, ui_queue: "queue.Queue", permission_mode=None):
+    def __init__(self, ui_queue: "queue.Queue", permission_mode=None, effort=None):
         super().__init__(daemon=True)
         # Tap the UI channel so the debug log captures every worker→UI event (no-op when
         # DEBUG_LOG is ""). The UI side keeps reading the raw queue.
@@ -130,6 +130,13 @@ class ClaudeWorker(threading.Thread):
         # reconnect with the CURRENT mode, not the startup one, and (b) _allow_tool
         # must know when it's read-only (see the plan guard there).
         self._permission_mode = permission_mode or PERMISSION_MODE
+        # The ACTIVE reasoning effort ("" = inherit the CLI's). Starts at the caller's
+        # launch value (the UI passes the remembered ⚡ choice; None → the config constant);
+        # set_effort switches it at run time. Instance state, not the module constant, for
+        # the same reason as _permission_mode: _make_options must rebuild any reconnect
+        # with the CURRENT value — and a switch IS a reconnect, since --effort is a launch
+        # flag the SDK has no live control request for (unlike model and permission mode).
+        self._effort = EFFORT if effort is None else effort
         # Whether THIS session may ever be switched to bypassPermissions at run time:
         # the CLI refuses to ELEVATE a running session to bypass unless it was launched
         # with --dangerously-skip-permissions, and the SDK only adds that flag when the
@@ -230,6 +237,40 @@ class ClaudeWorker(threading.Thread):
         # flip its toggle when it calls this — it waits for the ("permission_mode", mode)
         # confirmation event, so the toggle never claims a safety state the CLI isn't in.
         self.req.put(("set_permission_mode", mode))
+
+    def set_effort(self, level):
+        # Queued like the other two; the UI waits for the ("effort", level) confirmation.
+        self.req.put(("set_effort", level))
+
+    async def _do_set_effort(self, level):
+        """Apply a new effort level. --effort is a launch flag — the SDK exposes no runtime
+        control for it (checked: set_model and set_permission_mode exist, set_effort does
+        not) — so the only way to change it is to relaunch the CLI. _reconnect does that
+        WITH the session id, so the conversation carries over; the cost is one connect
+        (~10s here). Before the first connect there is nothing to relaunch: the value just
+        waits for _open to pick it up. The UI learns the outcome from the ("effort", …)
+        event, never from its own click, so the ⚡ label can't claim a level the CLI
+        isn't running."""
+        level = level or ""
+        old = self._effort
+        self._effort = level           # BEFORE the reconnect: _make_options reads it
+        if self._client is None:
+            self.ui.put(("effort", level))
+            self.ui.put(("status", ""))
+            return
+        label = next((lbl for lbl, v in EFFORT_LEVELS if v == level), level or "default")
+        try:
+            await self._reconnect(note=f"⚡ Effort → {label} — relaunching Claude and "
+                                       "resuming the conversation…")
+            if self._client is None:
+                raise RuntimeError("relaunch failed")
+            self.ui.put(("effort", level))
+        except Exception as e:
+            self._effort = old
+            self.ui.put(("error", f"effort switch failed: {type(e).__name__}: {e}"))
+            self.ui.put(("effort", old))   # re-sync the label with what is actually running
+        finally:
+            self.ui.put(("status", ""))
 
     async def _do_set_permission_mode(self, client, mode):
         if mode == "bypassPermissions" and not self._bypass_capable:
@@ -347,12 +388,13 @@ class ClaudeWorker(threading.Thread):
             # Claude Code 2.1.150 does not support this model". modelresolve also probes
             # shutil.which("claude"), so this keeps the probe and the session on ONE CLI.
             opts["cli_path"] = cli
-        if EFFORT:
+        if self._effort:
             # Same dial as the CLI's --effort flag, scoped to this overlay session. ""
-            # (default) passes nothing, so the CLI keeps honouring the user's own
-            # settings.json effortLevel — the overlay only ever LOWERS/RAISES effort when
-            # explicitly told to in config. extra_args is the SDK's raw-flag passthrough.
-            opts["extra_args"] = {"effort": EFFORT}
+            # passes nothing, so the CLI keeps honouring the user's own settings.json
+            # effortLevel. The instance value, not config.EFFORT: the ⚡ menu changes it at
+            # run time and every reconnect must carry the CURRENT choice (see set_effort).
+            # extra_args is the SDK's raw-flag passthrough.
+            opts["extra_args"] = {"effort": self._effort}
         if DISALLOWED_TOOLS:
             # Remove interactive tools the overlay can't service (AskUserQuestion) from the
             # tool schema entirely, so the model can't call them and hang the turn — it asks
@@ -494,6 +536,8 @@ class ClaudeWorker(threading.Thread):
                         self.ui.put(("status", ""))
                     else:
                         await self._do_set_permission_mode(self._client, payload)
+                elif kind == "set_effort":
+                    await self._do_set_effort(payload)   # handles the not-yet-connected case itself
             except asyncio.CancelledError:
                 # a cancel (Stop / transport teardown) must not break the loop or be
                 # mistaken for a fatal error — CancelledError is BaseException, not

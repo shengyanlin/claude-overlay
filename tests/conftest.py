@@ -43,11 +43,12 @@ class FakeWorker:
     """Stand-in for ClaudeWorker: stores the UI queue, records calls for assertions,
     starts no thread and connects to nothing."""
 
-    def __init__(self, ui_queue, permission_mode=None):
+    def __init__(self, ui_queue, permission_mode=None, effort=None):
         self.ui = ui_queue
         self.req = queue.Queue()
         self.calls = []
         self.permission_mode = permission_mode   # launch mode the Overlay asked for
+        self.effort = effort                     # launch effort the Overlay asked for
 
     def _rec(self, name, *a):
         self.calls.append((name, a))
@@ -59,6 +60,7 @@ class FakeWorker:
     def set_model(self, *a):    self._rec("set_model", *a)
     def resume(self, *a):       self._rec("resume", *a)
     def set_permission_mode(self, *a):  self._rec("set_permission_mode", *a)
+    def set_effort(self, *a):   self._rec("set_effort", *a)
     def interrupt(self):        self._rec("interrupt")
     def shutdown(self):         self._rec("shutdown")
     def join(self, *a, **k):    self._rec("join")

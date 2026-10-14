@@ -14,8 +14,8 @@ import claude_overlay as co
 
 class _Sentinel:
     """A worker class distinguishable from both FakeWorker and the real thing."""
-    def __init__(self, ui_q, permission_mode="default"):
-        self.ui_q, self.permission_mode = ui_q, permission_mode
+    def __init__(self, ui_q, permission_mode="default", effort=None):
+        self.ui_q, self.permission_mode, self.effort = ui_q, permission_mode, effort
 
 
 def test_the_patched_global_wins(overlay):
