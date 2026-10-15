@@ -3,6 +3,26 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.24.1] - 2026-10-15
+
+Hotfix for 1.24.0: on a CLI that doesn't know `--effort auto`, the overlay could not
+start at all. Update if you see "Could not start Claude: ProcessError … exit code 1".
+
+### Fixed
+- **"Could not start Claude: ProcessError: Command failed with exit code 1" on every
+  launch and every message.** The overlay runs without a console (pythonw), so it has no
+  stderr — and Claude Code inherited that missing stderr. 1.24.0 launches with
+  `--effort auto`; a CLI that doesn't accept `auto` as a launch flag (2.1.289 does not)
+  prints a warning at startup, and writing that warning killed it. 1.24.0's note that such
+  a CLI "warns at launch and runs at its own default" was only true with a console
+  attached. The overlay now always collects the CLI's stderr, so a warning is harmless,
+  and when Claude does fail to start the error quotes what the CLI actually said instead
+  of "Check stderr output for details".
+- **⚡ said `auto` while the session ran the default.** The same CLI accepts `auto`
+  through its `/effort` command but not as the launch flag, so after a launch that
+  rejected the flag the overlay now applies the level with `/effort` (well under a
+  second). If that is refused as well, the label shows Default — what is really running.
+
 ## [1.24.0] - 2026-10-15
 
 This release changes how hard the model thinks by default and puts the dial on the
