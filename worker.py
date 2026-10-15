@@ -5,6 +5,7 @@ queues (requests in, events out). Imports config + debuglog (one-way)."""
 
 import asyncio
 import base64
+import collections
 import json
 import os
 import re
@@ -180,6 +181,24 @@ class ClaudeWorker(threading.Thread):
         # Whether that one recycle attempt has already been spent for the current failure,
         # so a genuinely dead login can't put us in a reconnect loop.
         self._auth_recycled = False
+        # Last lines the CLI wrote to stderr (see _on_cli_stderr). Bounded: the CLI is
+        # long-lived and a chatty build must not grow this for the whole session.
+        self._stderr_tail = collections.deque(maxlen=20)
+
+    def _on_cli_stderr(self, line):
+        """SDK stderr callback. Registering ANY callback is what matters: without one the
+        SDK lets the CLI inherit our stderr, and under pythonw there is none — so the first
+        warning the CLI prints at startup (e.g. "Unknown --effort value 'auto'" on a CLI
+        that predates auto) kills it with exit 1 before connect() completes. With a
+        callback the SDK pipes stderr and the warning is harmless. The tail is kept so a
+        failed start can say WHY instead of the SDK's "Check stderr output for details"."""
+        try:
+            s = str(line).rstrip()
+            if s:
+                self._stderr_tail.append(s)
+                dbg("cli_stderr", s[:300])
+        except Exception:
+            pass
 
     def ask(self, text: str, image_paths=None):
         self.req.put(("ask", (text, list(image_paths or []))))
@@ -286,6 +305,22 @@ class ClaudeWorker(threading.Thread):
             self.ui.put(("effort", old))   # re-sync the label with what is actually running
         finally:
             self.ui.put(("status", ""))
+
+    async def _fix_rejected_effort_flag(self):
+        """A CLI can accept a level through `/effort` that its `--effort` launch flag
+        rejects — measured on 2.1.289: `/effort auto` works, `--effort auto` prints
+        "Unknown --effort value 'auto' — ignoring it and using the default effort" and runs
+        at the default. Left alone the ⚡ label would say auto while the session runs
+        something else, so when the launch warned, apply the level through the slash
+        command instead (~0.4s), and if even that fails, tell the UI the truth."""
+        if not self._effort or not any("Unknown --effort value" in s for s in self._stderr_tail):
+            return
+        if await self._slash_effort(self._effort):
+            dbg("effort_flag_fallback", f"{self._effort} applied via /effort")
+            return
+        dbg("effort_flag_fallback", f"{self._effort} rejected by flag and slash")
+        self._effort = ""
+        self.ui.put(("effort", ""))
 
     async def _slash_effort(self, level):
         """`/effort <level>` on the live client → True only when the CLI confirmed THAT
@@ -428,6 +463,9 @@ class ClaudeWorker(threading.Thread):
                            "append": SYSTEM_APPEND, "exclude_dynamic_sections": True},
         )
         opts["max_buffer_size"] = MAX_BUFFER_SIZE
+        # Always pipe the CLI's stderr — under pythonw an inherited stderr doesn't exist and
+        # a startup warning is then fatal. See _on_cli_stderr.
+        opts["stderr"] = self._on_cli_stderr
         cli = _native_cli()
         if cli:
             # Pin the CLI on PATH. Left unset, the SDK prefers a `claude.exe` bundled INSIDE
@@ -482,7 +520,7 @@ class ClaudeWorker(threading.Thread):
         # mcp_servers is itself what the SDK rejects.
         droppable = ["strict_mcp_config", "max_buffer_size", "can_use_tool",
                      "include_partial_messages", "skills", "disallowed_tools", "resume",
-                     "mcp_servers", "extra_args"]
+                     "mcp_servers", "extra_args", "stderr"]
         self._last_dropped = []
         while True:
             try:
@@ -711,6 +749,7 @@ class ClaudeWorker(threading.Thread):
             await self._open_once()
 
     async def _open_once(self, quiet=False):
+        self._stderr_tail.clear()   # a failure below should quote THIS launch, not the last one
         try:
             self._client = ClaudeSDKClient(options=self._make_options())
             self._bypass_capable = (self._permission_mode == "bypassPermissions")
@@ -727,6 +766,7 @@ class ClaudeWorker(threading.Thread):
             # after the connect so a refresh the CLI performs during startup is already
             # included — otherwise every first turn would look like "credentials changed".
             self._creds_sig = authstate.signature()
+            await self._fix_rejected_effort_flag()
             self.ui.put(("ready", None))
             # Context usage is informative only; do not block the first queued prompt on
             # an extra CLI round-trip during startup/reconnect.
@@ -759,8 +799,10 @@ class ClaudeWorker(threading.Thread):
                     "claude auth login   (then send your message again — the overlay picks "
                     "the new login up on its own)."))
             else:
+                tail = "\n".join(list(self._stderr_tail)[-6:])
                 self.ui.put(("error",
                     f"Could not start Claude: {type(e).__name__}: {e}\n"
+                    + (f"CLI said:\n{tail}\n" if tail else "") +
                     "Is the `claude` CLI installed and logged in? Run `claude --version` "
                     "in a terminal; if it's missing, run setup.cmd (or `irm "
                     "https://claude.ai/install.ps1 | iex`), then `claude` to /login."))

@@ -388,6 +388,16 @@ class TestMakeOptions:
         opts = make_worker()._make_options()
         assert opts.cli_path is None
 
+    def test_cli_stderr_is_always_piped(self):
+        # No callback → the SDK lets the CLI inherit OUR stderr, and under pythonw there is
+        # none: the CLI's first startup warning ("Unknown --effort value 'auto'") then exits
+        # it with code 1 and the overlay can't start. A callback makes the SDK pipe it.
+        w = make_worker()
+        opts = w._make_options()
+        assert callable(getattr(opts, "stderr", None))
+        opts.stderr("Warning: Unknown --effort value 'auto'\n")
+        assert list(w._stderr_tail) == ["Warning: Unknown --effort value 'auto'"]
+
     def test_has_cwd_attribute(self):
         w = make_worker()
         opts = w._make_options()
@@ -506,6 +516,34 @@ class TestSetEffort:
             return result
         w._slash_effort = fake
         return asked
+
+    def test_launch_flag_rejected_applies_level_via_slash(self):
+        # CLI 2.1.289: `--effort auto` warns and runs at the default, `/effort auto` works.
+        w = make_worker()
+        w._effort = "auto"
+        w._stderr_tail.append("Warning: Unknown --effort value 'auto' — ignoring it")
+        asked = self._slash(w, True)
+        asyncio.run(w._fix_rejected_effort_flag())
+        assert asked == ["auto"]
+        assert w._effort == "auto"
+        assert not any(k == "effort" for k, _ in _drain(w.ui))
+
+    def test_launch_flag_and_slash_both_rejected_reports_default(self):
+        w = make_worker()
+        w._effort = "auto"
+        w._stderr_tail.append("Warning: Unknown --effort value 'auto' — ignoring it")
+        self._slash(w, False)
+        asyncio.run(w._fix_rejected_effort_flag())
+        assert w._effort == ""
+        assert ("effort", "") in _drain(w.ui)
+
+    def test_launch_flag_accepted_sends_no_slash(self):
+        w = make_worker()
+        w._effort = "high"
+        w._stderr_tail.append("⚠ Sandbox disabled: …")
+        asked = self._slash(w, True)
+        asyncio.run(w._fix_rejected_effort_flag())
+        assert asked == []
 
     def test_connected_uses_the_slash_command_and_does_not_relaunch(self):
         w = make_worker()
