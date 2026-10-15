@@ -70,6 +70,9 @@ class _FakeMenu:
 
 def test_popup_row_asks_the_worker_and_does_not_flip_the_label(ov, monkeypatch):
     ov.effort = "low"
+    ov._refresh_statusline()          # paint the starting label; the assertion below is that
+                                      # the CLICK doesn't repaint it (the test once passed only
+                                      # because "low" happened to be the shipped default)
     _FakeMenu.built = []
     monkeypatch.setattr(co.tk, "Menu", _FakeMenu)
 
