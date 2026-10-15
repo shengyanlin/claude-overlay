@@ -27,6 +27,21 @@ import pytest
 os.environ["CLAUDE_OVERLAY_CONFIG"] = os.path.join(
     tempfile.gettempdir(), "claude_overlay_test_no_user_config", "config.json")
 
+# Import the worker (and with it claude_agent_sdk) on the MAIN thread before any test
+# module can import claude_overlay, because that import starts a background thread doing
+# the same import. Two threads entering one package from different top-level modules take
+# its import locks in different orders: the thread holding `claude_agent_sdk` (running
+# its __init__) wants `claude_agent_sdk.types`, while a test that did
+# `from claude_agent_sdk.types import …` holds `.types` and wants the package — Python's
+# detector then raises _DeadlockError in the background thread, which stashes it as the
+# worker import's failure, and test_the_real_import_actually_happened fails. Reproduced
+# deterministically (2026-10-15) with `pytest tests/test_config.py
+# tests/test_startup_lazy_worker.py`, on v1.23.2 as well. The full suite never saw it only
+# because test_worker.py's own `import worker` at collection serialized the two threads
+# on the SAME module lock. Importing here makes that protection unconditional: by the
+# time the background thread runs, everything it needs is already in sys.modules.
+import worker  # noqa: E402,F401
+
 # Belt-and-suspenders for the one Tk init (and any stray second root): pin the Tcl/Tk
 # library dirs so the interpreter always finds them.
 _tcl_root = os.path.join(sys.base_prefix, "tcl")
