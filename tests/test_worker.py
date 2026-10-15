@@ -621,6 +621,13 @@ class TestSlashEffort:
         assert self._run(c, "high") is True
         assert c.sent == ["/effort high"]
 
+    def test_autos_own_phrasing_is_a_confirmation(self):
+        # The CLI words auto differently ("Effort level set to auto …", not "Set effort
+        # level to …"). Missing that would send every Auto click down the 12s relaunch.
+        c = self._Client(*self._reply("Effort level set to auto (this session only)"))
+        assert self._run(c, "auto") is True
+        assert c.sent == ["/effort auto"]
+
     def test_confirmation_for_another_level_is_false(self):
         # Belt and braces: the CLI confirming a level we didn't ask for is not a success.
         c = self._Client(*self._reply("Set effort level to low (this session only): Quick"))

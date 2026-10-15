@@ -80,9 +80,15 @@ MODEL_MENU_FILTER = _env_bool("CLAUDE_OVERLAY_MODEL_FILTER", True)
 # choice is remembered across launches; this constant seeds the first one). Effort is a
 # CLI launch flag, so changing it relaunches the session — the conversation is resumed.
 EFFORT = "low"
+# The ⚡ statusline menu, in this order. "auto" is the CLI's own word for NO fixed level:
+# the model decides per request how much to think (measured 2026-10-15: on a one-line
+# rewrite it was leaner than low — 0 thinking, 29 output tokens). It is not the same as
+# "" — that one inherits settings.json's effortLevel; auto ignores it. A CLI too old to
+# know `--effort auto` prints a warning at launch and runs at its default; nothing breaks.
 EFFORT_LEVELS = [("Low", "low"), ("Medium", "medium"), ("High", "high"),
                  ("Extra high", "xhigh"), ("Max", "max"),
-                 ("Default (your CLI setting)", "")]   # the ⚡ statusline menu, in this order
+                 ("Auto (model decides)", "auto"),
+                 ("Default (your CLI setting)", "")]
 PERMISSION_MODE = "bypassPermissions"
                                  # the STARTUP permission mode; flip it at run time with the
                                  # status-bar "Read-only" toggle (◉ = "plan", a read-only agent
@@ -512,7 +518,7 @@ _USER_CONFIG_KEYS = {
     "PERMISSION_MODE": _v_choice("bypassPermissions", "acceptEdits", "default", "plan", "auto"),
     # "" = inherit the CLI/settings.json effort. The overlay validates the value because a
     # typo here would otherwise surface as an opaque connect failure two screens later.
-    "EFFORT": _v_choice("", "low", "medium", "high", "xhigh", "max"),
+    "EFFORT": _v_choice("", "low", "medium", "high", "xhigh", "max", "auto"),
     "SKILLS": _v_skills,                       # "all" | ["name", …] | null
     "MODEL_MENU_FILTER": _v_bool,              # false = offer every family, entitled or not
     "QUEUE_MESSAGES": _v_bool,                 # false = Enter mid-turn interrupts (old behaviour)

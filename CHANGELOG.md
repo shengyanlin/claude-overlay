@@ -7,7 +7,9 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 - **⚡ effort switcher on the statusline.** Next to the model: `⚡ low ▾` — click for
-  Low / Medium / High / Extra high / Max, or Default (your CLI's own `effortLevel`). The
+  Low / Medium / High / Extra high / Max, Auto (no fixed level: the model decides per
+  request; on a one-line ask it came out leaner than Low), or Default (your CLI's own
+  `effortLevel`). The
   switch is the CLI's own `/effort` command sent over the live session, so it applies in
   a fraction of a second with the conversation untouched; the label changes only on the
   CLI's confirmation, never on the click. Default is the one row that has to relaunch

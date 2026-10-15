@@ -308,7 +308,13 @@ class ClaudeWorker(threading.Thread):
                         return text or str(getattr(msg, "result", "") or "")
                 return text
             reply = await asyncio.wait_for(_exchange(), EFFORT_SLASH_TIMEOUT)
-            ok = reply.strip().lower().startswith(f"set effort level to {level.lower()}")
+            # Two phrasings, measured 2026-10-15: fixed levels answer "Set effort level to
+            # high (this session only): …", auto answers "Effort level set to auto (this
+            # session only)". Accept both, keyed on the level we asked for either way.
+            head = reply.strip().lower()
+            lv = level.lower()
+            ok = head.startswith(f"set effort level to {lv}") or \
+                head.startswith(f"effort level set to {lv}")
             dbg("effort_slash", f"{level} ok={ok} | {reply[:120]}")
             return ok
         except Exception as e:

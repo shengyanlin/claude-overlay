@@ -430,6 +430,7 @@ class TestUserConfig:
         assert set(offered) == set(config._USER_CONFIG_KEYS["EFFORT"].allowed)
         assert len(offered) == len(set(offered))
         assert "" in offered                    # "inherit the CLI" stays reachable
+        assert "auto" in offered                # and so does "no fixed level, model decides"
 
     def test_effort_override_is_accepted_and_canonical(self, load_cfg):
         c = load_cfg({"EFFORT": "Medium"})
