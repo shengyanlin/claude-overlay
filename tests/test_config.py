@@ -416,11 +416,12 @@ class TestUserConfig:
         assert len(c.USER_CONFIG_WARNINGS) == 1
         assert "PERMISSION_MODE" in c.USER_CONFIG_WARNINGS[0]
 
-    def test_effort_defaults_to_low(self):
-        # Measured 2026-10-14: an inherited xhigh turned a one-line rewrite into 14-24s
-        # (thinking plus a tool detour); "low" answered the same in 3-4s. The overlay is a
-        # quick-turn chat, so it ships low and the ⚡ menu raises it per session.
-        assert config.EFFORT == "low"
+    def test_effort_defaults_to_auto(self):
+        # Measured 2026-10-14/15: an inherited xhigh turned a one-line rewrite into 14-24s
+        # (thinking plus a tool detour); "low" answered the same in 3-4s and "auto" in ~2s
+        # with no thinking at all. The overlay is a quick-turn chat, so it ships auto — no
+        # fixed level, the model decides per request — and the ⚡ menu pins one per session.
+        assert config.EFFORT == "auto"
 
     def test_effort_menu_offers_exactly_the_accepted_values(self):
         # The ⚡ menu and the config validator must agree, or the menu could launch the
@@ -442,7 +443,7 @@ class TestUserConfig:
         # effort — and it must be SEEN: an unnoticed typo here would otherwise quietly
         # change how long the model thinks on every single message.
         c = load_cfg({"EFFORT": "ultra"})
-        assert c.EFFORT == "low"       # the shipped default, spelled out: load_cfg reloads
+        assert c.EFFORT == "auto"      # the shipped default, spelled out: load_cfg reloads
                                        # the module, so comparing to config.EFFORT is a tautology
         assert any("EFFORT" in w for w in c.USER_CONFIG_WARNINGS)
 

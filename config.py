@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 
-__version__ = "1.23.2"
+__version__ = "1.24.0"
 
 def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     try:
@@ -75,20 +75,20 @@ MODEL_MENU_FILTER = _env_bool("CLAUDE_OVERLAY_MODEL_FILTER", True)
 # one-liner spent 6-11s thinking first. Measured again 2026-10-14 on a one-line "rewrite
 # this as a slide title": inherited xhigh took 14-24s per reply (thinking, plus a detour
 # through a tool call it decided the answer deserved); "low" took 3-4s with the same model
-# and an answer of the same quality. So the overlay now ships at "low": the chat is for
-# quick turns, and the statusline's ⚡ menu raises it for the turns that need depth (the
-# choice is remembered across launches; this constant seeds the first one). Effort is a
-# CLI launch flag, so changing it relaunches the session — the conversation is resumed.
-EFFORT = "low"
-# The ⚡ statusline menu, in this order. "auto" is the CLI's own word for NO fixed level:
-# the model decides per request how much to think (measured 2026-10-15: on a one-line
-# rewrite it was leaner than low — 0 thinking, 29 output tokens). It is not the same as
-# "" — that one inherits settings.json's effortLevel; auto ignores it. A CLI too old to
-# know `--effort auto` prints a warning at launch and runs at its default; nothing breaks.
+# and an answer of the same quality, and "auto" (2026-10-15) was leaner still — 2.2s, no
+# thinking, 29 output tokens. So the overlay ships at "auto": the CLI's own word for NO
+# fixed level, the model decides per request how much to think — cheap on the quick turns
+# a floating chat is made of, and free to think harder when a question warrants it, which
+# a pinned "low" never is. It is NOT the same as "": that inherits settings.json's
+# effortLevel; auto ignores it. The statusline's ⚡ menu pins a level for the turns that
+# need one (the choice is remembered across launches; this constant seeds the first one).
+# A CLI too old to know `--effort auto` prints a warning at launch and runs at its own
+# default — degrades to "", doesn't break.
+EFFORT = "auto"
 EFFORT_LEVELS = [("Low", "low"), ("Medium", "medium"), ("High", "high"),
                  ("Extra high", "xhigh"), ("Max", "max"),
                  ("Auto (model decides)", "auto"),
-                 ("Default (your CLI setting)", "")]
+                 ("Default (your CLI setting)", "")]   # the ⚡ statusline menu, in this order
 PERMISSION_MODE = "bypassPermissions"
                                  # the STARTUP permission mode; flip it at run time with the
                                  # status-bar "Read-only" toggle (◉ = "plan", a read-only agent

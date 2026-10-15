@@ -3,10 +3,13 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.24.0] - 2026-10-15
+
+This release changes how hard the model thinks by default and puts the dial on the
+statusline. If the overlay has felt slow to start answering, this is the fix.
 
 ### Added
-- **⚡ effort switcher on the statusline.** Next to the model: `⚡ low ▾` — click for
+- **⚡ effort switcher on the statusline.** Next to the model: `⚡ auto ▾` — click for
   Low / Medium / High / Extra high / Max, Auto (no fixed level: the model decides per
   request; on a one-line ask it came out leaner than Low), or Default (your CLI's own
   `effortLevel`). The
@@ -18,13 +21,24 @@ This project follows [Semantic Versioning](https://semver.org/).
   remembered across launches; `EFFORT` in config now seeds just the first one.
 
 ### Changed
-- **Effort now defaults to `low` instead of inheriting your CLI's setting.** Measured on
-  2026-10-14 with the same model and the same one-line "rewrite this as a slide title":
-  inherited `xhigh` took 14–24s per reply — several seconds of thinking, then a tool call
-  it decided the answer deserved, then a 600-token answer to a request for one line — and
-  `low` took 3–4s for the same title. The overlay is a quick-turn chat; the ⚡ menu is how
-  you buy depth for the turns that need it. Set `"EFFORT": ""` in config.json to get the
-  old inherit-everything behaviour back as your starting point.
+- **Effort now defaults to `auto` instead of inheriting your CLI's setting.** Measured
+  with the same model and the same one-line "rewrite this as a slide title": inherited
+  `xhigh` took 14–24s per reply — several seconds of thinking, then a tool call it decided
+  the answer deserved, then a 600-token answer to a request for one line — `low` took
+  3–4s, and `auto` about 2s with no thinking at all. `auto` is the CLI's own word for no
+  fixed level: the model decides per request, so a quick turn stays quick and a hard one
+  can still get the thinking it needs — which a pinned `low` would deny it. The ⚡ menu is
+  how you pin a level when you want one. Set `"EFFORT": ""` in config.json to get the old
+  inherit-everything behaviour back as your starting point; a CLI too old to know `auto`
+  warns at launch and runs at its own default, which amounts to the same thing.
+
+### Fixed
+- **A test-suite import race**, present since the lazy worker import: running
+  `test_config.py` with `test_startup_lazy_worker.py` and nothing else failed every time
+  (`_DeadlockError` on `claude_agent_sdk.types`), because a test importing the SDK on the
+  main thread raced the background import of the same package. The full suite never saw
+  it only because `test_worker.py`'s own import happened to serialize the two. The suite's
+  conftest now imports the worker up front, so the order of modules can't matter.
 
 ## [1.23.2] - 2026-10-04
 

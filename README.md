@@ -364,7 +364,7 @@ script here *scans* that folder and uses whatever runs, no matter how it got the
 | &nbsp;&nbsp;• Show / hide in screen shares | **⚙ → Shareable** (visible to Teams/Zoom/OBS; off = private, the default) |
 | &nbsp;&nbsp;• Lock Claude read-only | **⚙ → Read-only** ("plan" mode: looks and answers, changes nothing; off = the configured `PERMISSION_MODE`) |
 | Switch model | click the **statusline** (`model ▾`) — the list shows the model families **your** login can actually pick, read from the CLI's own record of them, so it can't offer you a model that would silently fall back to another one |
-| Change how hard it thinks | click the statusline's **`⚡ low ▾`** — Low / Medium / High / Extra high / Max, **Auto** (no fixed level: the model decides per request — on simple asks it came out leaner than Low), or Default (your CLI's own `effortLevel`). Ships at **Low**: the overlay is for quick turns, and at an inherited `xhigh` a one-line rewrite took 14–24s against 3–4s at Low with the same answer. Raise it for a turn that needs depth. Switching is instant and keeps the conversation (it is the CLI's own `/effort` command); only **Default** relaunches Claude, resuming the conversation (~10s). Your choice is remembered across launches |
+| Change how hard it thinks | click the statusline's **`⚡ auto ▾`** — Low / Medium / High / Extra high / Max, **Auto** (no fixed level: the model decides per request), or Default (your CLI's own `effortLevel`). Ships at **Auto**: the overlay is for quick turns, and at an inherited `xhigh` a one-line rewrite took 14–24s against ~2s at Auto with the same answer — while a hard question can still get the thinking it needs. Pin a level when you want one. Switching is instant and keeps the conversation (it is the CLI's own `/effort` command); only **Default** relaunches Claude, resuming the conversation (~10s). Your choice is remembered across launches |
 | Glance the allowance | the ring on the titlebar **✻** — inner arc is the 5-hour window, outer is weekly, amber near the limit, red past it. **Hover** it for the numbers: both windows, reset times, and roughly how many turns of context are left |
 | See how much allowance is left | the statusline's `5h 61%` — the window is **named**, so you always know whether you're looking at the 5-hour allowance or a weekly one, and whichever you'll hit first is the one shown. Filled in from your account the moment the overlay opens, so it's there **before** you send anything, and refreshed every minute while it sits idle; amber as you approach a limit, red once it's gone, and the reset time joins it only once that's worth planning around. It speaks up once per transition, and a message refused for allowance is put back in the box rather than lost |
 | Retry when the allowance returns | a refused message offers **⏱ Send it automatically at &lt;time&gt;** — opt-in, one click, and it stands down the moment you type something else, send by hand, or Clear |
@@ -449,17 +449,18 @@ The settings themselves:
   `"TELEMETRY_URL": ""` is a second way to switch it off — or point it at your own
   collector if you'd rather have your own numbers. Full details:
   [PRIVACY.md](PRIVACY.md).
-- `EFFORT` — the reasoning effort the overlay **starts** at: `"low"` (default),
-  `"medium"`, `"high"`, `"xhigh"`, `"max"`, `"auto"` (no fixed level — the model
-  decides per request), or `""` to inherit your CLI's setting
+- `EFFORT` — the reasoning effort the overlay **starts** at: `"auto"` (default — no
+  fixed level, the model decides per request), `"low"`, `"medium"`, `"high"`, `"xhigh"`,
+  `"max"`, or `""` to inherit your CLI's setting
   (`effortLevel` in `~/.claude/settings.json`, or the CLI default). The same dial as the
   CLI's `--effort` flag, scoped to the overlay; your terminal sessions keep their own
   setting. This only seeds the first launch — the statusline's **⚡ menu** changes it live
-  and remembers the choice, so you rarely need it here. Why Low: a global `effortLevel`
+  and remembers the choice, so you rarely need it here. Why Auto: a global `effortLevel`
   tuned for deep terminal work makes the model **think for extra seconds before every
   overlay reply** — at `xhigh` we measured 6–11s of thinking on one-line questions, and
   14–24s on a one-line rewrite once the model decided the answer also deserved a tool
-  call; Low answered the same in 3–4s.
+  call; Auto answered the same in about 2s, and unlike a pinned Low it can still think
+  hard when a question calls for it.
 - `PERMISSION_MODE` — `"bypassPermissions"` by default (see security note below); this
   is just the **first-launch** mode — the **⚙ → Read-only** menu item switches
   the live session between `"plan"` (read-only) and this mode at any time, and the
