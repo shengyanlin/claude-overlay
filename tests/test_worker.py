@@ -623,6 +623,100 @@ class TestSetEffort:
         assert w._effort == ""
         assert not getattr(w._make_options(), "extra_args", None)
 
+    def test_relaunch_confirms_the_level_that_runs_not_the_one_asked_for(self):
+        # Picking Auto on a CLI that refuses it: the relaunch falls back to "" (see
+        # TestEffortFlagRefused). Confirming "auto" afterwards would put the label back on
+        # a level the session isn't running — and the UI would persist it.
+        w = make_worker()
+        w._client = object()
+        self._slash(w, False)
+
+        async def falling_back_reconnect(note=None):
+            w._effort = ""                 # what _open_once does when the flag is refused
+            w._client = object()
+
+        w._reconnect = falling_back_reconnect
+        asyncio.run(w._do_set_effort("auto"))
+        efforts = [p for k, p in _drain(w.ui) if k == "effort"]
+        assert efforts == [""]
+
+
+class _StrictEffortClient:
+    """ClaudeSDKClient over a CLI that validates --effort strictly, as 2.1.150 does: a
+    launch with an effort it doesn't know writes commander's error and exits 1 before
+    connect() completes. Records the effort each launch carried."""
+
+    def __init__(self, options, launches, fail_always=False):
+        self.options = options
+        self._launches = launches
+        self._fail_always = fail_always
+
+    async def connect(self):
+        effort = (getattr(self.options, "extra_args", None) or {}).get("effort")
+        self._launches.append(effort)
+        if effort == "auto":
+            self.options.stderr("error: option '--effort <level>' argument 'auto' is "
+                                "invalid. It must be one of: low, medium, high, xhigh, max\n")
+            raise RuntimeError("Command failed with exit code 1")
+        if self._fail_always:
+            self.options.stderr("Error: something else entirely\n")
+            raise RuntimeError("Command failed with exit code 1")
+
+
+class TestEffortFlagRefused:
+    """A CLI older than `--effort auto` used to leave the overlay dead: every launch died on
+    the flag, the red "Could not start Claude" line came back on every message, and only
+    picking a level by hand (which drops the flag) got it working."""
+
+    @staticmethod
+    def _install(monkeypatch, fail_always=False):
+        launches = []
+        monkeypatch.setattr(worker_module, "ClaudeSDKClient",
+                            lambda options: _StrictEffortClient(options, launches, fail_always))
+        monkeypatch.setattr(worker_module.authstate, "signature", lambda: None)
+        return launches
+
+    def test_refused_flag_relaunches_at_the_cli_default(self, monkeypatch):
+        launches = self._install(monkeypatch)
+        w = ClaudeWorker(queue.Queue(), effort="auto")
+        assert asyncio.run(w._open_once()) is True
+        assert launches == ["auto", None]
+        assert w._effort == ""
+        events = _drain(w.ui)
+        assert ("effort", "") in events
+        assert ("ready", None) in events
+        assert any(k == "system" and "too old" in str(p) and "auto" in str(p)
+                   for k, p in events)
+        assert not any(k == "error" for k, _ in events)
+
+    def test_resume_survives_the_fallback(self, monkeypatch):
+        # The retry must keep --resume: dropping to a fresh session would cost the user
+        # the conversation over a flag.
+        self._install(monkeypatch)
+        w = ClaudeWorker(queue.Queue(), effort="auto")
+        w._resume_session_id = "sid-1"
+        asyncio.run(w._open())
+        assert w._resume_ok is True
+        assert w._session_id == "sid-1"
+        assert not any(k == "system" and "resume" in str(p).lower() for k, p in _drain(w.ui))
+
+    def test_other_start_failures_are_reported_and_not_retried(self, monkeypatch):
+        launches = self._install(monkeypatch, fail_always=True)
+        w = ClaudeWorker(queue.Queue(), effort="high")
+        assert asyncio.run(w._open_once()) is False
+        assert launches == ["high"]
+        assert w._effort == "high"
+        events = _drain(w.ui)
+        assert any(k == "error" and "something else entirely" in str(p) for k, p in events)
+        assert not any(k == "effort" for k, _ in events)
+
+    def test_not_refused_without_an_effort(self):
+        # With no effort there is no flag on the command line, so nothing to fall back
+        # from — this is also what stops the retry from recursing.
+        w = ClaudeWorker(queue.Queue(), effort="")
+        w._stderr_tail.append("error: option '--effort <level>' argument 'auto' is invalid.")
+        assert w._effort_flag_refused() is False
+
 
 class TestSlashEffort:
     """_slash_effort keys on the CLI's own confirmation text, because that is the only

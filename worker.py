@@ -298,7 +298,10 @@ class ClaudeWorker(threading.Thread):
                                        "resuming the conversation…")
             if self._client is None:
                 raise RuntimeError("relaunch failed")
-            self.ui.put(("effort", level))
+            # What the relaunch actually runs, not what was asked for: a CLI that refuses
+            # or ignores the level makes _open_once / _fix_rejected_effort_flag fall back
+            # to "", and confirming `level` here would put it back on the ⚡ label.
+            self.ui.put(("effort", self._effort))
         except Exception as e:
             self._effort = old
             self.ui.put(("error", f"effort switch failed: {type(e).__name__}: {e}"))
@@ -321,6 +324,16 @@ class ClaudeWorker(threading.Thread):
         dbg("effort_flag_fallback", f"{self._effort} rejected by flag and slash")
         self._effort = ""
         self.ui.put(("effort", ""))
+
+    def _effort_flag_refused(self):
+        """True when THIS launch died because the CLI refused its --effort value outright.
+        Older CLIs validate the flag strictly and exit before connect() completes —
+        measured on 2.1.150: "error: option '--effort <level>' argument 'auto' is invalid.
+        It must be one of: low, medium, high, xhigh, max". Newer ones (2.1.246+ measured)
+        only warn and run at the default instead; _fix_rejected_effort_flag handles those."""
+        if not self._effort:
+            return False
+        return any("--effort" in s and "is invalid" in s for s in self._stderr_tail)
 
     async def _slash_effort(self, level):
         """`/effort <level>` on the live client → True only when the CLI confirmed THAT
@@ -777,6 +790,18 @@ class ClaudeWorker(threading.Thread):
             return True
         except BaseException as e:   # incl. CancelledError — _open_once must never propagate
             self._client = None
+            if not isinstance(e, asyncio.CancelledError) and self._effort_flag_refused():
+                # Relaunching with the same flag fails the same way on every message, so
+                # the overlay sat on a red error until the user picked a level by hand.
+                # Fall back to the CLI's own default and launch again — once: with no
+                # effort set there is no flag left to refuse.
+                level, self._effort = self._effort, ""
+                dbg("effort_flag_refused", level)
+                self.ui.put(("effort", ""))
+                self.ui.put(("system",
+                    f"⚡ This Claude Code CLI is too old for effort '{level}' — running at "
+                    "its default instead. Update Claude Code (`claude update`) to use it."))
+                return await self._open_once(quiet=quiet)
             if quiet:
                 # A resume attempt: _open announces the fallback itself; the raw error
                 # would only alarm (the retry right after it usually succeeds).
