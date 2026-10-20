@@ -3,6 +3,22 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.24.2] - 2026-10-20
+
+Hotfix for 1.24.0 on older Claude Code CLIs: the overlay could get stuck on "Could not
+start Claude" until effort was changed by hand. Update if ⚡ Auto never worked for you.
+
+### Fixed
+- **On an older Claude Code CLI the overlay stopped working after the update to Auto
+  effort.** Older CLIs (2.1.150 measured) reject `--effort auto` outright and exit at
+  launch, so every message ended in a red "Could not start Claude" line until you picked
+  a level from ⚡ by hand. The overlay now falls back to the CLI's default effort and
+  launches again, keeping the conversation, and says in the chat that the CLI is too old
+  for Auto. Newer CLIs (2.1.246+), which only warn about the flag, were already handled.
+- **⚡ could show Auto after a switch to Auto that didn't take.** When you picked Auto and
+  the relaunch fell back to the default, the label went back to Auto anyway. It now shows
+  the level the session is really running.
+
 ## [1.24.1] - 2026-10-15
 
 Hotfix for 1.24.0: on a CLI that doesn't know `--effort auto`, the overlay could not

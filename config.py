@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 
-__version__ = "1.24.1"
+__version__ = "1.24.2"
 
 def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     try:
@@ -82,8 +82,9 @@ MODEL_MENU_FILTER = _env_bool("CLAUDE_OVERLAY_MODEL_FILTER", True)
 # a pinned "low" never is. It is NOT the same as "": that inherits settings.json's
 # effortLevel; auto ignores it. The statusline's ⚡ menu pins a level for the turns that
 # need one (the choice is remembered across launches; this constant seeds the first one).
-# A CLI too old to know `--effort auto` prints a warning at launch and runs at its own
-# default — degrades to "", doesn't break.
+# A CLI too old to know `--effort auto` either warns and runs at its own default (2.1.246+
+# measured) or refuses the flag and exits (2.1.150 measured); the worker handles both by
+# degrading to "" (see worker._fix_rejected_effort_flag / _effort_flag_refused).
 EFFORT = "auto"
 EFFORT_LEVELS = [("Low", "low"), ("Medium", "medium"), ("High", "high"),
                  ("Extra high", "xhigh"), ("Max", "max"),
