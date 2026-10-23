@@ -4,7 +4,7 @@ _Auto-updated daily. GitHub's Traffic API only retains the last 14 days; this br
 
 | metric | value |
 |---|---|
-| **Unique cloners, last 14 days** (rolling, as of 2026-10-22) | **194** |
+| **Unique cloners, last 14 days** (rolling, as of 2026-10-23) | **194** |
 | Peak 14-day unique cloners on record | 234 |
 | Total clone events, all-time (sum of daily counts) | **3498** |
 | Days of clone data on record | 144 |
