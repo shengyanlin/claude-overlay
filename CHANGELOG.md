@@ -3,6 +3,42 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.25.0] - 2026-10-28
+
+Codex mode: a **Claude | Codex** switch in the titlebar puts OpenAI's Codex behind the same
+window. Updating? Install the Codex CLI and sign in once (`npm install -g @openai/codex`,
+then `codex login` — or re-run setup.cmd); the overlay tells you which step is missing.
+
+### Added
+- **Codex mode.** A **Claude | Codex** switch in the titlebar puts OpenAI's Codex behind
+  the overlay, on your own `codex` login (driven over `codex app-server`, the protocol the
+  Codex app itself uses). Switching is live — no restart — and re-skins the expanded window
+  to Codex's look (blue-violet accent on cool-tinted neutrals, the `>_` mark); the
+  collapsed orb stays Clawd. Streaming replies and
+  reasoning, tool lines, Stop, screenshots and attachments, Compact, context %, the
+  allowance ring, ⚡ effort and the model menu all work in Codex mode, with Codex's own
+  models and levels. The last Codex conversation is offered to resume at launch.
+- **The rest of the overlay in Codex mode too** (Claude skills aside): allowance notices and the
+  timed auto-retry, the allowance re-read every minute, Past conversations (Codex threads;
+  ✕ archives), a sign-out notice that holds your message, PDF text, ⚡ Auto (the model's own
+  default), the compaction progress bar, the overlay's MCP settings, and the one-click CLI
+  update for Codex.
+- **The switch only changes an empty conversation**, and a side whose CLI isn't installed is
+  struck through; clicking either says what to do (Clear first / how to install).
+- **Approval cards.** When Codex asks before stepping outside its sandbox, an Allow /
+  Allow for this session / Deny card appears in the chat (and retires itself when Codex's
+  own reviewer answers first).
+- **setup.cmd installs the Codex CLI** (npm; offers Node.js via winget when it's missing)
+  and offers `codex login`. Diagnose and update.cmd say when it's missing or signed out,
+  and the first launch of 1.25 says what this machine still needs. All of it is
+  optional — Claude mode never needs Codex.
+
+### Notes
+- Full access in Codex mode means no sandbox and no prompts where the machine allows it.
+  A managed machine's Codex policy can forbid that, and on Windows the `workspace-write`
+  sandbox can fail to start; the overlay checks both (once per Codex version), runs the
+  strongest mode that actually works, and says so in the chat.
+
 ## [1.24.2] - 2026-10-20
 
 Hotfix for 1.24.0 on older Claude Code CLIs: the overlay could get stuck on "Could not
