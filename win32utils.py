@@ -317,6 +317,14 @@ def can_self_update(repo=None):
         return False
 
 
+def _cmd_c(script, *args):
+    """`cmd /s /c` command line that runs a .cmd from ANY app folder. A list argv would leave a
+    path without spaces unquoted (that's how Windows quoting works), and cmd.exe then reads
+    an `&` in it (a folder named Tools&Apps) as "run the rest as a second command". With /s, cmd
+    drops exactly the outer pair of quotes and runs `"script" args` as written."""
+    return 'cmd /s /c ""%s"%s"' % (script, "".join(" " + a for a in args))
+
+
 def run_overlay_update(repo=None):
     """Run the app folder's update.cmd IN ITS OWN CONSOLE WINDOW and wait for it. Returns
     (ok, message); ok only for exit code 0. Never raises. Call this off the UI thread.
@@ -354,7 +362,7 @@ def run_overlay_update(repo=None):
         # output, and every `pause` prompt in it, would go nowhere.
         env = dict(os.environ)
         env["OV_UPDATE_AUTO"] = "1"          # see WHY OV_UPDATE_AUTO above
-        p = subprocess.Popen(["cmd", "/c", script], cwd=repo, env=env,
+        p = subprocess.Popen(_cmd_c(script), cwd=repo, env=env,
                              creationflags=_CREATE_NEW_CONSOLE)
         rc = p.wait()
     except Exception as e:
@@ -362,6 +370,28 @@ def run_overlay_update(repo=None):
     if rc == 0:
         return (True, "")
     return (False, f"update.cmd stopped with exit code {rc} - its window says why")
+
+
+def run_codex_setup(repo=None):
+    """Run install-codex.cmd --from-app IN ITS OWN CONSOLE WINDOW and wait for it -- the
+    overlay's "Set up Codex" button. Returns the script's exit code (0 installed and signed
+    in, 2 installed but not signed in, 3 not installed), or None when it couldn't run at all.
+    Never raises; call it off the UI thread.
+
+    A visible console for the same reasons as run_overlay_update: npm's output, the Node.js
+    question, and `codex login`'s sign-in URL are the progress and error UI, and the script
+    pauses only when it has something left to say. No timeout: a browser sign-in takes as
+    long as it takes."""
+    repo = repo or _REPO_DIR
+    script = os.path.join(repo, "install-codex.cmd")
+    if not os.path.exists(script):
+        return None
+    try:
+        p = subprocess.Popen(_cmd_c(script, "--from-app"), cwd=repo,
+                             creationflags=_CREATE_NEW_CONSOLE)
+        return p.wait()
+    except Exception:
+        return None
 
 
 # Win32 region calls — set argtypes so 64-bit handles aren't truncated.

@@ -1165,6 +1165,13 @@ class Overlay:
         if now - self._lock_told < 4.0:
             return
         self._lock_told = now
+        if target == "codex" and self._can_setup_codex():
+            self._offer_codex_setup(
+                "⇄ Can't switch to Codex yet: the Codex CLI (`codex`) isn't installed on this "
+                "PC. One click installs it and signs you in — a console window shows the "
+                "progress, and Codex is clickable as soon as it's done. (By hand, it's  npm "
+                "install -g @openai/codex  — needs Node.js 18+ — then  codex login.)")
+            return
         if target == "codex":
             how = ("install it with  npm install -g @openai/codex  (needs Node.js 18+), then "
                    "codex login  in a terminal — or re-run setup.cmd, which does both")
@@ -1186,6 +1193,12 @@ class Overlay:
         _save_state(codex_intro_shown=True)
         if self.provider == "codex":
             return                       # already using it — nothing to introduce
+        if not self._cli_ok.get("codex") and self._can_setup_codex():
+            self._offer_codex_setup("✨ New: Codex mode — use OpenAI's Codex in this same "
+                                    "window from the Codex side of the titlebar switch. It "
+                                    "needs the Codex CLI, which isn't on this PC yet — one "
+                                    "click installs it and signs you in:")
+            return
         if not self._cli_ok.get("codex"):
             self.add_sys("✨ New: Codex mode — click Codex in the titlebar to use OpenAI's "
                          "Codex in this same window. It needs the Codex CLI: in a terminal, "
@@ -1197,11 +1210,99 @@ class Overlay:
             self.add_sys("✨ New: Codex mode — click Codex in the titlebar to use OpenAI's "
                          "Codex in this same window. It uses the Codex login you already have "
                          "(the Codex app shares it), so there's nothing to set up.")
+        elif self._can_setup_codex():
+            self._offer_codex_setup("✨ New: Codex mode — click Codex in the titlebar to use "
+                                    "OpenAI's Codex in this same window. Sign in to Codex "
+                                    "once first (if you use the Codex app you may already "
+                                    "be, and the overlay tells you if you aren't):",
+                                    signin=True)
         else:
             self.add_sys("✨ New: Codex mode — click Codex in the titlebar to use OpenAI's "
                          "Codex in this same window. Sign in once first with  codex login  in "
                          "a terminal — if you use the Codex app you may already be signed in, "
                          "and the overlay tells you if you aren't.")
+
+    def _can_setup_codex(self):
+        return os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "install-codex.cmd"))
+
+    def _offer_codex_setup(self, text, signin=False):
+        """A note plus the one-click "Set up Codex" button: install-codex.cmd in its own
+        console installs the CLI (Node.js first, asked, when there's no npm) and signs in —
+        the same script setup.cmd and update.cmd run. While one is running, a second offer
+        says so instead of stacking another button."""
+        if self._codex_setup_running():
+            return
+        self.add_sys(text)
+        self.chat.insert("end", "\n")
+        self.chat.window_create("end", window=self._codex_setup_btn(signin),
+                                padx=self.px(16), pady=self.px(2))
+        self.chat.insert("end", "\n")
+        self._scroll_follow()
+        self._prune_chat()
+
+    def _codex_setup_running(self):
+        """One setup at a time. Several offers can sit in the chat at once (the introduction,
+        then a click on the struck-through side), and two clicks would open two installers
+        whose results land on one button — so a click while one runs is told so instead."""
+        live = getattr(self, "_codex_setup_btn_ref", None)
+        if live is not None and getattr(live, "_ustate", "") == "working":
+            self.add_sys("Codex setup is already running in its console window — finish it "
+                         "there, and the result shows up here.")
+            return True
+        return False
+
+    def _codex_setup_btn(self, signin=False):
+        def work():
+            rc = run_codex_setup()           # looked up at click time, so it stays patchable
+            return rc == 0, "" if rc is None else str(rc)
+
+        def done():                          # "✓ … switch to it" does what it says
+            if self.provider != "codex":
+                self.switch_provider("codex")
+        here = self.provider == "codex"
+        return self._one_click_update_btn(
+            {"idle": "→  Sign in to Codex" if signin else "⬇  Install Codex CLI & sign in",
+             "working": "Setting up Codex…  (in the console window)",
+             "done": "✓  Codex is ready" if here else "✓  Codex is ready — switch to it",
+             "error": "⚠  Not finished — click to retry"},
+            work, "codex-setup", "_codex_setup_btn_ref", "codex_setup_result", on_done=done,
+            can_start=lambda: not self._codex_setup_running())
+
+    def _show_codex_setup_result(self, payload):
+        """install-codex.cmd's exit code, said in words: 0 ready, 2 installed but not signed
+        in, 3 not installed, "" couldn't run. The switch is re-read either way — a CLI that
+        did install makes the Codex side clickable even if the sign-in didn't happen."""
+        try:
+            ok, msg = payload
+        except Exception:
+            ok, msg = False, ""
+        c = getattr(self, "_codex_setup_btn_ref", None)
+        if c is not None:
+            try:
+                c._set_ustate("done" if ok else "error")
+            except Exception:
+                pass
+        self._refresh_cli_ok()
+        self._paint_provider_switch()
+        if ok:
+            if self.provider == "codex":
+                getattr(self.worker, "recheck_auth", lambda: None)()
+                self.add_sys("✅ Codex is signed in — your next message will go through.")
+            else:
+                self.add_sys("✅ Codex is set up. Click Codex in the titlebar (or the button "
+                             "above) to switch to it.")
+        elif msg == "2":
+            self.add_err("Codex CLI is installed, but not signed in yet. Click the button to "
+                         "sign in, or run  codex login  in a terminal.")
+        elif msg == "3":
+            self.add_err("The Codex CLI didn't install — its console window said why. Click "
+                         "the button to try again, or install it by hand:  npm install -g "
+                         "@openai/codex  (needs Node.js 18+), then  codex login.")
+        else:
+            self.add_err("Couldn't start install-codex.cmd from the app folder. Install Codex "
+                         "by hand:  npm install -g @openai/codex  (needs Node.js 18+), then  "
+                         "codex login  — or re-run setup.cmd, which does both.")
 
     def _switch_locked(self):
         """Why the agent can't change right now — "busy" or "content" — or None.
@@ -4783,15 +4884,17 @@ class Overlay:
         self._scroll_follow()
         self._prune_chat()
 
-    def _one_click_update_btn(self, labels, work, thread_name, btn_attr, result_kind):
+    def _one_click_update_btn(self, labels, work, thread_name, btn_attr, result_kind,
+                              on_done=None, can_start=None):
         """Shared builder for the in-chat one-click update buttons — the CLI's and the overlay's
         own (same embedded-canvas pattern as the Copy button). `labels` gives the text for the four
         states; a click while idle/error runs `work()` (zero-arg, returns (ok, msg)) on a
         background thread named `thread_name`, records THIS canvas on `self.<btn_attr>` so the
         result handler can restyle the button the user actually clicked, and delivers the outcome
-        as a (`result_kind`, (ok, msg)) UI event. A click while 'done' restarts the overlay —
-        neither update takes effect in this process. Forwards the wheel so it can't swallow
-        scrolling (the v1.4.1 embedded-widget trap).
+        as a (`result_kind`, (ok, msg)) UI event. A click while 'done' runs `on_done` — by
+        default a restart, since neither update takes effect in this process. `can_start`, when
+        given, is asked first and can refuse a click (one run at a time across several buttons).
+        Forwards the wheel so it can't swallow scrolling (the v1.4.1 embedded-widget trap).
 
         One builder rather than two: what differs between the CLI button and the overlay button is
         exactly the five arguments above. The drawing, the zoom re-render, the hover states and
@@ -4835,6 +4938,8 @@ class Overlay:
 
         def on_click(_e):
             if c._ustate in ("idle", "error"):          # first click, or retry after a failure
+                if can_start is not None and not can_start():
+                    return "break"
                 set_state("working")
                 setattr(self, btn_attr, c)
                 def run():
@@ -4845,7 +4950,7 @@ class Overlay:
                     self.ui_q.put((result_kind, (bool(ok), str(msg))))
                 threading.Thread(target=run, name=thread_name, daemon=True).start()
             elif c._ustate == "done":                   # after a successful update → restart now
-                self._restart_overlay()
+                (on_done or self._restart_overlay)()
             return "break"                              # working → inert
         c._click = on_click    # a named handle so the routing is directly testable
 
@@ -7144,6 +7249,11 @@ class Overlay:
                 self._auth_dead = not ok
                 if ok:
                     self.add_sys("✅ Codex login restored — your next message will go through.")
+                elif self._can_setup_codex():
+                    self.add_err("⚠ Codex isn't signed in, so every message would fail.")
+                    self._offer_codex_setup("Sign in with the button below (or  codex login  "
+                                            "in a terminal) — the overlay picks the login up "
+                                            "on its own, no restart needed:", signin=True)
                 else:
                     self.add_err("⚠ Codex isn't signed in, so every message would fail. In a "
                                  "terminal, run:  codex login  — the overlay notices the new "
@@ -7382,6 +7492,8 @@ class Overlay:
             self._refresh_statusline()
         elif kind == "ov_update_result":
             self._show_overlay_update_result(payload)
+        elif kind == "codex_setup_result":
+            self._show_codex_setup_result(payload)
         elif kind == "cli_update":
             self._show_cli_update_notice(payload)
         elif kind == "cli_update_result":

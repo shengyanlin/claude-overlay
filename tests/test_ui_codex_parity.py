@@ -60,13 +60,15 @@ def test_a_refused_turn_offers_the_timed_retry(codex):
 def test_past_codex_conversations_render_as_cards(codex):
     codex.show_sessions()
     assert ("list_sessions", ()) in codex.worker.calls
-    before = len(codex.chat.window_names())
+    before = set(codex.chat.window_names())
     codex._handle("codex_sessions", [
         {"id": "th-a", "title": "Summarise the deck", "subtitle": "gpt-x", "mtime": 1790000000},
         {"id": "th-b", "title": "Excel macro", "subtitle": "gpt-y", "mtime": 1790000500}])
-    names = codex.chat.window_names()
-    assert len(names) == before + 2                             # no count → never folded away
-    cards = [codex.chat.nametowidget(n) for n in names[before:]]
+    new = [n for n in codex.chat.window_names() if n not in before]
+    assert len(new) == 2                                        # no count → never folded away
+    # Tk lists embedded windows in no particular order, so take them in reading order
+    new.sort(key=lambda n: tuple(int(x) for x in codex.chat.index(n).split(".")))
+    cards = [codex.chat.nametowidget(n) for n in new]
     cards[1]._on_click()
     assert ("resume", ("th-b",)) in codex.worker.calls
     cards[0]._arm()
@@ -153,12 +155,16 @@ def test_a_permissions_card_says_what_is_asked(codex):
 
 # ── the one-time "Codex mode is here" note for installs updating to it ──
 
-@pytest.mark.parametrize("installed,auth_file,expect", [
-    (False, False, "npm install -g @openai/codex"),
-    (True, True, "nothing to set up"),
-    (True, False, "Sign in once first with  codex login"),
+@pytest.mark.parametrize("installed,auth_file,script,expect", [
+    (False, False, True, "one click installs it and signs you in"),
+    (False, False, False, "npm install -g @openai/codex"),     # no install-codex.cmd: by hand
+    (True, True, True, "nothing to set up"),
+    (True, False, True, "Sign in to Codex once first"),
+    (True, False, False, "Sign in once first with  codex login"),
 ])
-def test_codex_mode_is_introduced_once(overlay, tmp_path, monkeypatch, installed, auth_file, expect):
+def test_codex_mode_is_introduced_once(overlay, tmp_path, monkeypatch, installed, auth_file,
+                                       script, expect):
+    monkeypatch.setattr(co.Overlay, "_can_setup_codex", lambda self: script)
     home = tmp_path / "codexhome"
     home.mkdir()
     if auth_file:

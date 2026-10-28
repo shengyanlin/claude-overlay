@@ -230,6 +230,7 @@ def _clean_overlay(ov):
     ov._quota_said = None
     ov._cli_ok = {"claude": True, "codex": True}
     ov.__dict__.pop("_ring_told", None)   # …per agent, across Claude <-> Codex switches
+    ov._codex_setup_btn_ref = None        # a "Set up Codex" click left working can't leak
     ov._ring_explained = False          # the ring introduces itself once; a leaked flag would
                                         # silence the introduction in whichever test runs next
     try:

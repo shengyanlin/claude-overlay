@@ -262,19 +262,18 @@ instead of merging a release into work in progress.
 
 ### Updating to 1.25 — turning on Codex mode
 
-1.25 adds the titlebar's **Claude | Codex** switch. Updating doesn't install the Codex CLI
-(setup.cmd does that for new installs), so on an existing install:
+1.25 adds the titlebar's **Claude | Codex** switch, which drives the Codex CLI. **The update
+sets it up for you** (since 1.25.1): `update.cmd` — and the overlay's one-click Update —
+asks to install the Codex CLI (Node.js too, with winget, if there's no npm; Windows may ask
+for admin approval) and then offers `codex login`. Say no and it won't ask again on later
+updates. Claude mode works exactly as before either way.
 
-1. In a terminal: `npm install -g @openai/codex` (needs Node.js 18+), then `codex login`.
-   If you already use the Codex app you're probably signed in — it shares the CLI's login.
-   Re-running **`setup.cmd`** does both for you.
-2. Click **Codex** in the titlebar. No restart needed, even if you installed it while the
-   overlay was open.
-
-You don't have to remember this: the first launch of 1.25 says which of the two steps your
-machine still needs, `update.cmd` prints the same, the Codex side of the switch is struck
-through until the CLI is installed, and a signed-out Codex is announced before it can eat
-a message. Claude mode works exactly as before either way.
+Skipped it, or it didn't finish? Click **Codex** in the titlebar: while the CLI is missing
+(or signed out) the overlay offers a one-click **Install Codex CLI & sign in** button — a
+console window shows the progress — and Codex is clickable the moment it's done, no
+restart. By hand it's `npm install -g @openai/codex` (needs Node.js 18+), then
+`codex login`; re-running **`setup.cmd`** does both too. If you already use the Codex app
+you're probably signed in — it shares the CLI's login.
 
 ### 🛠️ By hand
 

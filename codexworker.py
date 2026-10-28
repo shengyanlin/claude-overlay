@@ -538,6 +538,11 @@ class CodexWorker(threading.Thread):
             self._next_auth_poll = now + AUTH_CHECK_INTERVAL
             self._bg_call("acct", "account/read", {})
 
+    def recheck_auth(self):
+        """Read the login on the next idle second instead of at the next poll — the UI calls
+        this after its "Set up Codex" console signed in, so held sends free up right away."""
+        self._next_auth_poll = 0.0
+
     def _bg_call(self, tag, method, params=None):
         if tag in self._bg_busy:
             return

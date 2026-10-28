@@ -3,6 +3,29 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.25.1] - 2026-10-28
+
+Updating no longer leaves Codex mode unusable: the update installs the Codex CLI and signs
+you in, and the overlay can do it in one click.
+
+### Fixed
+- **An install updated to 1.25 couldn't switch to Codex.** Installs older than Codex mode
+  never got the Codex CLI, and the update only printed a note about it — into a console
+  that the overlay's one-click Update closes on success, so nobody saw it. The update now
+  sets Codex up: it asks to install the CLI (Node.js first, with winget, if there's no
+  npm), then offers `codex login`. A "no" is remembered so later updates don't ask again.
+- **One-click Codex setup in the overlay.** Clicking the struck-through Codex side, the
+  first-launch introduction, and a Codex that signs out mid-session now carry an
+  **Install Codex CLI & sign in** (or **Sign in to Codex**) button that runs the same setup
+  in a console window; when it's done the switch unlocks without a restart, and a sign-in
+  frees held messages right away.
+- **The one-click Update didn't start from an app folder with `&` in its path** (and no
+  space): cmd.exe read the rest of the path as a second command. The Update and Codex
+  setup buttons now quote the script path for cmd.
+
+### Changed
+- setup.cmd, update.cmd and the overlay share one Codex installer, `install-codex.cmd`.
+
 ## [1.25.0] - 2026-10-28
 
 Codex mode: a **Claude | Codex** switch in the titlebar puts OpenAI's Codex behind the same

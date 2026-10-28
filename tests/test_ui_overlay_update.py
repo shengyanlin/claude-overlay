@@ -4,7 +4,10 @@ Sibling of test_ui_cli_update.py, for the OTHER update: the overlay updating its
 update.cmd. Drives the real Overlay methods on the shared hidden-root fixture and asserts the
 chat text / embedded-button state. update.cmd is never spawned — run_overlay_update is stubbed
 wherever a click is exercised, and the notice/result handlers spawn nothing at all."""
+import sys
 import tkinter as tk
+
+import pytest
 
 import claude_overlay as co
 import win32utils
@@ -245,7 +248,8 @@ def test_run_overlay_update_maps_the_exit_code(tmp_path, monkeypatch):
     assert win32utils.run_overlay_update(str(tmp_path))[0] is True
     # goes through cmd (a .cmd shim can't be exec'd directly) and gets its OWN console, since
     # under pythonw there is none to inherit and the updater's `pause` prompts must be visible.
-    assert seen["args"][:2] == ["cmd", "/c"]
+    assert seen["args"].startswith('cmd /s /c ""')
+    assert '"%s"' % (tmp_path / "update.cmd") in seen["args"]     # quoted: see _cmd_c
     assert seen["kw"]["creationflags"] & 0x00000010
     # and it tells update.cmd it was started by the app, so update.cmd skips the `pause` on its
     # success exit -- otherwise this wait() hangs on a keypress nobody knows to make and the
@@ -256,6 +260,30 @@ def test_run_overlay_update_maps_the_exit_code(tmp_path, monkeypatch):
     seen["rc"] = 1
     ok, msg = win32utils.run_overlay_update(str(tmp_path))
     assert ok is False and "1" in msg
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="cmd.exe")
+def test_the_launchers_run_from_a_folder_with_an_ampersand_and_parentheses(tmp_path, monkeypatch):
+    """A folder named Tools&Apps, or one under Program Files (x86): an unquoted `&` made cmd.exe run
+    the rest of the path as a second command, so neither script started. Really runs cmd
+    (in this console, not a new one), so the quoting is what's tested, not a mock of it."""
+    app = tmp_path / "Tools&Apps (x86)"
+    app.mkdir()
+    (app / "update.cmd").write_text('@if "%OV_UPDATE_AUTO%"=="1" exit /b 0\n@exit /b 5\n')
+    (app / "install-codex.cmd").write_text('@if "%~1"=="--from-app" exit /b 7\n@exit /b 1\n')
+    monkeypatch.setattr(win32utils, "_CREATE_NEW_CONSOLE", 0)
+    assert win32utils.run_overlay_update(str(app)) == (True, "")
+    assert win32utils.run_codex_setup(str(app)) == 7
+
+
+def test_run_codex_setup_without_the_script_or_on_a_failed_launch_is_none(tmp_path, monkeypatch):
+    assert win32utils.run_codex_setup(str(tmp_path)) is None
+    (tmp_path / "install-codex.cmd").write_text("rem")
+
+    def _boom(*a, **k):
+        raise OSError("nope")
+    monkeypatch.setattr(win32utils.subprocess, "Popen", _boom)
+    assert win32utils.run_codex_setup(str(tmp_path)) is None
 
 
 def test_run_overlay_update_never_raises(tmp_path, monkeypatch):

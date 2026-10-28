@@ -147,54 +147,11 @@ if /i not "%DOLOGIN%"=="n" ( claude auth login )
 
 rem --- 2c. codex CLI (the titlebar's Claude <-> Codex switch drives it) -----------
 rem Codex mode is one half of the app, so setup installs it -- but Claude mode never
-rem touches it, so every failure in here is a [!] and setup carries on: a machine where
-rem npm is blocked must still end up with a working (Claude-only) overlay. Codex mode
-rem itself says what's missing the first time it's switched on.
-rem goto-structured on purpose: PATH is changed below and re-read on the next line, which a
-rem parenthesized block would expand at parse time, before the change (see setup's top).
-rem npm is the install route OpenAI documents for Windows; it needs Node.js 18+.
-echo.
-where codex >nul 2>nul
-if not errorlevel 1 goto codexfound
-echo [!] 'codex' CLI not found -- the overlay's Codex mode needs it.
-where npm >nul 2>nul
-if not errorlevel 1 goto codexnpm
-echo     Installing it needs npm, which comes with Node.js -- not on this PC either.
-where winget >nul 2>nul
-if errorlevel 1 goto codexmanual
-set "DONODE=Y"
-set /p DONODE="Install Node.js LTS with winget now? Windows may ask for admin approval. [Y/n] "
-if /i "%DONODE:~0,1%"=="n" goto codexmanual
-winget install -e --id OpenJS.NodeJS.LTS --accept-source-agreements --accept-package-agreements
-set "PATH=%ProgramFiles%\nodejs;%APPDATA%\npm;%PATH%"
-where npm >nul 2>nul
-if errorlevel 1 goto codexmanual
-:codexnpm
-echo     Installing it with npm  ^(npm install -g @openai/codex^) ...
-rem `call`: npm and codex are .cmd shims, and a .cmd run without call never returns here.
-call npm install -g @openai/codex
-where codex >nul 2>nul
-if errorlevel 1 goto codexmanual
-echo [OK] codex CLI installed.
-goto codexlogin
-:codexmanual
-echo [!] Codex CLI not installed. Claude mode works without it; for Codex mode later:
-echo       npm install -g @openai/codex    ^(needs Node.js 18+ from https://nodejs.org^)
-echo       codex login
-echo     then click "Codex" in the overlay's titlebar.
-goto codexdone
-:codexfound
-echo [OK] codex CLI found.
-:codexlogin
-call codex login status >nul 2>nul
-if not errorlevel 1 goto codexsignedin
-set "DOCXLOGIN=Y"
-set /p DOCXLOGIN="Sign in to Codex now with 'codex login' (a browser opens)? [Y/n] "
-if /i not "%DOCXLOGIN:~0,1%"=="n" call codex login
-goto codexdone
-:codexsignedin
-echo [OK] codex is signed in.
-:codexdone
+rem touches it, so nothing in here can stop setup: a machine where npm is blocked must
+rem still end up with a working (Claude-only) overlay. install-codex.cmd is shared with
+rem update.cmd and the overlay's own "Set up Codex" button; it installs the CLI (Node.js
+rem first, via winget, if there's no npm) and offers `codex login`.
+call "%~dp0install-codex.cmd" --from-setup
 
 rem --- 3. Python packages ---
 echo.

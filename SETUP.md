@@ -36,8 +36,9 @@ else.**
 2. **Python 3.10+** — https://www.python.org/downloads/
    (In the installer, tick **"Add python.exe to PATH"**.)
 3. **Codex CLI** — for the titlebar's **Claude ⇄ Codex** switch (Codex mode drives your own
-   `codex` login the same way Claude mode drives `claude`). `setup.cmd` installs it for you;
-   by hand it is:
+   `codex` login the same way Claude mode drives `claude`). `setup.cmd` installs it for you
+   (so does `update.cmd` on an install that predates it, and the overlay's **Install Codex
+   CLI & sign in** button); by hand it is:
    ```
    npm install -g @openai/codex      (needs Node.js 18+ — https://nodejs.org)
    codex login

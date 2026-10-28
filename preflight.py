@@ -335,7 +335,8 @@ def check():
             "the `codex` CLI isn't on PATH - Claude mode works, but the titlebar's Codex "
             "switch has nothing to drive",
             "Install it (npm install -g @openai/codex, needs Node.js 18+) and sign in with "
-            "`codex login` once in a terminal - or re-run setup.cmd, which does both."))
+            "`codex login` once in a terminal - or double-click install-codex.cmd in the "
+            "app folder, which does both."))
 
     problems.sort(key=lambda p: 0 if p.level == FAIL else 1)
     return problems
