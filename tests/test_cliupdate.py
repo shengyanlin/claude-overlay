@@ -168,3 +168,39 @@ def test_run_update_failure_when_cannot_spawn(monkeypatch):
     monkeypatch.setattr(cu, "_run", lambda args, timeout: None)
     ok, reason = cu.run_update()
     assert ok is False and "launch" in reason
+
+
+# ── the same check and one-click update for the Codex CLI ──
+
+def _codex_run(calls, latest="0.161.0", installed="0.160.1", install_rc=0):
+    def run(args, timeout):
+        calls.append(args)
+        if args[:2] == ["codex", "--version"]:
+            return (0, f"codex-cli {installed}\n", "")
+        if args[:2] == ["npm", "view"]:
+            return (0, latest + "\n", "")
+        if args[:2] == ["npm", "install"]:
+            return (install_rc, "", "")
+        return None
+    return run
+
+
+def test_codex_check_uses_its_own_package_and_cache(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(cu, "_find_npm", lambda: "npm")
+    monkeypatch.setattr(cu, "_run", _codex_run(calls))
+    monkeypatch.setattr(cu, "_CACHE_PATH", tmp_path / "claude.json")
+    monkeypatch.setattr(cu, "_CODEX_CACHE_PATH", tmp_path / "codex.json")
+    assert cu.check_update(cli="codex") == {"installed": "0.160.1", "latest": "0.161.0",
+                                            "behind": True}
+    assert ["npm", "view", "@openai/codex", "version"] in calls
+    assert (tmp_path / "codex.json").exists() and not (tmp_path / "claude.json").exists()
+
+
+def test_codex_run_update_installs_the_codex_package(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(cu, "_find_npm", lambda: "npm")
+    monkeypatch.setattr(cu, "_run", _codex_run(calls, installed="0.161.0"))
+    monkeypatch.setattr(cu, "_CODEX_CACHE_PATH", tmp_path / "codex.json")
+    assert cu.run_update(cli="codex") == (True, "0.161.0")
+    assert ["npm", "install", "-g", "@openai/codex@latest"] in calls

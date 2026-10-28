@@ -79,6 +79,9 @@ class FakeWorker:
     def interrupt(self):        self._rec("interrupt")
     def shutdown(self):         self._rec("shutdown")
     def join(self, *a, **k):    self._rec("join")
+    def respond_approval(self, *a): self._rec("respond_approval", *a)   # CodexWorker only
+    def list_sessions(self):    self._rec("list_sessions")             # CodexWorker only
+    def archive(self, *a):      self._rec("archive", *a)               # CodexWorker only
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -130,6 +133,10 @@ def _overlay_singleton():
 
     mp = pytest.MonkeyPatch()
     mp.setattr(co, "ClaudeWorker", FakeWorker)
+    mp.setattr(co, "CodexWorker", FakeWorker)     # the titlebar switch builds this one
+    # Both CLIs "installed", whatever this machine has: a CI runner has no codex, and the
+    # switch tests must not depend on it. Tests of the missing-CLI path patch it per test.
+    mp.setattr(co.Overlay, "_cli_available", lambda self, provider: True)
     mp.setattr(co.Overlay, "_register_hotkey", lambda self: None)
     mp.setattr(co.Overlay, "_check_for_update", lambda self: None)
     # No usage-endpoint polling: the suite must not reach the network, and must not read
@@ -194,6 +201,11 @@ def _clean_overlay(ov):
             ov.toggle_collapse()        # back to expanded
     except Exception:
         pass
+    try:
+        if ov.provider != "claude":
+            ov.switch_provider("claude", force=True)   # a test that switched to Codex must not leave the
+    except Exception:                      # next one a Codex palette and worker
+        pass
     ov._queue = []                      # BEFORE reset(): a leaked line-up would otherwise be
     ov._queue_hold = None               # dropped-with-a-note into the freshly wiped chat and
     ov._queue_held = False              # leave the next test a non-empty transcript
@@ -216,6 +228,8 @@ def _clean_overlay(ov):
     ov._quota = None                    # allowance readings are per-test: a leaked one would
     ov._quota_polled = None             # take the gauge slot away from the next test's context
     ov._quota_said = None
+    ov._cli_ok = {"claude": True, "codex": True}
+    ov.__dict__.pop("_ring_told", None)   # …per agent, across Claude <-> Codex switches
     ov._ring_explained = False          # the ring introduces itself once; a leaked flag would
                                         # silence the introduction in whichever test runs next
     try:

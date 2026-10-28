@@ -35,16 +35,27 @@ else.**
    > installer drops it in `%USERPROFILE%\.local\bin` and a fresh terminal picks up the PATH.
 2. **Python 3.10+** — https://www.python.org/downloads/
    (In the installer, tick **"Add python.exe to PATH"**.)
+3. **Codex CLI** — for the titlebar's **Claude ⇄ Codex** switch (Codex mode drives your own
+   `codex` login the same way Claude mode drives `claude`). `setup.cmd` installs it for you;
+   by hand it is:
+   ```
+   npm install -g @openai/codex      (needs Node.js 18+ — https://nodejs.org)
+   codex login
+   ```
+   Verify with `codex --version` and `codex login status`. Claude mode works without it.
 
 ## Install
 
 1. Copy this whole `claude-overlay` folder to the new machine (anywhere).
 2. Double-click **`setup.cmd`** — it checks Python + the `claude` CLI (auto-installing the
-   CLI if it's missing) and installs the three Python packages (`claude-agent-sdk`,
-   `pillow`, `keyboard`).
+   CLI if it's missing), then the `codex` CLI (installed with npm; if Node.js is missing too
+   it offers to install it with winget, which may ask for admin approval — say no and Codex
+   is simply skipped), offers both sign-ins, and installs the Python packages
+   (`claude-agent-sdk`, `pillow`, `keyboard`, …).
    > pip may print a few `… is installed in … which is not on PATH` warnings here —
    > **they're harmless**; the overlay doesn't use those scripts.
-3. Make sure you've already logged in (`claude auth login`, step 1 above).
+3. Make sure you've already logged in (`claude auth login`, step 1 above — and
+   `codex login` for Codex mode).
 
 ## Run
 
@@ -64,6 +75,13 @@ comfortable with that, change it to:
 - `acceptEdits` — runs, but asks before edits, or
 - `default` — asks before most actions, or
 - `plan` — read-only.
+
+**Codex mode** asks for the same full access (`CODEX_SANDBOX = "danger-full-access"`:
+no sandbox, no prompts) — but only where the machine allows it. A managed machine's Codex
+policy can forbid that; the overlay then runs the strongest sandbox the policy permits
+(and, if Windows' `workspace-write` sandbox can't start on that PC, read-only), says so in
+the chat, and shows an **Allow / Deny** card whenever Codex wants to step outside it.
+Read-only always means Codex's `read-only` sandbox.
 
 ## Notes / fallbacks
 

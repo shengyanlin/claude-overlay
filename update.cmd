@@ -341,6 +341,29 @@ rem Overlay" shortcut is on the Desktop, re-point it at the current icon. We ski
 rem there's no shortcut, so an update never creates one the user didn't ask for.
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$d=[Environment]::GetFolderPath('Desktop'); if (Test-Path (Join-Path $d 'Claude Overlay.lnk')) { & '.\create-shortcut.ps1'; Write-Host '[OK] Desktop shortcut icon refreshed.' }"
 
+rem --- Codex mode needs the codex CLI ------------------------------------------
+rem An install that predates the Claude <-> Codex switch never got it from setup.cmd. Say
+rem so once per update -- a note, not a failure: Claude mode doesn't need it. [NOTE] rather
+rem than [!]: this script runs with delayed expansion on, which eats a lone `!`.
+rem Installed but never signed in (someone who only had Claude until now) is the same
+rem dead end one step later, so that gets its own note. goto-structured: `call` inside a
+rem parenthesized block would still work, but the two outcomes read clearer as labels.
+set "CODEXCMD="
+where codex >nul 2>nul && set "CODEXCMD=codex"
+if not defined CODEXCMD if exist "%APPDATA%\npm\codex.cmd" set "CODEXCMD=%APPDATA%\npm\codex.cmd"
+if defined CODEXCMD goto codexlogincheck
+echo.
+echo [NOTE] Codex mode ^(the titlebar switch^) needs the codex CLI. Install it with
+echo        npm install -g @openai/codex   then   codex login   -- or re-run setup.cmd.
+goto codexnotedone
+:codexlogincheck
+call "%CODEXCMD%" login status >nul 2>nul
+if not errorlevel 1 goto codexnotedone
+echo.
+echo [NOTE] Codex mode ^(the titlebar switch^) is ready, but Codex isn't signed in yet.
+echo        Run   codex login   once in a terminal before you switch to it.
+:codexnotedone
+
 rem --- prove the updated install can actually start ---------------------------
 rem Checking here is the whole difference between "it broke and I don't know why" and
 rem "the update told me". preflight loads the app exactly the way the launcher will.

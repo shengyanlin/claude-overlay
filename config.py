@@ -403,6 +403,65 @@ THEMES = {
     },
 }
 
+# ── Codex mode ──────────────────────────────────────────────────────────────
+# The titlebar's Claude ⇄ Codex switch swaps the agent behind the overlay for the `codex`
+# CLI (driven over `codex app-server`, the same JSON-RPC protocol the Codex desktop app and
+# IDE extension use — see codexworker.py) and re-skins the expanded window to match it.
+# The collapsed orb keeps its Clawd artwork either way.
+PROVIDER = "claude"             # startup default; the remembered switch position wins
+CODEX_MODEL = ""                # "" → whatever ~/.codex/config.toml (or the account) picks
+CODEX_EFFORT = "low"            # the overlay's own default, for the same reason EFFORT is
+                                # "auto": a floating chat lives on quick turnaround, and a
+                                # config.toml tuned for terminal work (xhigh) makes every
+                                # one-liner think first. The ⚡ menu changes it per session.
+# Sandbox for Codex's full-access mode (Read-only always runs "read-only"). The default
+# mirrors the Claude side's bypassPermissions: no sandbox, and no approval prompts where
+# the machine allows that. A MANAGED machine may not: an enterprise requirements layer can
+# forbid modes outright, and app-server then DOWNGRADES a forbidden request without failing
+# it (measured 2026-10-28: a policy allowing only read-only / workspace-write turned
+# "danger-full-access" into read-only — the opposite of what was asked). So the worker reads
+# the allowed set first, asks for the strongest mode the policy permits, and says so in the
+# chat; approvals the policy insists on are answered from an in-chat card.
+CODEX_SANDBOX = "danger-full-access"
+CODEX_EFFORT_LEVELS = [("Low", "low"), ("Medium", "medium"), ("High", "high"),
+                       ("Extra high", "xhigh"), ("Max", "max"),
+                       ("Default (your Codex setting)", "")]   # fallback when the model list
+                                                                # can't be read
+CODEX_SYSTEM_APPEND = SYSTEM_APPEND.replace(
+    "never use a structured multiple-choice question tool",
+    "never use a structured question or user-input tool")
+
+# The Codex palettes. Live switching recolours every widget already on screen by mapping
+# each Claude palette value to the Codex value of the SAME role (and back), so the two
+# palettes of one THEME must share a collision pattern: two roles that hold the same colour
+# in one must hold the same colour in the other, or a remapped value can't know which role
+# it came from. light: field == on_accent and user_card == hover. dark: border == sel.
+# (Pinned by tests/test_ui_provider_switch.py.)
+# The look: Codex's blue-violet as the one accent (send button, the >_ mark, the live
+# switch segment, Allow), on cool-tinted whites and slates rather than flat grey, with the
+# user's bubble a faint wash of the same hue. The accent can't double as the warning tier
+# the way Claude's orange does, so Codex carries its own amber in "warn".
+# The optional extra keys are read with T.get(...) at paint time only, never remapped.
+CODEX_THEMES = {
+    "light": {
+        "bg": "#FAFBFE", "field": "#FFFFFF", "user_card": "#ECEFFE",
+        "text": "#141826", "muted": "#545C70", "faint": "#8B93A7",
+        "accent": "#4F5DF5", "accent_hi": "#3B47D9", "on_accent": "#FFFFFF",
+        "border": "#E0E4F0", "tool_bg": "#F1F3FA", "err": "#D9363E",
+        "sel": "#D5DCFF", "hover": "#ECEFFE",
+        "warn": "#D98200", "menu_hi": "#ECEFFE", "on_menu_hi": "#141826",
+    },
+    "dark": {
+        "bg": "#14161D", "field": "#1B1E27", "user_card": "#262B40",
+        "text": "#E7EAF3", "muted": "#A2AABE", "faint": "#6A7287",
+        "accent": "#7D89FF", "accent_hi": "#9AA4FF", "on_accent": "#FFFFFF",
+        "border": "#2B3042", "tool_bg": "#1A1D27", "err": "#FF6B6B",
+        "sel": "#2B3042", "hover": "#20242F",
+        "warn": "#F2A93B", "menu_hi": "#262B40", "on_menu_hi": "#E7EAF3",
+    },
+}
+FONT_CODEX_TITLE = ["Segoe UI Variable Display", "Segoe UI Semibold", "Segoe UI"]
+
 # ── per-machine overrides: config.json ──────────────────────────────────────
 # Every constant above is a COMMITTED default — editing this file to taste dirties the
 # git clone and turns every `git pull` into a conflict (or forces a rebase dance). So
@@ -528,6 +587,11 @@ _USER_CONFIG_KEYS = {
     "CLI_UPDATE_CHECK": _v_bool,
     "TELEMETRY": _v_bool,                      # false = never send the anonymous usage ping
     "TELEMETRY_URL": _v_telemetry_url,         # "" = no endpoint; https only, see telemetry.state
+    # Codex mode (the titlebar Claude ⇄ Codex switch)
+    "PROVIDER": _v_choice("claude", "codex"),  # seeds the first launch; the switch remembers
+    "CODEX_MODEL": _v_str,
+    "CODEX_EFFORT": _v_choice("", "auto", "low", "medium", "high", "xhigh", "max", "ultra"),
+    "CODEX_SANDBOX": _v_choice("workspace-write", "danger-full-access"),
     # capture
     "AUTO_SCREENSHOT_DEFAULT": _v_bool,
     "SHOT_SCOPE": _v_choice("screens", "window"),
@@ -628,4 +692,7 @@ def _apply_user_config():
 
 _apply_user_config()
 
-T = THEMES.get(THEME, THEMES["light"])
+# A COPY, not the THEMES entry itself: the Claude ⇄ Codex switch rewrites T in place (every
+# module that did `from config import *` holds this same dict), and the source palettes
+# must survive that to be switched back to.
+T = dict(THEMES.get(THEME, THEMES["light"]))

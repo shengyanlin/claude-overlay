@@ -196,6 +196,13 @@ def _claude_cli_path():
     return shutil.which("claude", path=path)
 
 
+def _codex_cli_path():
+    """Where the `codex` CLI is, with the global-npm folder codexworker.py adds to PATH."""
+    import shutil
+    extra = os.path.join(os.environ.get("APPDATA", ""), "npm")
+    return shutil.which("codex", path=os.pathsep.join([extra, os.environ.get("PATH", "")]))
+
+
 def check():
     """Every environment problem we can name, worst first. Pure inspection — nothing here
     starts the app, opens a window or contacts the network."""
@@ -320,6 +327,15 @@ def check():
             "will fail",
             "Install it (npm install -g @anthropic-ai/claude-code) and sign in with "
             "`claude` once in a terminal."))
+    # WARN, never FAIL: Codex is the other half of the titlebar switch, but Claude mode
+    # doesn't touch it — a machine without it still has a working overlay.
+    if not _codex_cli_path():
+        problems.append(Problem(
+            WARN, "codex-cli",
+            "the `codex` CLI isn't on PATH - Claude mode works, but the titlebar's Codex "
+            "switch has nothing to drive",
+            "Install it (npm install -g @openai/codex, needs Node.js 18+) and sign in with "
+            "`codex login` once in a terminal - or re-run setup.cmd, which does both."))
 
     problems.sort(key=lambda p: 0 if p.level == FAIL else 1)
     return problems

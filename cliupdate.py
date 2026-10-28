@@ -42,6 +42,11 @@ from pathlib import Path
 
 _PKG = "@anthropic-ai/claude-code"
 _CACHE_PATH = Path.home() / ".claude-overlay" / "cli_update_cache.json"
+# The Codex side of the titlebar switch: same check, same one-click update, its own package
+# and cache. Every public function takes cli="claude" | "codex" and defaults to Claude, so
+# existing callers (and their tests, which patch the module globals) are unchanged.
+_CODEX_PKG = "@openai/codex"
+_CODEX_CACHE_PATH = Path.home() / ".claude-overlay" / "codex_update_cache.json"
 _CHECK_INTERVAL_S = 24 * 60 * 60          # re-query the registry at most once/day
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 _NPM_VIEW_TIMEOUT = 25                     # registry lookup (cache miss only)
@@ -88,11 +93,21 @@ def installed_version():
         return None
 
 
-def _npm_latest():
+def codex_version():
+    """The installed `codex` CLI's version ('0.160.1') or None. `codex --version` prints
+    "codex-cli 0.160.1"; through cmd /c because the npm install is a .cmd shim."""
+    res = _run(["codex", "--version"], _NPM_VIEW_TIMEOUT)
+    if not res or res[0] != 0:
+        return None
+    m = re.search(r"\b(\d+\.\d+\.\d+)\b", res[1])
+    return m.group(1) if m else None
+
+
+def _npm_latest(pkg=None):
     """The latest published version of the package on the npm registry (the exact version
     `npm install -g <pkg>@latest` would install), or None. Parses STDOUT only — npm's upgrade
     nags go to stderr and could otherwise be mis-read as the package version."""
-    res = _run(["npm", "view", _PKG, "version"], _NPM_VIEW_TIMEOUT)
+    res = _run(["npm", "view", pkg or _PKG, "version"], _NPM_VIEW_TIMEOUT)
     if not res:
         return None
     rc, out, _err = res
@@ -102,27 +117,28 @@ def _npm_latest():
     return m.group(1) if m else None
 
 
-def _load_cache():
+def _load_cache(path=None):
     try:
-        c = json.loads(_CACHE_PATH.read_text("utf-8"))
+        c = json.loads((path or _CACHE_PATH).read_text("utf-8"))
         return c if isinstance(c, dict) else None
     except Exception:
         return None
 
 
-def _save_cache(result):
+def _save_cache(result, path=None):
     """Persist a check result with a timestamp so the (slow) registry lookup is skipped for
     _CHECK_INTERVAL_S. Best-effort — a write failure just means we re-check next launch."""
     try:
-        _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _CACHE_PATH.write_text(json.dumps({"ts": time.time(), "result": result}), "utf-8")
+        path = path or _CACHE_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"ts": time.time(), "result": result}), "utf-8")
     except Exception:
         pass
 
 
-def _fresh_cache():
+def _fresh_cache(path=None):
     """The cached check result if it's younger than _CHECK_INTERVAL_S and well-formed, else None."""
-    c = _load_cache()
+    c = _load_cache(path)
     if not c:
         return None
     ts = c.get("ts")
@@ -134,7 +150,15 @@ def _fresh_cache():
     return None
 
 
-def check_update(force=False):
+def _spec(cli):
+    """(package, cache path, installed-version fn, latest-version fn) for a CLI. Looked up
+    at call time, so a test that patches the module's Claude globals still sees them."""
+    if cli == "codex":
+        return _CODEX_PKG, _CODEX_CACHE_PATH, codex_version, lambda: _npm_latest(_CODEX_PKG)
+    return _PKG, _CACHE_PATH, installed_version, _npm_latest
+
+
+def check_update(force=False, cli="claude"):
     """Decide whether the installed CLI is behind the latest npm release.
 
     Returns {"installed": "2.1.198", "latest": "2.1.204", "behind": True} — or None on ANY
@@ -143,17 +167,18 @@ def check_update(force=False):
     calls (pass force=True to bypass, e.g. right after an update)."""
     if _find_npm() is None:
         return None
+    _pkg, cache, installed, latest_of = _spec(cli)
     if not force:
-        cached = _fresh_cache()
+        cached = _fresh_cache(cache)
         if cached is not None:
             return cached
-    inst = installed_version()
-    latest = _npm_latest()
+    inst = installed()
+    latest = latest_of()
     if not inst or not latest:
         return None
     result = {"installed": inst, "latest": latest,
               "behind": bool(_parse_ver(inst) < _parse_ver(latest))}
-    _save_cache(result)
+    _save_cache(result, cache)
     return result
 
 
@@ -184,7 +209,7 @@ def _failure_reason(rc, out, err):
     return f"npm exited with code {rc}"
 
 
-def run_update():
+def run_update(cli="claude"):
     """Run `npm install -g @anthropic-ai/claude-code@latest`.
 
     Returns (True, new_version) on success — after which the cache is refreshed to not-behind
@@ -192,12 +217,17 @@ def run_update():
     can always fall back to running the npm command by hand."""
     if _find_npm() is None:
         return (False, "npm not found on PATH")
-    res = _run(["npm", "install", "-g", _PKG + "@latest"], _INSTALL_TIMEOUT)
+    pkg, cache, installed, _latest = _spec(cli)
+    res = _run(["npm", "install", "-g", pkg + "@latest"], _INSTALL_TIMEOUT)
     if not res:
         return (False, "couldn't launch npm")
     rc, out, err = res
     if rc != 0:
-        return (False, _failure_reason(rc, out, err))
-    new = installed_version() or "latest"
-    _save_cache({"installed": new, "latest": new, "behind": False})
+        reason = _failure_reason(rc, out, err)
+        if cli == "codex":
+            reason = reason.replace("a running Claude process", "a running Codex process "
+                                    "(the Codex app, or a terminal running codex)")
+        return (False, reason)
+    new = installed() or "latest"
+    _save_cache({"installed": new, "latest": new, "behind": False}, cache)
     return (True, new)

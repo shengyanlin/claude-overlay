@@ -146,8 +146,10 @@ class TestThemes:
             assert key in config.THEMES["dark"], f"'dark' theme missing key: {key}"
 
     def test_T_is_light_theme(self):
-        # THEME defaults to "light", so T must be the light sub-dict
-        assert config.T is config.THEMES["light"]
+        # THEME defaults to "light", so T carries the light palette — as a COPY: the
+        # Claude ⇄ Codex switch rewrites T in place and THEMES must survive that.
+        assert config.T == config.THEMES["light"]
+        assert config.T is not config.THEMES["light"]
 
     def test_T_equals_light_theme_values(self):
         assert config.T == config.THEMES["light"]
@@ -366,7 +368,7 @@ class TestUserConfig:
                       "AUTO_SCREENSHOT_DEFAULT": False})
         assert c.PERMISSION_MODE == "plan"
         assert c.THEME == "dark"
-        assert c.T is c.THEMES["dark"]          # T is derived AFTER the overrides
+        assert c.T == c.THEMES["dark"]          # T is derived AFTER the overrides
         assert c.AUTO_SCREENSHOT_DEFAULT is False
         assert c.USER_CONFIG_WARNINGS == []
 

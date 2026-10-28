@@ -123,6 +123,10 @@ def _file_version():
 # the real class in _worker_import rather than assigning the global — assigning it would
 # race that patch and could hand a test a real worker with a real `claude` connection.
 ClaudeWorker = None
+# The Codex agent behind the titlebar switch — a patch point exactly like ClaudeWorker. Its
+# module is stdlib-only (no SDK chain to hide), so it is imported with the UI below and only
+# looked up here when the switch, or a remembered "codex", asks for it.
+CodexWorker = None
 _worker_import = {}                # "cls" on success, "err" on failure — set exactly once
 _worker_ready = threading.Event()
 
@@ -152,6 +156,7 @@ try:
     from win32utils import *
     from win32utils import _user32, _gdi32
     import authstate
+    import codexworker
     import modelresolve
     import sessions
     import telemetry
@@ -161,11 +166,13 @@ except Exception as _e:
 
 # ───────────────────────────── the overlay UI ─────────────────────────────
 PLACEHOLDER = "Reply to Claude…"
+CODEX_PLACEHOLDER = "Ask Codex anything…"
+PROVIDERS = (("claude", "Claude"), ("codex", "Codex"))   # the titlebar switch, left to right
 TOOL_ICONS = {
     "Read": "▤", "Write": "✎", "Edit": "✎", "MultiEdit": "✎", "NotebookEdit": "✎",
     "Bash": "❯", "BashOutput": "❯", "KillShell": "❯", "PowerShell": "❯",
     "Glob": "⌕", "Grep": "⌕", "WebSearch": "⌕", "WebFetch": "↗", "ToolSearch": "⌕",
-    "TodoWrite": "☑", "Task": "◆",
+    "TodoWrite": "☑", "Task": "◆", "ImageGen": "◐",
 }
 
 
@@ -228,9 +235,11 @@ _COMPACT_ETA_Q = 0.80             # aim the estimate here, not at the middle (se
 _COMPACT_ETA_PAD = 0.15           # …and never less than this much headroom, however tight the fit
 
 
-def _compact_history():
-    """Remembered (pre_tokens, duration_sec) pairs from this overlay's own compactions."""
-    raw = _load_state().get("compact_runs")
+def _compact_history(key="compact_runs"):
+    """Remembered (pre_tokens, duration_sec) pairs from this overlay's own compactions. One
+    list per agent (`key`): Codex compacts at its own speed, and fitting one agent's timings
+    to the other's would draw a progress bar that lies."""
+    raw = _load_state().get(key)
     out = []
     if isinstance(raw, list):
         for it in raw[-_COMPACT_HIST_MAX:]:
@@ -243,7 +252,7 @@ def _compact_history():
     return out
 
 
-def _compact_history_add(pre_tokens, duration_sec):
+def _compact_history_add(pre_tokens, duration_sec, key="compact_runs"):
     """Append one completed run, keeping only the most recent _COMPACT_HIST_MAX."""
     try:
         pre, dur = int(pre_tokens), float(duration_sec)
@@ -251,8 +260,8 @@ def _compact_history_add(pre_tokens, duration_sec):
         return
     if pre <= 0 or dur <= 0:
         return
-    runs = _compact_history() + [(pre, round(dur, 1))]
-    _save_state(compact_runs=[list(r) for r in runs[-_COMPACT_HIST_MAX:]])
+    runs = _compact_history(key) + [(pre, round(dur, 1))]
+    _save_state(**{key: [list(r) for r in runs[-_COMPACT_HIST_MAX:]]})
 
 
 def _compact_samples_from_transcripts():
@@ -404,7 +413,8 @@ _CTX_HOT_PCT = 85.0               # red, and a second, louder note
 # is no reading, so the row stays short on a narrow overlay, which is what killed arrangement
 # one (a second clause pushed the version off the end).
 _QUOTA_WINDOWS = {"five_hour": "5h", "seven_day": "week", "seven_day_opus": "week/opus",
-                  "seven_day_sonnet": "week/sonnet", "overage": "overage"}
+                  "seven_day_sonnet": "week/sonnet", "overage": "overage",
+                  "codex_limit": "limit"}   # a Codex business seat's spend limit (codexworker)
 _QUOTA_HOT = 0.90                 # colour by the number shown, even if the CLI still says
                                   # "allowed" — a grey 94% reads as nothing being wrong
 _QUOTA_WARN = 0.75                # amber floor for a reading that carries no status. The CLI's
@@ -562,15 +572,105 @@ def _startup_permission_mode():
     return ro, ("plan" if ro else full)
 
 
-def _startup_effort():
+def _startup_provider():
+    """Which agent this launch starts with: the remembered titlebar switch over the config
+    default (PROVIDER), like every other remembered toggle."""
+    saved = _load_state().get("provider")
+    if saved in ("claude", "codex"):
+        return saved
+    return PROVIDER if PROVIDER in ("claude", "codex") else "claude"
+
+
+def _resolve_startup_provider(wanted, cli_ok):
+    """(provider to open on, note or None). The remembered agent wins — unless its CLI is
+    gone and the other one is installed, in which case opening on it would greet the user
+    with an error they can't act on from here. Neither installed → keep the wish; its
+    worker then says exactly what to install."""
+    other = "claude" if wanted == "codex" else "codex"
+    if cli_ok.get(wanted, True) or not cli_ok.get(other, False):
+        return wanted, None
+    names = dict(PROVIDERS)
+    cli = "Codex CLI (`codex`)" if wanted == "codex" else "Claude Code CLI (`claude`)"
+    return other, f"⇄ Opened in {names[other]} — the {cli} isn't installed on this PC."
+
+
+# Every reasoning level a Codex model has been seen to advertise. The ⚡ menu offers what the
+# CURRENT model reports (codexworker reads model/list); this set only vets a remembered value.
+_CODEX_EFFORTS = {"", "auto", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+                  "ultra"}
+_CODEX_EFFORT_LABELS = {"none": "None", "minimal": "Minimal", "low": "Low", "medium": "Medium",
+                        "high": "High", "xhigh": "Extra high", "max": "Max", "ultra": "Ultra"}
+
+
+def _startup_effort(provider="claude"):
     """The effort to LAUNCH the worker with: the remembered ⚡ choice — a deliberate user
     choice, like Read-only and Window-only — over the config default, which seeds the
     first launch. Only a level the menu can offer is honoured: a hand-edited or stale
-    state.json must not launch the CLI with a flag value it would reject."""
+    state.json must not launch the CLI with a flag value it would reject. Each agent
+    remembers its own: Codex's levels are a different vocabulary."""
+    if provider == "codex":
+        saved = _load_state().get("codex_effort")
+        return saved if isinstance(saved, str) and saved in _CODEX_EFFORTS else CODEX_EFFORT
     saved = _load_state().get("effort")
     if isinstance(saved, str) and saved in {v for _, v in EFFORT_LEVELS}:
         return saved
     return EFFORT
+
+
+# Every event kind a WORKER emits. Switching agents purges these from ui_q so nothing the old
+# one already queued (the tail of a stream, its "ready", its session id) lands in the new
+# conversation; events from the UI's own helper threads (attach, sessions, updates) survive.
+_WORKER_EVENTS = frozenset({
+    "ready", "reset_done", "delta", "think", "tool", "model", "ctx", "ctx_tokens", "quota",
+    "turn_done", "session", "resumed", "resume_failed", "resume_lost", "compacting",
+    "compact_done", "auto_compacted", "session_replaced", "error", "result", "status",
+    "permission_mode", "effort", "system", "codex_models", "codex_quota", "codex_sandbox",
+    "approval", "approval_resolved"})
+
+# What _recolor walks: the colour options a Tk widget can carry, a canvas item can carry, and
+# a Text tag can carry.
+_COLOR_OPTS = ("background", "foreground", "activebackground", "activeforeground",
+               "highlightbackground", "highlightcolor", "insertbackground", "selectbackground",
+               "selectforeground", "inactiveselectbackground", "disabledforeground",
+               "readonlybackground", "troughcolor", "selectcolor")
+_ITEM_COLOR_OPTS = ("fill", "outline", "activefill", "activeoutline", "disabledfill",
+                    "disabledoutline")
+_TAG_COLOR_OPTS = ("foreground", "background", "selectforeground", "selectbackground")
+
+
+class _CodexThreads:
+    """The past-conversation cards' store, for Codex: "delete" archives the thread (Codex's
+    own reversible removal — `codex unarchive` brings it back) rather than unlinking a
+    rollout file app-server owns."""
+
+    def __init__(self, overlay):
+        self._ov = overlay
+
+    def delete(self, session):
+        try:
+            self._ov.worker.archive(session.id)
+            return True
+        except Exception:
+            return False
+
+
+class _WorkerSink:
+    """The queue a worker writes to — cut off the moment that worker is replaced.
+
+    A worker that has been told to shut down can still be mid-put: the tail of a streaming
+    reply, a reconnect note. Through the raw queue those would render in the NEXT agent's
+    conversation. Each worker gets a sink stamped with the generation it was born in; a put
+    after the switch bumps the generation is dropped, under the same lock the bump takes, so
+    there is no window between "checked" and "delivered"."""
+    __slots__ = ("_q", "_owner", "_gen")
+
+    def __init__(self, q, owner, gen):
+        self._q, self._owner, self._gen = q, owner, gen
+
+    def put(self, item, *a, **k):
+        with self._owner._sink_lock:
+            if self._owner._worker_gen == self._gen:
+                self._q.put(item, *a, **k)
 
 
 def round_rect(c, x1, y1, x2, y2, r, **kw):
@@ -598,7 +698,24 @@ class Overlay:
         if not SHOT_SCOPE_FORCED:                     # remembered toggle choice survives a
             self.window_shot = bool(_load_state().get("window_shot", self.window_shot))
                                                       # relaunch; an explicit env var beats it
-        self.effort = _startup_effort()   # the ⚡ level the worker is LAUNCHED with; the
+        # Which agent answers: the titlebar's Claude ⇄ Codex switch. Decided before the
+        # palette is read by _build, which paints the whole window in this agent's colours.
+        self.provider = _startup_provider()
+        self._cli_ok = {p: self._cli_available(p) for p, _ in PROVIDERS}
+        self.provider, self._startup_note = _resolve_startup_provider(self.provider, self._cli_ok)
+        if self.provider == "codex":
+            T.clear()
+            T.update(self._palette_for("codex"))
+        self._worker_gen = 0               # bumped per worker; see _WorkerSink
+        self._sink_lock = threading.Lock()
+        self._switching = False            # re-entrancy guard for switch_provider
+        self._codex_models = []            # [{id, label, efforts, …}] from codexworker
+        self._codex_sandbox = None         # the sandbox Codex actually runs in (worker-reported)
+        self._approval_cards = {}          # pending Codex approval id → its in-chat card
+        self._has_turns = False            # something was asked (or resumed) in THIS conversation
+                                           # — from then on the switch is locked until Clear
+        self._lock_told = 0.0              # when the "Clear first" note last showed (no spam)
+        self.effort = _startup_effort(self.provider)   # the ⚡ level the worker is LAUNCHED with; the
                                           # statusline menu changes it via the worker
                                           # (confirmed async) and confirmed changes persist
         self.share_visible = SHOW_IN_SCREEN_SHARE_DEFAULT   # True → overlay shows in screen shares
@@ -774,7 +891,7 @@ class Overlay:
     # ── construction ──
     def _build(self):
         self.root = tk.Tk()
-        self.root.title("Claude")
+        self.root.title(self._provider_name())
         self.s = max(1.0, self.root.winfo_fpixels("1i") / 96.0)   # DPI scale factor
         self.root.overrideredirect(True)
         self._apply_app_icon()                 # Clawd icon for the taskbar button / alt-tab
@@ -793,6 +910,7 @@ class Overlay:
         avail = set(tkfont.families())
         pick = lambda cands: next((c for c in cands if c in avail), cands[-1])
         self.sans, self.serif, self.mono = pick(FONT_SANS), pick(FONT_SERIF), pick(FONT_MONO)
+        self.codex_title_fam = pick(FONT_CODEX_TITLE)   # Codex's wordmark is a plain sans
         self.zoom = 1.0
         self._fonts = []   # (Font, base_logical_size) → reconfigured live on Ctrl +/-
         # Embedded canvases (user bubbles, tool chips, tables, Copy buttons) are fixed-size and
@@ -804,7 +922,8 @@ class Overlay:
             f = tkfont.Font(family=fam, size=-self.px(base), **k)
             self._fonts.append((f, base))
             return f
-        self.f_title = mk(self.serif, 16, weight="bold")
+        self.f_title = mk(self.serif if self.provider == "claude" else self.codex_title_fam,
+                          16, weight="bold")
         self.f_body  = mk(self.sans, 15)
         self.f_small = mk(self.sans, 12)
         self.f_chip  = mk(self.sans, 11, weight="bold")
@@ -821,6 +940,9 @@ class Overlay:
         # Collapsed-orb name pill: a fixed-size label (NOT registered for zoom — it only shows
         # while collapsed, where the chat-text zoom is irrelevant). Kept as a ref so Tk won't GC it.
         self.f_pill  = tkfont.Font(family=self.sans, size=-self.px(13), weight="bold")
+        # The titlebar's Claude ⇄ Codex switch: fixed-size like the pill — it is chrome, and a
+        # titlebar control that grows with Ctrl + would push the window buttons off the bar.
+        self.f_switch = tkfont.Font(family=self.sans, size=-self.px(11), weight="bold")
         # Status-bar icon font: the native Windows symbol face renders a crisp, monochrome
         # settings gear (U+E713 — the same glyph Windows uses in its own Settings UI) that
         # colors cleanly with the theme, far nicer than the thin U+2699 the body font makes.
@@ -854,6 +976,9 @@ class Overlay:
         # launch a full-access session the user believed was read-only.
         for w in USER_CONFIG_WARNINGS:
             self.add_sys(f"⚠ {USER_CONFIG_FILE.name}: {w}")
+        if self._startup_note:
+            self.add_sys(self._startup_note)
+        self._maybe_announce_codex()
         self._maybe_offer_resume()
 
         # First paint, THEN the worker. update() maps and draws the window built above, so
@@ -892,7 +1017,8 @@ class Overlay:
                                                       # only one the user gets nothing from —
                                                       # so it goes behind the two that serve them
         self._usage_poll = usage.Poller(self.ui_q)
-        self._start_usage_poll()
+        if self.provider == "claude":   # Claude's allowance; Codex reports its own (codexworker)
+            self._start_usage_poll()
         self._start_hang_watchdog()    # diagnostic: dumps all-thread stacks if the UI pump stalls
 
     def _make_worker(self, mode):
@@ -906,13 +1032,366 @@ class Overlay:
         was — minus everything that has now painted first. A failure is reported through
         the exact channel the module-level import used, so a missing claude_agent_sdk
         still produces the dialog that names update.cmd rather than a blank window."""
-        cls = ClaudeWorker
-        if cls is None:
-            _worker_ready.wait()
-            if "err" in _worker_import:
-                _report_import_failure(_worker_import["err"])
-            cls = _worker_import["cls"]
-        return cls(self.ui_q, permission_mode=mode, effort=self.effort)
+        if self.provider == "codex":
+            cls = CodexWorker or codexworker.CodexWorker
+        else:
+            cls = ClaudeWorker
+            if cls is None:
+                _worker_ready.wait()
+                if "err" in _worker_import:
+                    _report_import_failure(_worker_import["err"])
+                cls = _worker_import["cls"]
+        with self._sink_lock:
+            self._worker_gen += 1
+            sink = _WorkerSink(self.ui_q, self, self._worker_gen)
+        return cls(sink, permission_mode=mode, effort=self.effort)
+
+    # ── Claude ⇄ Codex ──
+    def _provider_name(self):
+        return "Codex" if getattr(self, "provider", "claude") == "codex" else "Claude"
+
+    @staticmethod
+    def _palette_for(provider):
+        src = CODEX_THEMES if provider == "codex" else THEMES
+        return dict(src.get(THEME, src["light"]))
+
+    @staticmethod
+    def _claude_palette():
+        """Claude's colours whatever the switch says — the collapsed orb keeps its Clawd
+        look in both modes."""
+        return THEMES.get(THEME, THEMES["light"])
+
+    def _placeholder(self):
+        return CODEX_PLACEHOLDER if self.provider == "codex" else PLACEHOLDER
+
+    def switch_provider(self, target, force=False):
+        """The titlebar switch: swap the agent and re-skin the window in place, no relaunch.
+
+        A Claude conversation can't continue under Codex (or back), so the switch is a Clear
+        plus a new agent: the old worker is cut off — its sink stops forwarding and whatever
+        it had already queued is purged, so the tail of a stream can't land in the new chat —
+        the transcript is wiped the way Clear wipes it, the palette is swapped and every
+        widget already on screen recoloured (see _recolor), and a fresh worker starts in the
+        same Read-only state. Typed text and queued attachments stay put. Remembered for the
+        next launch, like every other toggle.
+
+        Only an EMPTY conversation can change hands (see _switch_locked): once something has
+        been asked, switching would throw the conversation away mid-thought, so the user is
+        told to Clear first. `force` skips that — for the test fixture's cleanup, never the UI.
+        Returns whether the switch happened."""
+        target = "codex" if target == "codex" else "claude"
+        if target == self.provider or self._switching:
+            return False
+        if not force and not self._refresh_cli_ok().get(target, True):
+            self._paint_provider_switch()
+            self._explain_missing_cli(target)
+            return False
+        if not force and self._switch_locked():
+            self._explain_switch_lock(target)
+            return False
+        self._switching = True
+        try:
+            if getattr(self, "_rename_entry", None) is not None:
+                self._commit_rename()
+            old = self.worker
+            with self._sink_lock:
+                self._worker_gen += 1          # from here on the old worker talks to no one
+            for fn in (getattr(old, "interrupt", None), getattr(old, "shutdown", None)):
+                try:
+                    fn and fn()
+                except Exception:
+                    pass
+            self._purge_worker_events()
+            name = dict(PROVIDERS)[target]
+            self._wipe_conversation(note=f"⇄ Switched to {name}")
+            self._discard_pending = False
+            told = self.__dict__.setdefault("_ring_told", set())   # the ring note is said
+            if self._ring_explained:                               # once per agent, not once
+                told.add(self.provider)                            # per flip of the switch
+            self.provider = target
+            self.effort = _startup_effort(target)
+            self._model = None
+            self._quota = self._quota_polled = self._quota_said = None
+            self._ring_explained = target in told
+            self._codex_models = []
+            self._codex_sandbox = None
+            self._sessions_loading = False              # the old agent's answer is dropped
+            self._auth_dead = self._auth_told = False   # a dead Claude login says nothing
+            self._auth_checked = 0.0                    # about Codex, and vice versa
+            try:
+                self._usage_poll.stop()
+            except Exception:
+                pass
+            self._usage_poll = usage.Poller(self.ui_q)
+            if target == "claude":
+                self._start_usage_poll()
+            self._apply_provider_look()
+            _save_state(provider=target)
+            self.worker = self._make_worker("plan" if self.read_only else self._full_mode)
+            self.worker.start()
+            self._set_busy(False)
+            self._intro()
+            self._maybe_offer_resume()
+            self._refresh_statusline()
+            self.statusline.configure(text="connecting…")
+            self.root.after(1500, self._check_cli_update)
+            return True
+        finally:
+            self._switching = False
+
+    @staticmethod
+    def _cli_name(provider):
+        return "Codex CLI (`codex`)" if provider == "codex" else "Claude Code CLI (`claude`)"
+
+    def _cli_available(self, provider):
+        """Is this agent's CLI installed — found the way its worker will look for it."""
+        try:
+            if provider == "codex":
+                return bool(codexworker.codex_command())
+            import shutil
+            extra = [os.path.join(os.environ.get("USERPROFILE", ""), ".local", "bin"),
+                     os.path.join(os.environ.get("APPDATA", ""), "npm")]
+            path = os.pathsep.join([p for p in extra if p] + [os.environ.get("PATH", "")])
+            return bool(shutil.which("claude", path=path))
+        except Exception:
+            return True                  # never lock a switch on a lookup that broke
+
+    def _refresh_cli_ok(self):
+        self._cli_ok = {p: self._cli_available(p) for p, _ in PROVIDERS}
+        return self._cli_ok
+
+    def _explain_missing_cli(self, target):
+        now = time.monotonic()
+        if now - self._lock_told < 4.0:
+            return
+        self._lock_told = now
+        if target == "codex":
+            how = ("install it with  npm install -g @openai/codex  (needs Node.js 18+), then "
+                   "codex login  in a terminal — or re-run setup.cmd, which does both")
+        else:
+            how = ("install it with  irm https://claude.ai/install.ps1 | iex  in PowerShell, "
+                   "then  claude auth login  — or re-run setup.cmd, which does both")
+        self.add_sys(f"⇄ Can't switch to {dict(PROVIDERS)[target]}: the {self._cli_name(target)} "
+                     f"isn't installed on this PC. To use it, {how}. Then click "
+                     f"{dict(PROVIDERS)[target]} again — no restart needed.")
+
+    def _maybe_announce_codex(self):
+        """Once per install, on the first launch of a build that has Codex mode: say it's
+        there and what it takes on THIS machine. An updated install got no Codex CLI from
+        the setup.cmd it ran long ago, so the answer differs: install it, sign in, or just
+        click. Login is judged by whether Codex has a stored login file at all (its
+        contents are never read), and the wording allows for a keyring-stored login."""
+        if _load_state().get("codex_intro_shown"):
+            return
+        _save_state(codex_intro_shown=True)
+        if self.provider == "codex":
+            return                       # already using it — nothing to introduce
+        if not self._cli_ok.get("codex"):
+            self.add_sys("✨ New: Codex mode — click Codex in the titlebar to use OpenAI's "
+                         "Codex in this same window. It needs the Codex CLI: in a terminal, "
+                         "run  npm install -g @openai/codex  and then  codex login  (or "
+                         "re-run setup.cmd, which does both).")
+            return
+        home = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+        if os.path.isfile(os.path.join(home, "auth.json")):
+            self.add_sys("✨ New: Codex mode — click Codex in the titlebar to use OpenAI's "
+                         "Codex in this same window. It uses the Codex login you already have "
+                         "(the Codex app shares it), so there's nothing to set up.")
+        else:
+            self.add_sys("✨ New: Codex mode — click Codex in the titlebar to use OpenAI's "
+                         "Codex in this same window. Sign in once first with  codex login  in "
+                         "a terminal — if you use the Codex app you may already be signed in, "
+                         "and the overlay tells you if you aren't.")
+
+    def _switch_locked(self):
+        """Why the agent can't change right now — "busy" or "content" — or None.
+
+        A conversation with anything in it stays with the agent it started with: a sent
+        message, a resumed session (or one being resumed), a reply streaming, a compaction
+        running, messages queued. The intro, system notes, an unclicked Resume offer, and
+        whatever is typed or attached but not yet sent don't count — the last two simply
+        come along to the new agent."""
+        if self.busy or self._compacting:
+            return "busy"
+        rb = self._resume_btn
+        if self._has_turns or self._queue or (rb is not None
+                                               and getattr(rb, "_ustate", "") == "working"):
+            return "content"
+        return None
+
+    def _explain_switch_lock(self, target):
+        now = time.monotonic()
+        if now - self._lock_told < 4.0:      # a double-click shouldn't print the note twice
+            return
+        self._lock_told = now
+        name = dict(PROVIDERS)[target]
+        if self._switch_locked() == "busy":
+            self.add_sys(f"⇄ Switching to {name} only works on an empty conversation — let "
+                         "this reply finish (or Stop it), then Clear, then switch.")
+        else:
+            self.add_sys(f"⇄ This conversation stays with {self._provider_name()}. To switch to "
+                         f"{name}, click Clear first — switching starts a new, empty "
+                         "conversation.")
+    def _purge_worker_events(self):
+        """Drop every worker event already sitting in ui_q (see _WORKER_EVENTS); keep the
+        rest, in order."""
+        keep = []
+        while True:
+            try:
+                item = self.ui_q.get_nowait()
+            except queue.Empty:
+                break
+            if not (isinstance(item, tuple) and item and item[0] in _WORKER_EVENTS):
+                keep.append(item)
+        for item in keep:
+            self.ui_q.put(item)
+
+    def _apply_provider_look(self):
+        """Re-skin the live window for self.provider: swap T in place (every module that did
+        `from config import *` holds the same dict, so all paint-time reads follow), recolour
+        what was already painted, and repaint what is drawn from cached images."""
+        old = dict(T)
+        T.clear()
+        T.update(self._palette_for(self.provider))
+        self._recolor(old, T)
+        try:
+            self.f_title.configure(family=(self.codex_title_fam if self.provider == "codex"
+                                           else self.serif))
+        except Exception:
+            pass
+        self._send_imgs.clear()            # cached per state, painted in the old accent
+        self._apply_name(self.overlay_name)
+        if getattr(self, "_ph_active", False):
+            try:
+                self.entry.delete("1.0", "end")
+                self.entry.insert("1.0", self._placeholder())
+                self.entry.configure(fg=T["faint"])
+            except Exception:
+                pass
+        for paint in (self._layout_input, self._paint_send, self._paint_gear,
+                      self._paint_screen_toggle, self._paint_provider_switch, self._sb_redraw,
+                      self._update_jump, self._refresh_queue, self._refresh_attach,
+                      self._refresh_statusline):
+            try:
+                paint()
+            except Exception as e:
+                dbg("provider_look", f"{getattr(paint, '__name__', paint)}: {type(e).__name__}: {e}")
+
+    def _recolor(self, old, new):
+        """Map every colour already painted from `old`'s palette to `new`'s, role for role.
+
+        Widgets, canvas items and Text tags all store the hex string they were given, so a
+        value equal to old[role] is rewritten to new[role]. That is only unambiguous because
+        the paired palettes share their collisions (two roles equal in one are equal in the
+        other — see CODEX_THEMES). The collapsed orb and its name pill are skipped: they keep
+        the Clawd look in both modes. Returns how many values changed (for the tests)."""
+        cmap = {}
+        for role, v in old.items():
+            if role in new and isinstance(v, str):
+                cmap.setdefault(v.lower(), new[role])
+        keep = {getattr(self, "orb", None), getattr(self, "orb_name", None)}
+        n = 0
+        stack = [self.root]
+        while stack:
+            w = stack.pop()
+            if w in keep:
+                continue
+            for opt in _COLOR_OPTS:
+                try:
+                    nv = cmap.get(str(w.cget(opt)).lower())
+                    if nv:
+                        w.configure({opt: nv})
+                        n += 1
+                except Exception:
+                    pass
+            try:
+                cls = w.winfo_class()
+            except Exception:
+                cls = ""
+            if cls == "Canvas":
+                for item in w.find_all():
+                    for opt in _ITEM_COLOR_OPTS:
+                        try:
+                            nv = cmap.get(str(w.itemcget(item, opt)).lower())
+                            if nv:
+                                w.itemconfigure(item, {opt: nv})
+                                n += 1
+                        except Exception:
+                            pass
+            elif cls == "Text":
+                for tag in w.tag_names():
+                    for opt in _TAG_COLOR_OPTS:
+                        try:
+                            nv = cmap.get(str(w.tag_cget(tag, opt)).lower())
+                            if nv:
+                                w.tag_configure(tag, {opt: nv})
+                                n += 1
+                        except Exception:
+                            pass
+            try:
+                stack.extend(w.winfo_children())
+            except Exception:
+                pass
+        return n
+
+    def _build_provider_switch(self, bar):
+        """A two-segment pill — Claude | Codex — with the live agent's segment raised."""
+        c = tk.Canvas(bar, bg=T["bg"], highlightthickness=0, cursor="hand2", takefocus=0)
+        c.pack(side="right", padx=(0, self.px(6)))
+        self.provider_switch = c
+        self._switch_hover = None
+        self._switch_spans = []
+        c.bind("<Button-1>", self._provider_switch_click)
+        c.bind("<Motion>", self._provider_switch_motion)
+        c.bind("<Leave>", lambda e: self._provider_switch_motion(None))
+        self._paint_provider_switch()
+
+    def _paint_provider_switch(self):
+        c = getattr(self, "provider_switch", None)
+        if c is None:
+            return
+        f, pad, inset, h = self.f_switch, self.px(9), self.px(2), self.px(24)
+        widths = [f.measure(lbl) + 2 * pad for _, lbl in PROVIDERS]
+        width = sum(widths) + 2 * inset
+        locked = self._switch_locked() is not None
+        cli_ok = getattr(self, "_cli_ok", {})
+        dead = {k for k, _ in PROVIDERS if k != self.provider and not cli_ok.get(k, True)}
+        c.configure(width=width, height=h, bg=T["bg"],
+                    cursor=("arrow" if locked or dead else "hand2"))
+        c.delete("all")
+        round_rect(c, 0, 0, width - 1, h - 1, h / 2, fill=T["tool_bg"], outline=T["border"])
+        x, spans = inset, []
+        for (key, lbl), w in zip(PROVIDERS, widths):
+            live = key == self.provider
+            if live:
+                round_rect(c, x, inset, x + w, h - inset - 1, (h - 2 * inset) / 2,
+                           fill=T["field"], outline=T["border"])
+            fg = (T["accent"] if live else _mix(T["faint"], T["tool_bg"], 0.5)
+                  if locked or key in dead
+                  else T["muted"] if self._switch_hover == key else T["faint"])
+            c.create_text(x + w / 2, h / 2, text=lbl, font=f, fill=fg, tags=("seg_" + key,))
+            if key in dead:                  # not installed: struck through, like a disabled tab
+                tw = f.measure(lbl)
+                c.create_line(x + (w - tw) / 2, h / 2, x + (w + tw) / 2, h / 2, fill=fg,
+                              width=max(1, self.px(1)), tags=("seg_" + key,))
+            spans.append((key, x, x + w))
+            x += w
+        self._switch_spans = spans
+
+    def _provider_at(self, x):
+        return next((k for k, x0, x1 in self._switch_spans if x0 <= x <= x1), None)
+
+    def _provider_switch_motion(self, e):
+        hover = self._provider_at(e.x) if e is not None else None
+        if hover != self._switch_hover:
+            self._switch_hover = hover
+            self._paint_provider_switch()
+
+    def _provider_switch_click(self, e):
+        key = self._provider_at(e.x)
+        if key and key != self.provider:
+            self.switch_provider(key)
+        return "break"
 
     def _start_usage_poll(self):
         """Start the allowance poll, so the gauge has a number before the first message.
@@ -1055,14 +1534,17 @@ class Overlay:
         update independently — a current overlay still drives whatever CLI is installed, and an
         old CLI silently runs an older model. Silent on any failure (no npm, offline, corporate
         proxy) so it never blocks or nags; the check is throttled to once/day inside cliupdate."""
-        if not CLI_UPDATE_CHECK:
-            return
+        cli = self.provider
+        checked = self.__dict__.setdefault("_cli_update_checked", set())
+        if not CLI_UPDATE_CHECK or cli in checked:
+            return                       # once per agent per session (the switch re-calls this)
+        checked.add(cli)
         def work():
             try:
                 from cliupdate import check_update
-                info = check_update()
+                info = check_update(cli=cli)
                 if info and info.get("behind"):
-                    self.ui_q.put(("cli_update", info))
+                    self.ui_q.put(("cli_update", dict(info, cli=cli)))
             except Exception:
                 pass
         threading.Thread(target=work, name="cli-update-check", daemon=True).start()
@@ -1319,7 +1801,7 @@ class Overlay:
         self._bind_drag(mark)
         # The title doubles as the rename target: click it (without dragging) to edit this
         # overlay's name; dragging it still moves the window (moved-detection, like the orb).
-        self.title_lbl = tk.Label(bar, text=self.overlay_name or "Claude", bg=T["bg"],
+        self.title_lbl = tk.Label(bar, text=self.overlay_name or self._provider_name(), bg=T["bg"],
                                   fg=T["text"], font=self.f_title, cursor="hand2")
         self.title_lbl.pack(side="left")
         self.title_lbl.bind("<ButtonPress-1>", self._title_press)
@@ -1327,21 +1809,34 @@ class Overlay:
         self.title_lbl.bind("<ButtonRelease-1>", self._title_release)
         # Faint hint to the right of the title, shown ONLY before this overlay is named (and not
         # while editing) — invites the user to click and name the session. Clicking it starts the
-        # rename too. Hidden the moment a name exists.
-        self.title_hint = tk.Label(bar, text="Click to name this session",
+        # rename too. Hidden the moment a name exists — and whenever the bar is too narrow for
+        # it, since the Claude ⇄ Codex switch shares the row: pack squeezes the last-packed
+        # label first, and a hint clipped at both ends reads as a rendering bug.
+        self.title_hint = tk.Label(bar, text="Click to name",
                                    bg=T["bg"], fg=T["faint"], font=self.f_small, cursor="hand2")
         self.title_hint.bind("<Button-1>", lambda e: self._begin_rename())
         self._title_btn(bar, "✕", self.quit)
         self._title_btn(bar, "—", self.toggle_collapse)
+        self._build_provider_switch(bar)
+        bar.bind("<Configure>", lambda e: self._update_title_hint(), add="+")
         self._update_title_hint()
+
+    def _title_hint_fits(self):
+        bar, hint = getattr(self, "titlebar", None), self.title_hint
+        avail = bar.winfo_width() if bar is not None else 0
+        if avail <= 1:
+            return True              # not laid out yet; <Configure> re-runs this once it is
+        used = sum(w.winfo_reqwidth() + self.px(8) for w in bar.pack_slaves() if w is not hint)
+        return used + hint.winfo_reqwidth() + self.px(8) <= avail
 
     def _update_title_hint(self):
         """Show the 'type to name this session' hint only before the overlay is named and while
-        not editing; hide it once it has a name (or during an edit)."""
+        not editing; hide it once it has a name (or during an edit), or if it wouldn't fit."""
         hint = getattr(self, "title_hint", None)
         if hint is None:
             return
-        show = not (self.overlay_name or "").strip() and getattr(self, "_rename_entry", None) is None
+        show = (not (self.overlay_name or "").strip()
+                and getattr(self, "_rename_entry", None) is None and self._title_hint_fits())
         try:
             if show and not hint.winfo_ismapped():
                 hint.pack(side="left", padx=(self.px(8), 0))
@@ -1415,7 +1910,7 @@ class Overlay:
 
     def _apply_name(self, name):
         self.overlay_name = name or ""
-        shown = self.overlay_name or "Claude"
+        shown = self.overlay_name or self._provider_name()
         try:
             self.title_lbl.configure(text=shown)
         except Exception:
@@ -1817,7 +2312,7 @@ class Overlay:
     def _build_orb(self):
         s = self.px(ORB_SIZE)
         self.orb_size = s
-        self.orb = tk.Canvas(self.root, width=s, height=s, bg=T["bg"],
+        self.orb = tk.Canvas(self.root, width=s, height=s, bg=self._claude_palette()["bg"],
                              highlightthickness=0, cursor="hand2")
         self._draw_orb()
         self.orb.bind("<ButtonPress-1>", self._orb_press)
@@ -1828,7 +2323,8 @@ class Overlay:
         # Name pill shown UNDER the orb while collapsed (only when this overlay has a custom
         # name). The whole collapsed cluster (orb + pill) shares the orb's click=expand /
         # drag=move handlers, so clicking the name expands too. Hidden until collapse.
-        self.orb_name = tk.Canvas(self.root, highlightthickness=0, bg=T["accent"], cursor="hand2")
+        self.orb_name = tk.Canvas(self.root, highlightthickness=0,
+                                  bg=self._claude_palette()["accent"], cursor="hand2")
         self.orb_name.bind("<ButtonPress-1>", self._orb_press)
         self.orb_name.bind("<B1-Motion>", self._orb_drag)
         self.orb_name.bind("<ButtonRelease-1>", self._orb_release)
@@ -2050,7 +2546,7 @@ class Overlay:
 
         SS = 4
         n = s * SS
-        base = self._rgb(T["accent"])
+        base = self._rgb(self._claude_palette()["accent"])   # the orb is Clawd's in both modes
         WHITE, BLACK = (255, 255, 255), (0, 0, 0)
         light = self._mix(base, WHITE, 0.55 if hover else 0.42)   # gradient core
         edge = self._mix(base, BLACK, 0.40)                        # gradient rim
@@ -2274,7 +2770,8 @@ class Overlay:
         # Same popup pattern as the model switcher (_model_menu): build fresh on each open
         # so the checkmarks reflect current state, then tk_popup at the click point.
         m = tk.Menu(self.root, tearoff=0, bg=T["field"], fg=T["text"],
-                    activebackground=T["accent"], activeforeground=T["on_accent"], bd=0)
+                    activebackground=T.get("menu_hi", T["accent"]),
+                    activeforeground=T.get("on_menu_hi", T["on_accent"]), bd=0)
         for lbl, cmd in self._gear_items():
             if cmd is None:          # GEAR_SEP — a divider, not a clickable row
                 m.add_separator()
@@ -2375,7 +2872,7 @@ class Overlay:
     def _ph_in(self, e=None):
         if not self.entry.get("1.0", "end").strip():
             self.entry.delete("1.0", "end")
-            self.entry.insert("1.0", PLACEHOLDER)
+            self.entry.insert("1.0", self._placeholder())
             self.entry.configure(fg=T["faint"])
             self._ph_active = True
 
@@ -2503,7 +3000,7 @@ class Overlay:
             return
         exts = IMAGE_EXTS + DOC_EXTS
         paths = filedialog.askopenfilenames(
-            parent=self.root, title="Attach files to Claude",
+            parent=self.root, title=f"Attach files to {self._provider_name()}",
             filetypes=[("Supported files", " ".join(f"*{e}" for e in exts)),
                        ("All files", "*.*")])
         if not paths:
@@ -3147,6 +3644,8 @@ class Overlay:
         self._prune_chat()
 
     def add_user(self, text):
+        self._has_turns = True           # this conversation now belongs to its agent
+        self._paint_provider_switch()
         self._md_finalize()              # commit the previous turn's last line before a new bubble
         self._turn_raw = ""              # a new turn starts → fresh assistant-answer buffer
         self._turn_copy_added = False
@@ -3380,13 +3879,16 @@ class Overlay:
             # insert) so _prune_chat can tell if a later trim removed the active header.
             self.chat.mark_set("ah_start", "end-1c")
             self.chat.mark_gravity("ah_start", "left")
-            self._ins("\n✦ Claude\n", "ah")
+            self._ins(self._header_text(), "ah")
             try:
                 self.chat.tag_remove("current_ah", "1.0", "end")
                 self.chat.tag_add("current_ah", "ah_start", "end-1c")
             except Exception:
                 pass
             self._claude_header = True
+
+    def _header_text(self):
+        return "\n>_ Codex\n" if self.provider == "codex" else "\n✦ Claude\n"
 
     def add_think(self, text):
         # Stream extended-thinking tokens as a muted block under the Claude header, before
@@ -3395,7 +3897,8 @@ class Overlay:
         self._md_finalize()              # seal any answer text before a (re-opened) thinking block
         self._ensure_header()
         if not self._thinking_active:
-            self._ins("\n✻ thinking\n", "think_label")
+            self._ins("\n◌ thinking\n" if self.provider == "codex" else "\n✻ thinking\n",
+                      "think_label")
             self._thinking_active = True
         self._ins(text, "think")
 
@@ -3936,7 +4439,7 @@ class Overlay:
         a deliberately discarded conversation is never offered back."""
         if not RESUME_OFFER:
             return
-        saved = _load_state().get("last_session")
+        saved = _load_state().get(self._session_key())
         if not (isinstance(saved, dict) and saved.get("id")):
             return
         if saved.get("cwd") != WORKING_DIR:
@@ -3946,7 +4449,7 @@ class Overlay:
         if not (0 <= age <= RESUME_OFFER_MAX_AGE):
             return
         self.add_sys(f"💬 You have a conversation from {self._age_str(age)} ago. "
-                     "Claude can pick it up where you left off:")
+                     f"{self._provider_name()} can pick it up where you left off:")
         self.chat.insert("end", "\n")
         self.chat.window_create("end", window=self._resume_btn_widget(str(saved["id"])),
                                 padx=self.px(16), pady=self.px(2))
@@ -4045,6 +4548,12 @@ class Overlay:
         window that sits on top of whatever you were doing."""
         if getattr(self, "_sessions_loading", False):
             return
+        if self.provider == "codex":
+            # app-server lists them (thread/list); the answer comes back as "codex_sessions".
+            self._sessions_loading = True
+            self.add_sys("\U0001f5c2  Looking through your past Codex conversations…")
+            self.worker.list_sessions()
+            return
         self._sessions_loading = True
         self.add_sys("\U0001f5c2  Looking through your past conversations…")
 
@@ -4063,8 +4572,9 @@ class Overlay:
         if not rows:
             self.add_sys("No earlier conversations in this folder yet.")
             return
-        long_rows = [s for s in rows if s.messages >= self.SHORT_SESSION]
-        short_rows = [s for s in rows if s.messages < self.SHORT_SESSION]
+        # A Codex thread carries no message count (None): shown in full rather than guessed short.
+        long_rows = [s for s in rows if s.messages is None or s.messages >= self.SHORT_SESSION]
+        short_rows = [s for s in rows if s.messages is not None and s.messages < self.SHORT_SESSION]
         for s in long_rows:
             self._add_session_card(store, s)
         if short_rows:
@@ -4185,8 +4695,9 @@ class Overlay:
             right = full - pad - self.px(16)
             c.create_text(x, pad + self.px(2), text=_fit(session.title, f_t, right - x),
                           anchor="nw", font=f_t, fill=T["text"])
-            meta = f"{self._age_str(session.age)} ago  ·  {session.messages} message" \
-                   f"{'s' if session.messages != 1 else ''}"
+            meta = (f"{self._age_str(session.age)} ago" if session.messages is None else
+                    f"{self._age_str(session.age)} ago  ·  {session.messages} message"
+                    f"{'s' if session.messages != 1 else ''}")
             sub = session.subtitle
             c.create_text(x, pad + self.px(16), anchor="nw", font=f_s, fill=T["faint"],
                           text=_fit(f"{meta}   {sub}" if sub else meta, f_s, right - x))
@@ -4246,21 +4757,27 @@ class Overlay:
         launch can offer to resume it. Called per completed turn — cheap (a tiny JSON
         write) and crash-safe: whatever the last finished turn was, that's resumable."""
         if self._session_id:
-            _save_state(last_session={"id": self._session_id, "ts": time.time(),
-                                      "cwd": WORKING_DIR})
+            _save_state(**{self._session_key(): {"id": self._session_id, "ts": time.time(),
+                                                 "cwd": WORKING_DIR}})
 
     def _show_cli_update_notice(self, info):
         """Render the 'CLI is behind' notice + a one-click Update button in the chat. Shown at
         most once per session (guarded), and only reached when cliupdate found the CLI behind."""
-        if getattr(self, "_cli_update_shown", False) or not isinstance(info, dict):
+        if not isinstance(info, dict):
             return
+        cli = info.get("cli", "claude")
+        shown = self.__dict__.setdefault("_cli_update_shown_for", set())
+        if cli in shown or cli != self.provider:
+            return                       # once per agent, and only while that agent is live
+        shown.add(cli)
         self._cli_update_shown = True
         inst, latest = info.get("installed", "?"), info.get("latest", "?")
-        self.add_sys(f"🔔 Your Claude CLI is out of date (v{inst} → v{latest}). The overlay is "
+        name = "Codex" if cli == "codex" else "Claude"
+        self.add_sys(f"🔔 Your {name} CLI is out of date (v{inst} → v{latest}). The overlay is "
                      "current, but the CLI it drives isn't — and the newest models need the "
                      "latest CLI. Update it in one click:")
         self.chat.insert("end", "\n")
-        self.chat.window_create("end", window=self._cli_update_btn(latest),
+        self.chat.window_create("end", window=self._cli_update_btn(latest, cli),
                                 padx=self.px(16), pady=self.px(2))
         self.chat.insert("end", "\n")
         self._scroll_follow()
@@ -4340,13 +4857,34 @@ class Overlay:
         self._register_zoomable(c, render)
         return c
 
-    def _cli_update_btn(self, latest):
+    def _cli_update_btn(self, latest, cli="claude"):
         """The 'your CLI is behind' button: runs `npm install -g @anthropic-ai/claude-code@latest`
         (cliupdate.run_update) off the UI thread, then offers a restart so the newest models load.
         Imported inside the worker so a broken/absent cliupdate can't cost us the button."""
+        self._cli_update_target = cli
+
         def work():
             from cliupdate import run_update
-            return run_update()
+            if cli == "codex":
+                # The overlay's own app-server holds codex.exe open, and Windows won't let
+                # npm replace a running binary — so Codex is stopped for the update and
+                # started again (on the same conversation) once it's done.
+                done = threading.Event()
+                self.ui_q.put(("codex_pause", done))     # Tk is touched on its own thread only
+                done.wait(10)
+                # Wait for the worker to finish its teardown (it closes app-server and waits
+                # for the process), off the Tk thread. A worker stuck in a long request can't
+                # see "stop" until it returns, so past a bound the process is killed outright.
+                old = getattr(self, "_paused_worker", None)
+                if old is not None:
+                    try:
+                        old.join(15)
+                        if old.is_alive():
+                            getattr(old, "kill_server", lambda: None)()
+                            old.join(5)
+                    except Exception:
+                        pass
+            return run_update(cli=cli)
         return self._one_click_update_btn(
             {"idle": f"⬆  Update CLI to v{latest}",
              "working": "Updating…  (≈1 min)",
@@ -4367,12 +4905,55 @@ class Overlay:
                 c._set_ustate("done" if ok else "error")
             except Exception:
                 pass
+        cli = getattr(self, "_cli_update_target", "claude")
+        if cli == "codex":
+            self._resume_codex()             # back on the same conversation, either way
+            if ok:
+                self.add_sys(f"✅ Codex CLI updated to v{msg} — Codex has restarted on it and "
+                             "kept your conversation.")
+            else:
+                self.add_err(f"Codex CLI update didn't complete — {msg}. You can also update "
+                             "from a terminal:  npm install -g @openai/codex@latest  (close the "
+                             "Codex app first if it's open).")
+            return
         if ok:
             self.add_sys(f"✅ Claude CLI updated to v{msg}. Click the button above to restart the "
                          "overlay now and load the newest models (or restart it yourself later).")
         else:
             self.add_err(f"CLI update didn't complete — {msg}. You can also update from a terminal: "
                          " npm install -g @anthropic-ai/claude-code@latest")
+
+    def _pause_codex(self):
+        """Stop the Codex worker (and its app-server, which holds codex.exe) for an update."""
+        if self.provider != "codex" or getattr(self, "_codex_paused", False):
+            return
+        self._codex_paused = True
+        self._paused_worker = self.worker
+        with self._sink_lock:
+            self._worker_gen += 1
+        for fn in (self.worker.interrupt, self.worker.shutdown):
+            try:
+                fn()
+            except Exception:
+                pass
+        # The generation bump stops FUTURE puts; a result/turn_done already in ui_q would still
+        # land and clear busy — and a send then would go into a worker that is shutting down.
+        self._purge_worker_events()
+        self._set_busy(True)                 # Enter now lines messages up; they go out once
+        self._set_status("updating the Codex CLI…")   # the restarted Codex is there
+
+    def _resume_codex(self):
+        if not getattr(self, "_codex_paused", False):
+            return
+        self._codex_paused = False
+        self._paused_worker = None
+        self.worker = self._make_worker("plan" if self.read_only else self._full_mode)
+        self.worker.start()
+        if self._session_id:
+            self.worker.resume(self._session_id)
+        self._set_busy(False)
+        self._set_status("")
+        self._queue_kick()                   # anything typed during the update goes out now
 
     # ── "a newer overlay exists" notice + one-click update (runs update.cmd) ────────────
 
@@ -4485,6 +5066,10 @@ class Overlay:
         # limit, max turns) but flatly wrong for an authentication failure: that one repeats
         # forever, so promising otherwise sends the user off writing messages that can't be
         # delivered. Say what actually fixes it instead.
+        if self.provider == "codex" and (authstate.is_auth_error_text(detail)
+                                         or "authentication" in str(subtype or "")):
+            return (f"Last turn ended with an error ({reason}). Codex's login is no longer "
+                    "valid — sign in again in a terminal:  codex login")
         if authstate.is_auth_error_text(detail) or authstate.is_auth_error_text(subtype):
             return (f"Last turn ended with an error ({reason}). The Claude CLI's login is no "
                     f"longer valid, so further messages will fail too — sign in again in a "
@@ -4540,6 +5125,8 @@ class Overlay:
         than only when the user sends and loses a message. Cheap: one stat(), plus a ~1KB
         JSON read only when the file changed. Recovery is announced too — after signing in
         elsewhere, the user shouldn't have to guess whether the overlay noticed."""
+        if self.provider == "codex":
+            return                       # Codex's login is polled by its worker ("codex_auth")
         if now - self._auth_checked < AUTH_CHECK_INTERVAL:
             return
         self._auth_checked = now
@@ -4567,6 +5154,13 @@ class Overlay:
         cached flag, so a death that happened seconds ago is caught on this very send."""
         if not AUTH_GATE:
             return False
+        if self.provider == "codex":
+            if not self._auth_dead or not (self._entry_text() or self.auto_shot or self.pending_shot
+                                           or self.pending_images or self.pending_docs):
+                return False
+            self.add_err("⚠ Codex is signed out — nothing was sent. Run  codex login  in a "
+                         "terminal; your message is still here.")
+            return True
         # Nothing to send anyway (empty box, no auto-shot, no attachments): stay quiet and let
         # the normal empty-send no-op happen, so Enter on an empty box can't nag about login.
         if not (self._entry_text() or self.auto_shot or self.pending_shot
@@ -5228,7 +5822,12 @@ class Overlay:
         self._paint_ro_toggle()
         if changed:
             _save_state(read_only=ro)   # persist only CONFIRMED switches, never requests
-        if changed and ro:
+        if changed and self.provider == "codex":
+            self.add_sys("🔒 Read-only: Codex runs in the read-only sandbox — it can see your "
+                         "screen, read files and answer, but changes nothing." if ro else
+                         f"⚡ Full access: Codex runs in {self._codex_sandbox or 'its sandbox'} "
+                         "and asks before stepping outside it. Flip Read-only back on any time.")
+        elif changed and ro:
             self.add_sys("🔒 Read-only: Claude can see your screen, read files, and "
                          "answer — but won't edit anything or run commands.")
         elif changed:
@@ -5252,6 +5851,29 @@ class Overlay:
         # receive_response() and the reset just queues behind it — meanwhile the tail
         # of the old reply keeps streaming deltas into the chat we just cleared.
         self.worker.interrupt()
+        self._wipe_conversation(note="🔄 Cleared")
+        # Guard the window until the worker confirms the reset (reset_done): a stale
+        # (session / turn_done) batch from the turn that was in flight when Clear was
+        # clicked would otherwise re-set _session_id and re-persist the discarded record.
+        self._discard_pending = True
+        _save_state(**{self._session_key(): None})
+        self.worker.reset()
+        self._set_status("resetting…")
+
+    def _own_compact_history(self):
+        """This agent's remembered compactions. Claude's call stays argument-free — the same
+        call it always was, which is also what the suite patches."""
+        return _compact_history("codex_compact_runs") if self.provider == "codex"             else _compact_history()
+
+    def _session_key(self):
+        """Where the resumable conversation is remembered — one slot per agent, since a
+        Claude session id means nothing to Codex and vice versa."""
+        return "codex_last_session" if self.provider == "codex" else "last_session"
+
+    def _wipe_conversation(self, note):
+        """Everything Clear forgets on the UI side — shared with the Claude ⇄ Codex switch,
+        which is a Clear plus a new agent. `note` is what the dropped line-up is told."""
+        self._has_turns = False          # empty again → the switch unlocks
         self.chat.delete("1.0", "end")
         self._md_reset()                 # chat wiped → drop md tail/table/fence state + marks
         self._zoomables = []             # all embedded canvases were just destroyed with the text
@@ -5272,26 +5894,21 @@ class Overlay:
                                         # (the quota reading itself survives: the allowance is
                                         # the account's, not this conversation's)
         self._cancel_retry()            # …and its scheduled retry must not fire into the new one
-        self._drop_queue(note="🔄 Cleared")  # queued messages belong to the discarded
+        self._approval_cards.clear()    # their widgets went with the transcript
+        self._drop_queue(note=note)     # queued messages belong to the discarded
                                         # conversation; the note lands in the fresh transcript
                                         # (the chat was wiped above) so the texts survive
         self._refresh_statusline()
+        self._paint_provider_switch()
         # Clear = deliberate discard: forget the session AND its persisted record, so
         # the next launch can't offer to resume a conversation the user threw away.
         self._session_id = None
         self._resume_btn = None          # the embedded button was just wiped with the chat
-        # Guard the window until the worker confirms the reset (reset_done): a stale
-        # (session / turn_done) batch from the turn that was in flight when Clear was
-        # clicked would otherwise re-set _session_id and re-persist the discarded record.
-        self._discard_pending = True
         # Forget dedupe state NOW, at click time — not only when reset_done confirms. A
         # send slipped in between (the worker is busy reconnecting, but the UI isn't busy)
         # would otherwise dedupe against the discarded conversation and land an
         # image-less "unchanged" prompt in the brand-new session.
         self._forget_sent_shots()
-        _save_state(last_session=None)
-        self.worker.reset()
-        self._set_status("resetting…")
         # Chat was just wiped — drop the compaction banner/timer so a stray result line
         # can't land in the fresh conversation (the worker's interrupt above ends the turn).
         if self._compacting:
@@ -5425,18 +6042,27 @@ class Overlay:
     def _set_busy(self, busy):
         self.busy = busy
         self._refresh_send()
+        self._paint_provider_switch()
         self.busy_lbl.configure(text="thinking…" if busy else "")
 
     def _refresh_statusline(self):
         # version goes last so it clips first if the window is narrow; ⬆ flags an update
         ver = f"v{__version__}" + ("  ⬆" if self._update_available else "")
-        self.statusline.configure(text=f"{self._model or 'Claude'} ▾", fg=T["muted"])
+        self.statusline.configure(text=f"{self._model_label()} ▾", fg=T["muted"])
         self.effort_lbl.configure(text=f"·   ⚡ {self.effort or 'default'} ▾", fg=T["muted"])
         self.ctx_lbl.configure(text=f"·   {self._gauge_text()}", fg=self._ctx_color())
         q = self._quota_text()
         self.quota_lbl.configure(text=(f"·   {q}" if q else ""), fg=self._gauge_color())
         self.ver_lbl.configure(text=f"·   {ver}", fg=T["muted"])
         self._paint_quota_ring()
+
+    def _model_label(self):
+        """The statusline's model name: Codex models by their display name (GPT-6-Astra)
+        when the model list has it, everything else as the worker reported it."""
+        if self.provider == "codex":
+            m = next((m for m in self._codex_models if m.get("id") == self._model), None)
+            return (m or {}).get("label") or self._model or "Codex"
+        return self._model or "Claude"
 
     # ── the middle of the statusline ──
     def _ctx_text(self):
@@ -5525,7 +6151,7 @@ class Overlay:
             if st == "rejected" or pct >= _QUOTA_HOT * 100:
                 return T["err"]
             if st == "allowed_warning" or pct >= _QUOTA_WARN * 100:
-                return T["accent"]
+                return T.get("warn", T["accent"])   # Claude's accent IS its amber
         return T["muted"]
 
     def _quota_windows(self):
@@ -5567,7 +6193,7 @@ class Overlay:
         if u >= _QUOTA_HOT:
             return T["err"]
         if u >= _QUOTA_WARN:
-            return T["accent"]
+            return T.get("warn", T["accent"])   # Claude's accent IS its amber
         return quiet
 
     def _ring_track(self):
@@ -5643,7 +6269,10 @@ class Overlay:
             a = arcs.get(key)
             if a:
                 d.arc(box, -90, -90 + 360 * a[0], fill=a[1], width=lw)
-        self._draw_spark_pil(d, S)
+        if self.provider == "codex":
+            self._draw_prompt_pil(d, S)
+        else:
+            self._draw_spark_pil(d, S)
         self._ring_photo = ImageTk.PhotoImage(im.resize((sz, sz), Image.LANCZOS))
         c.delete("ring")
         c.create_image(sz / 2, sz / 2, image=self._ring_photo, tags="ring")
@@ -5662,6 +6291,19 @@ class Overlay:
             d.line([cx, cy, x, y], fill=T["accent"], width=w)
             d.ellipse([x - w / 2, y - w / 2, x + w / 2, y + w / 2], fill=T["accent"])
 
+    def _draw_prompt_pil(self, d, S):
+        """Codex's mark at the centre of the rings: a terminal prompt, >_ , in Codex's indigo.
+        Same footprint as the ✻ so the rings keep their air."""
+        cx = cy = S / 2
+        r, w = S * _SPARK_R, max(1, round(S * 2.2 / 32))
+        col = T["accent"]
+        top, bot = cy - r * 0.72, cy + r * 0.72
+        pts = [(cx - r * 1.0, top), (cx - r * 0.1, cy), (cx - r * 1.0, bot)]
+        d.line(pts, fill=col, width=w, joint="curve")
+        d.line([cx + r * 0.25, bot, cx + r * 1.05, bot], fill=col, width=w)
+        for x, y in pts[::2] + [(cx + r * 0.25, bot), (cx + r * 1.05, bot)]:
+            d.ellipse([x - w / 2, y - w / 2, x + w / 2, y + w / 2], fill=col)
+
     def _usage_panel_text(self):
         """Everything about usage, in one aligned block, for the panel the mark opens.
 
@@ -5676,6 +6318,9 @@ class Overlay:
             u = (wins.get(key) or {}).get("utilization")
             if isinstance(u, bool) or not isinstance(u, (int, float)):
                 continue
+            if key == "week":    # the outer track is whichever long window binds — on a Codex
+                                 # business seat that is the seat's spend limit, not a week
+                label = _QUOTA_WINDOWS.get(wins[key].get("window"), label)
             rows.append((label, f"{u * 100:.0f}%", self._quota_resets_text(wins[key])))
         if not rows:
             rows.append(("allowance", "—", "no reading yet"))
@@ -5705,6 +6350,11 @@ class Overlay:
         if self._ring_explained or not self._ring_arcs():
             return
         self._ring_explained = True
+        if self.provider == "codex":
+            self.add_sys("◔ The ring on >_ is your Codex allowance — the inner arc is the "
+                         "5-hour window, the outer one the weekly window or your seat's limit. "
+                         "Hover the mark for the numbers.")
+            return
         self.add_sys("◔ The ring on ✻ is your plan allowance — the inner arc is the 5-hour "
                      "window, the outer one is weekly. Hover the mark for the numbers.")
 
@@ -5715,7 +6365,7 @@ class Overlay:
         if p >= _CTX_HOT_PCT:
             return T["err"]
         if p >= _CTX_WARN_PCT:
-            return T["accent"]
+            return T.get("warn", T["accent"])   # Claude's accent IS its amber
         return T["muted"]
 
     def _ctx_rate(self):
@@ -5981,7 +6631,8 @@ class Overlay:
         Deliberately restricted to our own remembered runs — _compact_samples_from_transcripts
         reads a dozen files and this runs on the UI thread, where half a second of disk is a
         visible stall in a window that sits on top of the user's work."""
-        eta = _compact_predict(_compact_history(), self._ctx_tokens) if self._ctx_tokens else None
+        eta = (_compact_predict(self._own_compact_history(), self._ctx_tokens)
+               if self._ctx_tokens else None)
         cost = f" (~{self._compact_elapsed(eta)})" if eta else ""
         return f"Compact now{cost} — it only gets slower as the window fills."
 
@@ -6016,9 +6667,9 @@ class Overlay:
         # measurement), and therefore roughly how long this should take.
         pre = payload.get("pre_tokens") if isinstance(payload, dict) else None
         self._compact_pre = int(pre) if isinstance(pre, (int, float)) and pre > 0 else None
-        own = _compact_history()
+        own = self._own_compact_history()
         self._compact_eta = _compact_predict(own, self._compact_pre)
-        if len(own) < 2:
+        if len(own) < 2 and self.provider == "claude":   # only Claude has transcripts to mine
             # Under two runs of our own there's no line to fit, so the estimate above (if any)
             # ignores size. Go mine the CLI's transcripts for more.
             self._seed_compact_eta()
@@ -6141,7 +6792,11 @@ class Overlay:
             ms = m.get("duration_ms")
             if isinstance(ms, (int, float)) and ms > 0:
                 took = ms / 1000.0
-            _compact_history_add(m.get("pre_tokens") or self._compact_pre, took)
+            if self.provider == "codex":
+                _compact_history_add(m.get("pre_tokens") or self._compact_pre, took,
+                                     "codex_compact_runs")
+            else:
+                _compact_history_add(m.get("pre_tokens") or self._compact_pre, took)
             final = self._format_compact_result(meta, took)
         elif status == "unconfirmed":
             final = "⚠ Compaction finished, but success couldn't be confirmed — context may be unchanged."
@@ -6197,6 +6852,8 @@ class Overlay:
         has no Fable — and picking it raised no error, because the CLI silently falls back
         to the account default, so the overlay just appeared to ignore the click. Falls back
         to the full list whenever entitlement can't be read (see modelresolve)."""
+        if self.provider == "codex":
+            return [(m["label"], m["id"]) for m in self._codex_models]
         if not MODEL_MENU_FILTER:
             return list(MODELS)
         try:
@@ -6206,16 +6863,21 @@ class Overlay:
 
     def _model_menu(self, e):
         m = tk.Menu(self.root, tearoff=0, bg=T["field"], fg=T["text"],
-                    activebackground=T["accent"], activeforeground=T["on_accent"], bd=0)
-        for lbl, val in self._menu_models():
+                    activebackground=T.get("menu_hi", T["accent"]),
+                    activeforeground=T.get("on_menu_hi", T["on_accent"]), bd=0)
+        items = self._menu_models()
+        for lbl, val in items:
             m.add_command(label=lbl, command=lambda v=val: self._switch_model(v))
+        if not items:
+            m.add_command(label=f"{self._provider_name()} is still starting…", state="disabled")
         try:
             m.tk_popup(e.x_root, e.y_root)
         finally:
             m.grab_release()
 
     def _switch_model(self, val):
-        if self.busy:   # switching mid-stream is undefined against the SDK — defer
+        if self.busy and self.provider == "claude":   # mid-stream is undefined against the
+                                                       # SDK — defer. Codex applies it next turn.
             self.add_sys("⏳ Finish (or Stop) the current reply before switching model.")
             return
         self._set_status("switching model…")
@@ -6226,11 +6888,28 @@ class Overlay:
         """The (label, value) rows of the ⚡ menu, the ACTIVE level ticked. Split out from
         _effort_menu so it's unit-testable without popping a real Tk menu (same split as
         _gear_items). The tick follows the CONFIRMED level, never a pending click."""
-        return [(("✓  " if v == self.effort else "      ") + lbl, v) for lbl, v in EFFORT_LEVELS]
+        return [(("✓  " if v == self.effort else "      ") + lbl, v)
+                for lbl, v in self._effort_levels()]
+
+    def _effort_levels(self):
+        """(label, value) per ⚡ level the live agent accepts. Codex: what the current model
+        advertises (model/list), so the menu never offers a level that model would refuse."""
+        if self.provider != "codex":
+            return EFFORT_LEVELS
+        m = next((m for m in self._codex_models if m.get("id") == self._model), None)
+        efforts = (m or {}).get("efforts") or []
+        if not efforts:
+            return CODEX_EFFORT_LEVELS
+        own = (m or {}).get("default_effort")
+        auto = f"Auto (this model's default: {_CODEX_EFFORT_LABELS.get(own, own)})" if own \
+            else "Auto (this model's default)"
+        return ([(_CODEX_EFFORT_LABELS.get(e, e), e) for e in efforts]
+                + [(auto, "auto"), ("Default (your Codex setting)", "")])
 
     def _effort_menu(self, e):
         m = tk.Menu(self.root, tearoff=0, bg=T["field"], fg=T["text"],
-                    activebackground=T["accent"], activeforeground=T["on_accent"], bd=0)
+                    activebackground=T.get("menu_hi", T["accent"]),
+                    activeforeground=T.get("on_menu_hi", T["on_accent"]), bd=0)
         for lbl, val in self._effort_items():
             m.add_command(label=lbl, command=lambda v=val: self._switch_effort(v))
         try:
@@ -6241,7 +6920,9 @@ class Overlay:
     def _switch_effort(self, val):
         if val == self.effort:
             return                      # picking the ticked row must not relaunch anything
-        if self.busy:   # the switch relaunches the CLI; mid-stream that kills the reply
+        if self.busy and self.provider == "claude":   # the switch relaunches the CLI; mid-
+                                                       # stream that kills the reply (Codex
+                                                       # just applies it from the next turn)
             self.add_sys("⏳ Finish (or Stop) the current reply before changing effort.")
             return
         self._set_status("switching effort…")
@@ -6256,8 +6937,9 @@ class Overlay:
         self.effort = level
         self._refresh_statusline()
         if changed:
-            _save_state(effort=level)
-            label = next((lbl for lbl, v in EFFORT_LEVELS if v == level), level or "default")
+            _save_state(**{("codex_effort" if self.provider == "codex" else "effort"): level})
+            label = next((lbl for lbl, v in self._effort_levels() if v == level),
+                         level or "default")
             self.add_sys(f"⚡ Effort is now {label}.")
 
     def _on_wheel(self, e):
@@ -6442,10 +7124,41 @@ class Overlay:
             # having to send a message first. Display only, and on purpose: no announcement
             # (the reading carries no status to announce) and no retry re-arm (only the CLI's
             # own event may decide that a refused message can go back on the wire).
-            if isinstance(payload, dict):
+            if isinstance(payload, dict) and self.provider == "claude":
                 self._quota_polled = payload
                 self._refresh_statusline()
                 self._maybe_explain_ring()
+        elif kind == "codex_quota":
+            # Codex's allowance, already in the poll's shape ({"windows": {...}}), so the
+            # ring, the text segment and the hover panel read it with no Codex branch.
+            if isinstance(payload, dict) and self.provider == "codex":
+                self._quota_polled = payload
+                self._refresh_statusline()
+                self._maybe_explain_ring()
+        elif kind == "codex_models":
+            self._codex_models = [m for m in (payload or []) if isinstance(m, dict)]
+            self._refresh_statusline()
+        elif kind == "codex_auth":
+            ok = bool((payload or {}).get("ok"))
+            if self.provider == "codex" and ok == self._auth_dead:
+                self._auth_dead = not ok
+                if ok:
+                    self.add_sys("✅ Codex login restored — your next message will go through.")
+                else:
+                    self.add_err("⚠ Codex isn't signed in, so every message would fail. In a "
+                                 "terminal, run:  codex login  — the overlay notices the new "
+                                 "login on its own, no restart needed.")
+        elif kind == "codex_pause":      # a Codex CLI update needs codex.exe released
+            try:
+                self._pause_codex()
+            finally:
+                payload.set()
+        elif kind == "codex_sandbox":
+            self._codex_sandbox = str(payload or "") or None
+        elif kind == "approval":
+            self._approval_card(payload if isinstance(payload, dict) else {})
+        elif kind == "approval_resolved":
+            self._retire_approval(payload, "— answered by Codex's reviewer")
         elif kind == "turn_done":
             self._md_finalize()          # the turn ended → give the last line full block styling
             self._finish_turn_copy()     # then a Copy button under the reply
@@ -6456,6 +7169,8 @@ class Overlay:
             # turn that ended without one (stopped, errored, transport died) — the model may
             # never have seen those images, so they must not become dedupe baselines.
             self._pending_shot_hashes.clear()
+            for rid in list(self._approval_cards):
+                self._retire_approval(rid, "— the turn ended before an answer")
             if not self._discard_pending:
                 self._persist_session()  # this conversation is now the resumable one
                                          # (skipped for a turn Cleared mid-flight)
@@ -6465,6 +7180,8 @@ class Overlay:
             if not self._discard_pending:   # ignore a stale id from a Cleared conversation
                 self._session_id = str(payload)
         elif kind == "resumed":
+            self._has_turns = True       # the resumed context is content, even unseen
+            self._paint_provider_switch()
             self._set_status("")
             if self._resume_btn is not None:
                 try:
@@ -6473,7 +7190,8 @@ class Overlay:
                     pass
                 self._resume_btn = None
             self.add_sys("↺ Resumed your last conversation. The transcript isn't "
-                         "replayed here, but Claude remembers it — just keep going.")
+                         f"replayed here, but {self._provider_name()} remembers it — just "
+                         "keep going.")
             self._persist_session()      # keep it resumable even if no new turn follows
         elif kind == "resume_failed":
             self._set_status("")
@@ -6638,6 +7356,15 @@ class Overlay:
         elif kind == "sessions":
             store, rows = payload
             self._show_session_rows(store, rows)
+        elif kind == "codex_sessions":
+            if self.provider == "codex":
+                rows = [sessions.Session(r["id"], None, r.get("title") or "(untitled)",
+                                         r.get("subtitle") or "", None, 0,
+                                         float(r.get("mtime") or 0))
+                        for r in (payload or []) if isinstance(r, dict) and r.get("id")]
+                self._show_session_rows(_CodexThreads(self), rows)
+            else:
+                self._sessions_loading = False
         elif kind == "sessions_failed":
             self._sessions_loading = False
             self.add_err(f"Couldn't read your past conversations: {payload}")
@@ -6660,10 +7387,93 @@ class Overlay:
         elif kind == "cli_update_result":
             self._show_cli_update_result(payload)
 
+    # ── Codex approvals ──
+    _APPROVAL_HEADS = {"command": "Codex wants to run a command",
+                       "files": "Codex wants to change files",
+                       "permissions": "Codex wants extra permissions"}
+
+    def _approval_card(self, info):
+        """An in-chat card for a Codex approval request: what it wants, why, and three
+        answers. Codex asks only when it wants to step outside its sandbox — the reviewer
+        configured in ~/.codex usually answers first (the card then retires itself on
+        serverRequest/resolved); this is the human fallback, and the overlay must have one,
+        because a request nobody answers holds the turn forever."""
+        rid = info.get("rid")
+        if rid is None:
+            return
+        self._md_finalize()
+        self._ensure_header()
+        bg = T["tool_bg"]
+        card = tk.Frame(self.chat, bg=bg, highlightthickness=1, highlightbackground=T["border"],
+                        cursor="arrow")
+        wrap = max(self.px(160), self.chat.winfo_width() - self.px(90))
+        tk.Label(card, text=self._APPROVAL_HEADS.get(info.get("kind"), "Codex asks for approval"),
+                 bg=bg, fg=T["text"], font=self.f_chip, anchor="w", justify="left"
+                 ).pack(fill="x", padx=self.px(10), pady=(self.px(8), self.px(2)))
+        detail = (info.get("command") or "\n".join(info.get("files") or [])
+                  or info.get("permissions") or "")
+        if info.get("grant_root"):
+            detail = (detail + "\n" if detail else "") + f"write access to {info['grant_root']}"
+        if detail:
+            tk.Label(card, text=self._clip_bubble(detail), bg=bg, fg=T["text"], font=self.f_mono,
+                     anchor="w", justify="left", wraplength=wrap
+                     ).pack(fill="x", padx=self.px(10), pady=self.px(2))
+        why = info.get("reason") or (f"in {info['cwd']}" if info.get("cwd") else "")
+        if why:
+            tk.Label(card, text=why, bg=bg, fg=T["muted"], font=self.f_small, anchor="w",
+                     justify="left", wraplength=wrap
+                     ).pack(fill="x", padx=self.px(10), pady=(0, self.px(2)))
+        row = tk.Frame(card, bg=bg)
+        row.pack(fill="x", padx=self.px(10), pady=(self.px(4), self.px(9)))
+        for text, decision, fill, fg in (("Allow", "accept", T["accent"], T["on_accent"]),
+                                         ("Allow for this session", "session", T["field"], T["text"]),
+                                         ("Deny", "decline", T["field"], T["err"])):
+            b = tk.Label(row, text=text, bg=fill, fg=fg, font=self.f_small, cursor="hand2",
+                         padx=self.px(10), pady=self.px(3), highlightthickness=1,
+                         highlightbackground=T["border"])
+            b.pack(side="left", padx=(0, self.px(6)))
+            b.bind("<Button-1>", lambda e, d=decision: self._answer_approval(rid, d))
+        status = tk.Label(card, text="", bg=bg, fg=T["muted"], font=self.f_small, anchor="w")
+        for w in (card, row, *card.winfo_children(), *row.winfo_children()):
+            w.bind("<MouseWheel>", self._fwd_wheel, add="+")
+        self._approval_cards[rid] = {"card": card, "row": row, "status": status}
+        self.chat.insert("end", "\n")
+        self.chat.window_create("end", window=card, padx=self.px(16), pady=self.px(3))
+        self.chat.insert("end", "\n")
+        self._set_status("waiting for your approval…")
+        self._scroll_follow()
+
+    def _answer_approval(self, rid, decision):
+        if rid not in self._approval_cards:
+            return
+        try:
+            self.worker.respond_approval(rid, decision)
+        except Exception as e:
+            self.add_err(f"Couldn't answer Codex: {type(e).__name__}: {e}")
+            return
+        self._retire_approval(rid, {"accept": "✓ Allowed", "session": "✓ Allowed for this session",
+                                    "decline": "✕ Denied"}.get(decision, decision))
+        self._set_status("thinking…" if self.busy else "")
+
+    def _retire_approval(self, rid, text):
+        """Replace a card's buttons with what happened to it. Idempotent."""
+        ent = self._approval_cards.pop(rid, None)
+        if not ent:
+            return
+        try:
+            ent["row"].destroy()
+            ent["status"].configure(text=text)
+            ent["status"].pack(fill="x", padx=self.px(10), pady=(self.px(2), self.px(8)))
+        except Exception:
+            pass
+
     def _intro(self):
-        self._ins("\n✦ Claude\n", "ah")
-        self._ins("Hi — I float on top of everything. Ask me anything and I'll look at "
-                  "your screen to help.\n"
+        self._ins(self._header_text(), "ah")
+        hello = ("Codex here — floating on top of everything. Ask me anything and I'll look "
+                 "at your screen to help.\n" if self.provider == "codex" else
+                 "Hi — I float on top of everything. Ask me anything and I'll look at "
+                 "your screen to help.\n")
+        self._ins(hello +
                   "Enter to send · Shift+Enter for a new line · Ctrl +/− to zoom text · "
                   "drag an edge to resize.", "a")
         self._claude_header = True
