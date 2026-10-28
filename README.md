@@ -13,7 +13,7 @@
 
 <p align="center"><sub><b>Windows 10 / 11</b> only (for now) · runs on your existing Claude subscription — no API key</sub></p>
 
-https://github.com/user-attachments/assets/498f9f03-1ded-4177-93a4-60fe406b16c9
+https://github.com/user-attachments/assets/f47fb39d-68f5-42ba-b2be-5442812838d8
 
 **Claude Overlay** is a frameless, always-on-top chat window that floats over
 everything you do. Ask a question, and Claude looks at your **real
