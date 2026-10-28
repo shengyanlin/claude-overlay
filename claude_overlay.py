@@ -978,7 +978,8 @@ class Overlay:
             self.add_sys(f"⚠ {USER_CONFIG_FILE.name}: {w}")
         if self._startup_note:
             self.add_sys(self._startup_note)
-        self._maybe_announce_codex()
+        if not self._maybe_report_codex_setup():
+            self._maybe_announce_codex()
         self._maybe_offer_resume()
 
         # First paint, THEN the worker. update() maps and draws the window built above, so
@@ -1221,6 +1222,55 @@ class Overlay:
                          "Codex in this same window. Sign in once first with  codex login  in "
                          "a terminal — if you use the Codex app you may already be signed in, "
                          "and the overlay tells you if you aren't.")
+
+    _CODEX_SETUP_FAILED = {
+        "node-failed": "Node.js (which the Codex CLI needs) couldn't be installed",
+        "npm-failed": "npm couldn't install the Codex CLI",
+        "login-failed": "the Codex CLI installed, but the sign-in didn't finish",
+    }
+
+    def _maybe_report_codex_setup(self):
+        """Say once, at launch, that the Codex setup an update (or setup.cmd) TRIED didn't
+        finish, with the button that retries it. True when it said something, so the
+        introduction stays quiet.
+
+        install-codex.cmd leaves "<mode> <exit code> <what failed>" in codex-setup-result for
+        exactly this. The field report behind it: a 1.25.0 -> 1.25.1 update on a PC with no
+        Node.js "seemed to install" Codex, the window closed, and the overlay that came back
+        had a struck-through Codex and nothing saying why — the introduction had already been
+        shown by 1.25.0. A "no" leaves no record: it was the user's choice. The record is
+        consumed here; a CLI installed in the meantime makes an install failure moot."""
+        f = STATE_FILE.parent / "codex-setup-result"
+        try:
+            parts = f.read_text("ascii", "replace").split()
+        except OSError:
+            return False
+        try:
+            f.unlink()
+        except OSError:
+            pass
+        why = parts[2] if len(parts) >= 3 else ""
+        reason = self._CODEX_SETUP_FAILED.get(why)
+        if not reason or self.provider == "codex":
+            return False
+        installed = bool(self._cli_ok.get("codex"))
+        # A CLI that's there now settles an install failure. A sign-in failure is NOT settled
+        # by a login file existing -- `codex login status` already judged that file and
+        # said no -- so it's always offered; if it has been fixed since, the button finds
+        # that out in a second and says Codex is ready.
+        if installed and why != "login-failed":
+            return False                 # installed some other way since
+        _save_state(codex_intro_shown=True)        # this says everything the intro would
+        where = "Setup" if parts[0] == "--from-setup" else "The update"
+        if self._can_setup_codex():
+            self._offer_codex_setup(f"⚠ {where} tried to set up Codex mode, but {reason} "
+                                    "(its console window said why). One click tries again:",
+                                    signin=installed)
+        else:
+            self.add_sys(f"⚠ {where} tried to set up Codex mode, but {reason}. To finish it, "
+                         "run  npm install -g @openai/codex  (needs Node.js 18+) and then  "
+                         "codex login  in a terminal.")
+        return True
 
     def _can_setup_codex(self):
         return os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)),

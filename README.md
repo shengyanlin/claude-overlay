@@ -175,8 +175,8 @@ python --version
 
 ### 4. Codex CLI — for Codex mode (optional)
 The titlebar's **Claude ⇄ Codex** switch puts OpenAI's Codex behind the same window, on
-**your own** `codex` login. `setup.cmd` installs it (with npm, offering Node.js through
-winget if that's missing too); by hand:
+**your own** `codex` login. `setup.cmd` installs it (with npm, offering Node.js if that's
+missing too — per-user, no admin, with winget as the fallback); by hand:
 ```
 npm install -g @openai/codex
 codex login
@@ -264,11 +264,13 @@ instead of merging a release into work in progress.
 
 1.25 adds the titlebar's **Claude | Codex** switch, which drives the Codex CLI. **The update
 sets it up for you** (since 1.25.1): `update.cmd` — and the overlay's one-click Update —
-asks to install the Codex CLI (Node.js too, with winget, if there's no npm; Windows may ask
-for admin approval) and then offers `codex login`. Say no and it won't ask again on later
-updates. Claude mode works exactly as before either way.
+asks to install the Codex CLI (Node.js too if there's no npm — into your user folder, no
+admin needed, since 1.25.2; winget's admin-approved install is the fallback) and then offers
+`codex login`. Say no and it won't ask again on later updates. Claude mode works exactly as
+before either way.
 
-Skipped it, or it didn't finish? Click **Codex** in the titlebar: while the CLI is missing
+Skipped it, or it didn't finish? If the setup was tried and failed, the update's window stays
+open on the reason and the overlay says so when it restarts. Click **Codex** in the titlebar: while the CLI is missing
 (or signed out) the overlay offers a one-click **Install Codex CLI & sign in** button — a
 console window shows the progress — and Codex is clickable the moment it's done, no
 restart. By hand it's `npm install -g @openai/codex` (needs Node.js 18+), then

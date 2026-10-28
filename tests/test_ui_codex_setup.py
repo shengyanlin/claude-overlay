@@ -8,6 +8,8 @@ that runs the shared installer in its own console and reports its exit code in w
 install-codex.cmd is never spawned: run_codex_setup is stubbed wherever a click runs."""
 import tkinter as tk
 
+import pytest
+
 import claude_overlay as co
 from conftest import chat_text
 
@@ -153,6 +155,66 @@ def test_two_offers_already_on_screen_still_run_one_setup_at_a_time(overlay, mon
     assert first._ustate == "working" and second._ustate == "idle"
     assert overlay._codex_setup_btn_ref is first
     assert "already running in its console window" in chat_text(overlay)
+
+
+# ── a setup the update TRIED and didn't finish, said at the next launch ──
+# The 1.25.0 -> 1.25.1 field report: no Node.js, the update's Codex setup failed, the window
+# closed, and the overlay that came back said nothing (its introduction was already shown).
+
+def _record(overlay, text):
+    f = co.STATE_FILE.parent / "codex-setup-result"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(text, "ascii")
+    return f
+
+
+def test_a_failed_update_setup_is_reported_once_with_a_retry(overlay, monkeypatch):
+    _no_codex(monkeypatch, overlay)
+    f = _record(overlay, "--from-update 3 node-failed\r\n")
+    co._save_state(codex_intro_shown=None)
+    assert overlay._maybe_report_codex_setup() is True
+    text = chat_text(overlay)
+    assert "The update tried to set up Codex mode" in text
+    assert "Node.js" in text
+    assert any("Install Codex CLI & sign in" in t for _, t in _buttons(overlay))
+    assert not f.exists()                            # consumed: said once
+    assert co._load_state().get("codex_intro_shown")  # and the intro doesn't repeat it
+    assert overlay._maybe_report_codex_setup() is False
+
+
+@pytest.mark.parametrize("auth_file", [False, True])
+def test_a_failed_sign_in_offers_the_sign_in_button(overlay, monkeypatch, tmp_path, auth_file):
+    """Even with a login file there: `codex login status` already judged it and said no, so
+    its existence proves nothing (an expired or broken login leaves one behind)."""
+    monkeypatch.setattr(co.Overlay, "_can_setup_codex", lambda self: True)
+    if auth_file:
+        (tmp_path / "auth.json").write_text("{}", "utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    overlay._cli_ok = {"claude": True, "codex": True}
+    _record(overlay, "--from-setup 2 login-failed\r\n")
+    assert overlay._maybe_report_codex_setup() is True
+    assert "Setup tried to set up Codex mode" in chat_text(overlay)
+    assert "Sign in to Codex" in _buttons(overlay)[-1][1]
+
+
+@pytest.mark.parametrize("record,installed", [
+    ("--from-update 3 npm-failed", True),            # installed some other way since
+    ("--from-update 3 node-failed", True),
+    ("--from-update 3", False),                      # a "no" writes no reason
+    ("garbage", False),
+])
+def test_nothing_is_said_when_there_is_nothing_to_fix(overlay, monkeypatch, record, installed):
+    monkeypatch.setattr(co.Overlay, "_can_setup_codex", lambda self: True)
+    overlay._cli_ok = {"claude": True, "codex": installed}
+    f = _record(overlay, record)
+    before = chat_text(overlay)
+    assert overlay._maybe_report_codex_setup() is False
+    assert chat_text(overlay) == before
+    assert not f.exists()
+
+
+def test_no_record_means_no_report(overlay):
+    assert overlay._maybe_report_codex_setup() is False
 
 
 def test_a_mid_session_sign_out_offers_sign_in_and_success_rechecks(overlay, monkeypatch):

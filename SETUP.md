@@ -50,8 +50,9 @@ else.**
 1. Copy this whole `claude-overlay` folder to the new machine (anywhere).
 2. Double-click **`setup.cmd`** — it checks Python + the `claude` CLI (auto-installing the
    CLI if it's missing), then the `codex` CLI (installed with npm; if Node.js is missing too
-   it offers to install it with winget, which may ask for admin approval — say no and Codex
-   is simply skipped), offers both sign-ins, and installs the Python packages
+   it offers to install it into your user folder, no admin needed — winget, which may ask for
+   admin approval, is the fallback; say no and Codex is simply skipped), offers both
+   sign-ins, and installs the Python packages
    (`claude-agent-sdk`, `pillow`, `keyboard`, …).
    > pip may print a few `… is installed in … which is not on PATH` warnings here —
    > **they're harmless**; the overlay doesn't use those scripts.

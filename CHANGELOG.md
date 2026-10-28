@@ -3,6 +3,23 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.25.2] - 2026-10-29
+
+Codex setup now works on a PC without Node.js or admin rights, and a setup that doesn't
+finish says so instead of vanishing with its window.
+
+### Fixed
+- **Updating to 1.25.1 on a PC without Node.js could leave Codex mode unusable.** The update
+  asked to set Codex up, seemed to install, and its window closed: the only way to get
+  Node.js was winget's machine-wide installer, which needs an admin to approve it, and a
+  Codex setup that failed didn't fail the update, so the one-click Update closed the window
+  — and the reason — on success. Node.js now goes into your user folder from the official
+  nodejs.org .zip (checksum-verified, no admin), with winget as the fallback.
+- **A Codex setup that was tried and didn't finish now says so.** The update's window stays
+  open on the reason until you press a key, and when the overlay restarts it says what
+  didn't finish (Node.js, the Codex CLI, or the sign-in) with a one-click retry. Saying
+  "no" is still remembered and never reported as a failure.
+
 ## [1.25.1] - 2026-10-28
 
 Updating no longer leaves Codex mode unusable: the update installs the Codex CLI and signs

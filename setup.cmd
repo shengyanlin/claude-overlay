@@ -150,7 +150,8 @@ rem Codex mode is one half of the app, so setup installs it -- but Claude mode n
 rem touches it, so nothing in here can stop setup: a machine where npm is blocked must
 rem still end up with a working (Claude-only) overlay. install-codex.cmd is shared with
 rem update.cmd and the overlay's own "Set up Codex" button; it installs the CLI (Node.js
-rem first, via winget, if there's no npm) and offers `codex login`.
+rem first if there's no npm -- per-user, no admin, with winget as the fallback) and offers
+rem `codex login`.
 call "%~dp0install-codex.cmd" --from-setup
 
 rem --- 3. Python packages ---

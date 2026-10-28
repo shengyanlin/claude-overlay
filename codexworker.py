@@ -32,10 +32,20 @@ from config import __version__
 from debuglog import dbg, DEBUG_LOG, _UIQueueTap
 
 # The same PATH help worker.py gives the `claude` CLI: a global npm install lands in
-# %APPDATA%\npm, which a session started before the install can't see yet.
+# %APPDATA%\npm, which a session started before the install can't see yet. Node's own
+# folders too (install-node.ps1's per-user one, the MSI's machine-wide one): an overlay that
+# restarts itself after an update keeps the PATH it started with, and when codex_command
+# can't reach past the npm shim, the shim needs `node`.
+def _env_dir(var, *sub):
+    base = os.environ.get(var)
+    return os.path.join(base, *sub) if base else ""   # never a relative PATH entry
+
+
 os.environ["PATH"] = os.pathsep.join(filter(None, [
-    os.path.join(os.environ.get("APPDATA", ""), "npm"),
+    _env_dir("APPDATA", "npm"),
     os.environ.get("PATH", ""),
+    _env_dir("LOCALAPPDATA", "Programs", "nodejs"),
+    _env_dir("ProgramFiles", "nodejs"),
 ]))
 
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0

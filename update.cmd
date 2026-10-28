@@ -347,6 +347,9 @@ rem note here was not enough: from the app's Update button this window closes on
 rem so the note was gone before anyone read it and the switch stayed unclickable. So the
 rem update sets Codex up itself -- install-codex.cmd asks first, remembers a "no", installs
 rem Node.js/npm if needed and offers `codex login`. Never fatal: Claude mode doesn't need it.
+rem Its exit code is deliberately not checked here. When the setup was tried and failed it
+rem holds THIS window open itself (the app's Update button would close it on success, and
+rem the reason with it) and leaves a note the overlay shows at its next launch.
 call "%~dp0install-codex.cmd" --from-update
 
 rem --- prove the updated install can actually start ---------------------------
