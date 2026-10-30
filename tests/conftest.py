@@ -126,6 +126,9 @@ def _no_real_telemetry():
         mp.undo()
 
 
+REAL_CHECK_CLI_UPDATE = None     # the unstubbed Overlay._check_cli_update, set by the fixture
+
+
 @pytest.fixture(scope="session")
 def _overlay_singleton():
     """The one Overlay/Tk root for the session. Built with side effects patched out."""
@@ -156,6 +159,12 @@ def _overlay_singleton():
     # for the tests that want the real one.
     _real_ping = co.Overlay._ping_telemetry
     mp.setattr(co.Overlay, "_ping_telemetry", lambda self: None)
+    # And the launch's CLI check, for the whole session: it asks npm fresh at every launch
+    # and, with CLI_AUTO_UPDATE, runs `npm install -g` on a CLI that's behind -- the launch
+    # timer and every provider switch schedule it. Its tests call REAL_CHECK_CLI_UPDATE.
+    global REAL_CHECK_CLI_UPDATE
+    REAL_CHECK_CLI_UPDATE = co.Overlay._check_cli_update
+    mp.setattr(co.Overlay, "_check_cli_update", lambda self: None)
     # Point the persisted-UI-state store at a throwaway path: the suite must neither
     # read this machine's real toggle state nor overwrite it from toggle tests.
     import tempfile
@@ -188,7 +197,7 @@ def _clean_overlay(ov):
     # Cancel any after() timers a prior test may have scheduled (zoom re-render, region
     # re-apply, compaction animation, precapture) so none fires mid-next-test.
     for _attr in ("_rezoom_after", "_round_after", "_compact_anim_after",
-                  "_precapture_after", "_queue_after"):
+                  "_precapture_after", "_queue_after", "_cli_auto_after"):
         _tid = getattr(ov, _attr, None)
         if _tid is not None:
             try:
@@ -196,6 +205,14 @@ def _clean_overlay(ov):
             except Exception:
                 pass
             setattr(ov, _attr, None)
+    # A CLI update a test claimed (a button click, an auto-update) and never finished: the
+    # claim would refuse the next test's clicks and switches, a pause would leave it busy.
+    ov._cli_op = None
+    ov._cli_auto_queue = []
+    ov._codex_paused = False
+    ov._paused_worker = None
+    ov._chosen_model = None
+    ov._resume_started = None
     try:
         if not ov.expanded:
             ov.toggle_collapse()        # back to expanded

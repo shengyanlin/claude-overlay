@@ -260,6 +260,19 @@ a **fork** gets the release rather than its own stale copy. It updates only a cl
 sitting on `main`: on another branch, or with uncommitted changes, it says so and stops
 instead of merging a release into work in progress.
 
+### The Claude and Codex CLIs update themselves
+
+The overlay drives the `claude` CLI (and, in Codex mode, the `codex` CLI), and those update
+separately from the overlay — an up-to-date overlay on an old CLI quietly runs older models.
+So every launch checks both, and one that's behind is updated on its own when npm installed
+it (`npm install -g …@latest`); a native Claude install updates itself, so it's left alone.
+The chat says what's happening. A CLI the overlay is using right now is paused for the update
+— never in the middle of a reply — and comes back on the same conversation; what you type in
+the meantime goes out right after. If an update can't finish (another Claude or Codex
+window holding the CLI open, say), the chat says why and offers a one-click retry, and the
+next launch tries again. Set `CLI_AUTO_UPDATE` to `false` in `config.json` (or
+`CLAUDE_OVERLAY_CLI_AUTO_UPDATE=0`) to get only the notice and its **⬆ Update CLI** button.
+
 ### Updating to 1.25 — turning on Codex mode
 
 1.25 adds the titlebar's **Claude | Codex** switch, which drives the Codex CLI. **The update
@@ -270,7 +283,11 @@ admin needed, since 1.25.2; winget's admin-approved install is the fallback) and
 before either way.
 
 Skipped it, or it didn't finish? If the setup was tried and failed, the update's window stays
-open on the reason and the overlay says so when it restarts. Click **Codex** in the titlebar: while the CLI is missing
+open on the reason and the overlay says so when it restarts. An npm whose global folder the
+overlay doesn't search (an `.npmrc` prefix, a Node.js not from the official installer) gets a
+second try into your own `%APPDATA%\npm`. On a network that inspects HTTPS, npm is given the
+certificates Windows already trusts, so it isn't stopped by `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`.
+Click **Codex** in the titlebar: while the CLI is missing
 (or signed out) the overlay offers a one-click **Install Codex CLI & sign in** button — a
 console window shows the progress — and Codex is clickable the moment it's done, no
 restart. By hand it's `npm install -g @openai/codex` (needs Node.js 18+), then
@@ -437,7 +454,8 @@ to change, using the constant names below — for example:
 
 Overridable: `WORKING_DIR`, `MODEL`, `MODEL_MENU_FILTER`, `QUEUE_MESSAGES`, `EFFORT`,
 `PERMISSION_MODE`,
-`SKILLS`, `STRICT_MCP_CONFIG`, `CLI_UPDATE_CHECK`, `TELEMETRY`, `TELEMETRY_URL`,
+`SKILLS`, `STRICT_MCP_CONFIG`, `CLI_UPDATE_CHECK`, `CLI_AUTO_UPDATE`, `TELEMETRY`,
+`TELEMETRY_URL`,
 `AUTO_SCREENSHOT_DEFAULT`, `SHOT_SCOPE`,
 `SHOT_FORMAT`, `SHOT_JPEG_QUALITY`, `SHOT_DEDUPE_BITS`, `HIDE_SCREENSHOT_TOOL`, `THEME`,
 `SHOW_IN_SCREEN_SHARE_DEFAULT`, `TASKBAR_BUTTON`, `HOTKEY`, `WINDOW_ALPHA`,

@@ -30,11 +30,34 @@ if "%1"=="login" if "%2"=="status" (
 if "%1"=="login" if not "%FAKE_LOGIN_FAILS%"=="1" echo yes> "%FAKE_ROOT%\signed-in"
 exit /b 0
 """
-# `npm install -g @openai/codex` drops a codex shim into npm's global bin (%APPDATA%\npm).
+# `npm install -g @openai/codex` drops a codex shim into npm's global bin: %APPDATA%\npm, as
+# the official installer sets it, or FAKE_NPM_PREFIX (an .npmrc prefix) -- or --prefix's.
+#   FAKE_NPM_FAILS: every install fails (no network, say).
+#   FAKE_NPM_EPERM: an install into npm's own folder fails (admin-only); --prefix works.
+#   Each run also logs the certificate settings it was given (an "npm-env" line).
 FAKE_NPM = r"""@echo off
 echo npm %*>> "%FAKE_LOG%"
+>> "%FAKE_LOG%" echo npm-env SYSCA=%NODE_USE_SYSTEM_CA% EXTRA=%NODE_EXTRA_CA_CERTS%
+if "%1"=="prefix" goto prefix
 if "%FAKE_NPM_FAILS%"=="1" exit /b 1
-copy /y "%FAKE_ROOT%\codex.src" "%APPDATA%\npm\codex.cmd" >nul
+set "DEST="
+:args
+if "%~1"=="" goto go
+if "%~1"=="--prefix" set "DEST=%~2"
+shift
+goto args
+:go
+if defined DEST goto copy
+if "%FAKE_NPM_EPERM%"=="1" exit /b 1
+set "DEST=%APPDATA%\npm"
+if defined FAKE_NPM_PREFIX set "DEST=%FAKE_NPM_PREFIX%"
+:copy
+if not exist "%DEST%" mkdir "%DEST%"
+copy /y "%FAKE_ROOT%\codex.src" "%DEST%\codex.cmd" >nul
+exit /b 0
+:prefix
+if defined FAKE_NPM_PREFIX echo %FAKE_NPM_PREFIX%
+if not defined FAKE_NPM_PREFIX echo %APPDATA%\npm
 exit /b 0
 """
 # `winget install ... OpenJS.NodeJS.LTS` puts npm into %ProgramFiles%\nodejs.
@@ -58,6 +81,17 @@ if "%FAKE_PS_BROKEN%"=="1" (
 copy /y "%FAKE_ROOT%\npm.src" "%LOCALAPPDATA%\Programs\nodejs\npm.cmd" >nul
 exit /b 0
 """
+# `python windowsca.py <pem>` writes a stand-in PEM there -- or, with FAKE_CA_FAILS, nothing.
+# `python -c "pass"` (the is-there-a-Python probe) just works.
+FAKE_PYTHON = r"""@echo off
+echo python %*>> "%FAKE_LOG%"
+if "%~1"=="-c" exit /b 0
+if /i not "%~nx1"=="windowsca.py" exit /b 1
+if "%FAKE_CA_FAILS%"=="1" exit /b 1
+if not exist "%~dp2" mkdir "%~dp2"
+echo fake-ca> "%~2"
+exit /b 0
+"""
 BROKEN_NPM = r"""@echo off
 echo broken-npm %*>> "%FAKE_LOG%"
 exit /b 1
@@ -74,6 +108,7 @@ def box(tmp_path):
     (tmp_path / "winget.src").write_text(FAKE_WINGET)
     (tmp_path / "powershell.src").write_text(FAKE_POWERSHELL)
     (tmp_path / "broken-npm.src").write_text(BROKEN_NPM)
+    (tmp_path / "python.src").write_text(FAKE_PYTHON)
     sysroot = os.environ.get("SystemRoot", r"C:\Windows")
     env = {
         "PATH": str(tmp_path / "bin") + ";" + os.path.join(sysroot, "System32") + ";" + sysroot,
@@ -94,7 +129,7 @@ def box(tmp_path):
         def has(self, *tools):
             for t in tools:
                 src = {"codex": "codex.src", "npm": "npm.src", "winget": "winget.src",
-                       "powershell": "powershell.src"}[t]
+                       "powershell": "powershell.src", "python": "python.src"}[t]
                 (tmp_path / "bin" / f"{t}.cmd").write_text((tmp_path / src).read_text())
 
         def signed_in(self):
@@ -316,6 +351,127 @@ def test_a_failure_holds_the_apps_update_window_open(box):
     rc, by_hand = box.run("--from-update", answers="\n", FAKE_NPM_FAILS="1")
     assert "Codex setup didn't finish" not in by_hand  # update.cmd's own ending pauses there
     assert len(auto.strip().splitlines()) > len(by_hand.strip().splitlines())
+
+
+# ── the 1.25.2 field report: npm present, `npm install` printed nothing, still no codex ──
+
+def _installs(box):
+    return [l for l in box.log().splitlines() if l.startswith("npm install")]
+
+
+def test_npm_is_told_to_say_what_it_does(box):
+    """An npm configured silent (loglevel=silent in an .npmrc) hides its errors and its
+    success alike -- the field screenshot: the "Installing it with npm" line, then straight
+    to the [NOTE]. npm's own default level, passed explicitly, outranks any config."""
+    box.has("npm")
+    rc, out = box.run("--from-app")
+    assert rc == 0, out
+    assert _installs(box) == ["npm install -g @openai/codex --loglevel notice"]
+
+
+def test_codex_put_where_nothing_looks_is_installed_again_where_it_is_looked_for(box):
+    """npm's global folder is elsewhere (an .npmrc prefix): the install works and codex still
+    isn't on PATH. Once more into %APPDATA%\\npm, which the overlay searches too."""
+    box.has("npm")
+    elsewhere = box.root / "elsewhere"
+    rc, out = box.run("--from-app", FAKE_NPM_PREFIX=str(elsewhere))
+    assert rc == 0, out
+    assert (elsewhere / "codex.cmd").exists()
+    assert (box.root / "appdata" / "npm" / "codex.cmd").exists()
+    first, again = _installs(box)
+    assert "--prefix" not in first
+    assert again.endswith('--prefix "%s"' % (box.root / "appdata" / "npm"))
+    assert str(elsewhere) in out                        # says where npm's folder was
+
+
+def test_an_admin_only_global_folder_is_retried_in_the_users_own(box):
+    """A Node.js not from the official installer: npm's global folder is Node's own, under
+    Program Files, and a standard user can't write there."""
+    box.has("npm")
+    rc, out = box.run("--from-app", FAKE_NPM_PREFIX=str(box.root / "pf" / "nodejs"),
+                      FAKE_NPM_EPERM="1")
+    assert rc == 0, out
+    assert len(_installs(box)) == 2
+    assert (box.root / "appdata" / "npm" / "codex.cmd").exists()
+
+
+def test_a_failure_in_the_usual_folder_is_not_retried_and_says_how_it_ended(box):
+    """Already %APPDATA%\\npm: a second try would fail the same way. What the screenshot
+    needs instead: npm's exit code, which npm ran, and on which Node."""
+    box.has("npm")
+    rc, out = box.run("--from-app", answers="\n", FAKE_NPM_FAILS="1")
+    assert rc == 3
+    assert len(_installs(box)) == 1
+    assert "npm exit code 1" in out
+    assert str(box.root / "bin" / "npm") in out
+    assert "Node.js: not on PATH" in out
+
+
+def test_a_retry_that_fails_too_ends_in_the_same_note(box):
+    box.has("npm")
+    rc, out = box.run("--from-update", answers="\n", FAKE_NPM_FAILS="1",
+                      FAKE_NPM_PREFIX=str(box.root / "elsewhere"))
+    assert rc == 3
+    assert len(_installs(box)) == 2
+    assert box.result.read_text().split() == ["--from-update", "3", "npm-failed"]
+    assert "Claude mode works without it" in out
+
+
+# ── the second 1.25.2 field report: UNABLE_TO_GET_ISSUER_CERT_LOCALLY ──────────────────
+# A network that inspects HTTPS: its root certificate is in Windows' store, not in Node's.
+
+def _npm_envs(box):
+    return [l for l in box.log().splitlines() if l.startswith("npm-env")]
+
+
+def test_npm_gets_the_certificates_windows_trusts(box):
+    box.has("npm", "python")
+    rc, out = box.run("--from-app")
+    assert rc == 0, out
+    pem = box.root / "local" / "claude-overlay" / "windows-ca.pem"
+    assert "windowsca.py" in box.log() and pem.exists()
+    assert _npm_envs(box)[0] == "npm-env SYSCA=1 EXTRA=%s" % pem
+
+
+def test_it_uses_the_python_its_caller_found(box):
+    """setup.cmd and update.cmd hand down %PY% (quoted -- here a folder with an & in it), the
+    overlay's button OV_PYTHON; neither is the PATH python."""
+    box.has("npm", "python")
+    odd = box.root / "py & co"
+    odd.mkdir()
+    (odd / "python.cmd").write_text(FAKE_PYTHON.replace("echo python", "echo their-python"))
+    rc, out = box.run("--from-setup", answers="\n", PY='"%s"' % (odd / "python.cmd"))
+    assert rc == 0, out
+    assert "their-python" in box.log() and "\npython " not in "\n" + box.log()
+    assert _npm_envs(box)[0].endswith("windows-ca.pem")
+    (box.root / "appdata" / "npm" / "codex.cmd").unlink()
+    (box.root / "log.txt").unlink()
+    rc, out = box.run("--from-app", OV_PYTHON=str(odd / "python.cmd"))
+    assert rc == 0, out
+    assert "their-python" in box.log() and "\npython " not in "\n" + box.log()
+
+
+def test_certificate_settings_someone_already_made_are_kept(box):
+    box.has("npm", "python")
+    rc, out = box.run("--from-app", NODE_EXTRA_CA_CERTS=r"C:\it\proxy-root.pem",
+                      NODE_USE_SYSTEM_CA="0")
+    assert rc == 0, out
+    assert "windowsca.py" not in box.log()
+    assert _npm_envs(box)[0] == r"npm-env SYSCA=0 EXTRA=C:\it\proxy-root.pem"
+
+
+def test_no_certificate_file_still_installs(box):
+    """No Python, or one that can't write the file: Node's own store reading
+    (NODE_USE_SYSTEM_CA) is still on, and the install goes ahead."""
+    box.has("npm")
+    rc, out = box.run("--from-app")
+    assert rc == 0, out
+    assert _npm_envs(box)[0] == "npm-env SYSCA=1 EXTRA="
+    (box.root / "appdata" / "npm" / "codex.cmd").unlink()          # not installed again
+    box.has("python")
+    rc, out = box.run("--from-app", FAKE_CA_FAILS="1")
+    assert rc == 0, out
+    assert _npm_envs(box)[-1] == "npm-env SYSCA=1 EXTRA="
 
 
 def test_setup_and_update_both_call_it():

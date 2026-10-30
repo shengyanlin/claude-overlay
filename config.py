@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 
-__version__ = "1.25.2"
+__version__ = "1.26.0"
 
 def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     try:
@@ -319,6 +319,13 @@ CLI_UPDATE_CHECK = _env_bool("CLAUDE_OVERLAY_CLI_UPDATE_CHECK", True)   # on lau
                             # the overlay current never advances the CLI, and an old CLI silently
                             # runs an older model. Set CLAUDE_OVERLAY_CLI_UPDATE_CHECK=0 to disable
                             # (e.g. a locked-down box where global npm installs aren't allowed)
+CLI_AUTO_UPDATE = _env_bool("CLAUDE_OVERLAY_CLI_AUTO_UPDATE", True)   # with the check on: at
+                            # every launch, look at BOTH CLIs (Claude's and Codex's) and update one
+                            # that's behind on its own instead of waiting for a click -- when npm
+                            # installed it (a native install updates itself). A live conversation
+                            # is paused for it, never mid-reply; what you type meanwhile goes out
+                            # afterwards, on the same conversation. Set
+                            # CLAUDE_OVERLAY_CLI_AUTO_UPDATE=0 for the notice and button only.
 TELEMETRY = _env_bool("CLAUDE_OVERLAY_TELEMETRY", True)   # master switch for the anonymous
                             # usage ping (telemetry.py has the complete payload and PRIVACY.md
                             # the plain-English version). This is OPT-OUT: True plus the endpoint
@@ -585,6 +592,7 @@ _USER_CONFIG_KEYS = {
     "STRICT_MCP_CONFIG": _v_bool,
     "MCP_SERVERS": _v_mcp_servers,             # {name: {...}} — loads even under strict
     "CLI_UPDATE_CHECK": _v_bool,
+    "CLI_AUTO_UPDATE": _v_bool,                # false = notice + button only, no auto-update
     "TELEMETRY": _v_bool,                      # false = never send the anonymous usage ping
     "TELEMETRY_URL": _v_telemetry_url,         # "" = no endpoint; https only, see telemetry.state
     # Codex mode (the titlebar Claude ⇄ Codex switch)
@@ -621,6 +629,7 @@ _ENV_BEATS_JSON = {
     "SHOT_SCOPE": "CLAUDE_OVERLAY_SHOT_SCOPE",
     "STRICT_MCP_CONFIG": "CLAUDE_OVERLAY_STRICT_MCP",
     "CLI_UPDATE_CHECK": "CLAUDE_OVERLAY_CLI_UPDATE_CHECK",
+    "CLI_AUTO_UPDATE": "CLAUDE_OVERLAY_CLI_AUTO_UPDATE",
     "TELEMETRY": "CLAUDE_OVERLAY_TELEMETRY",
     "TELEMETRY_URL": "CLAUDE_OVERLAY_TELEMETRY_URL",
 }

@@ -387,7 +387,14 @@ def run_codex_setup(repo=None):
     if not os.path.exists(script):
         return None
     try:
-        p = subprocess.Popen(_cmd_c(script, "--from-app"), cwd=repo,
+        # OV_PYTHON: the interpreter install-codex.cmd runs windowsca.py with (Windows' root
+        # certificates for npm) -- this one, as python.exe when it's pythonw.exe.
+        env = dict(os.environ)
+        exe = sys.executable or ""
+        con = os.path.join(os.path.dirname(exe), "python.exe")
+        env["OV_PYTHON"] = con if os.path.basename(exe).lower() == "pythonw.exe" and \
+            os.path.isfile(con) else exe
+        p = subprocess.Popen(_cmd_c(script, "--from-app"), cwd=repo, env=env,
                              creationflags=_CREATE_NEW_CONSOLE)
         return p.wait()
     except Exception:

@@ -33,6 +33,7 @@ under pythonw. `npm view` prints the version to STDOUT and its "new npm availabl
 STDERR, so the version is parsed from stdout ONLY (a stderr nag can contain a stray x.y.z)."""
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -54,6 +55,28 @@ _INSTALL_TIMEOUT = 300                     # `npm install -g` (download + extrac
 _REASON_MAX = 200                          # cap a surfaced failure reason
 
 
+def npm_prefix(cli="claude"):
+    """The npm global folder the `claude` / `codex` on PATH runs from — the folder holding the
+    shim npm made, with the package beside it in node_modules — or None when it isn't an npm
+    global install: a native install (Claude's ~/.local/bin/claude.exe updates itself) or any
+    other installer. run_update installs into exactly this folder (--prefix): npm's own
+    configured prefix may have moved since (an .npmrc), and an update landing there would add
+    a copy that never runs — the CLI would look behind, and be updated, at every launch."""
+    pkg = _CODEX_PKG if cli == "codex" else _PKG
+    exe = shutil.which("codex" if cli == "codex" else "claude")
+    if not exe or os.path.splitext(exe)[1].lower() not in (".cmd", ".bat", ".ps1", ""):
+        return None
+    folder = os.path.dirname(exe)
+    if not os.path.isdir(os.path.join(folder, "node_modules", *pkg.split("/"))):
+        return None
+    return folder
+
+
+def npm_managed(cli="claude"):
+    """True when npm's global install is the CLI that runs (see npm_prefix)."""
+    return npm_prefix(cli) is not None
+
+
 def _find_npm():
     """Path to the npm launcher if npm is on PATH, else None — a cheap gate so we never even
     try to check/update when npm isn't installed (a native-installer setup, say). shutil.which
@@ -61,14 +84,68 @@ def _find_npm():
     return shutil.which("npm")
 
 
-def _run(args, timeout):
+_ca_pem = None                             # the Windows-roots file, once written this run
+
+
+def _windows_ca_pem():
+    """Path of the PEM file of the roots Windows trusts for HTTPS (windowsca.py — the same
+    file install-codex.cmd writes), or None. A network that inspects HTTPS re-signs every
+    site with the organisation's own root, which Windows trusts and Node.js's built-in list
+    doesn't, so npm fails with UNABLE_TO_GET_ISSUER_CERT_LOCALLY (a field report on 1.25.2).
+    Written once a run (rewritten if it went missing); imported lazily so a broken windowsca
+    can't cost us the module."""
+    global _ca_pem
+    if _ca_pem == "":                    # couldn't be written this run: don't keep trying
+        return None
+    if _ca_pem and os.path.isfile(_ca_pem):
+        return _ca_pem
+    _ca_pem = ""
+    if sys.platform != "win32":
+        return None
+    try:
+        import windowsca
+        _ca_pem = windowsca.write() or ""
+    except Exception:
+        pass
+    return _ca_pem or None
+
+
+def _npm_env():
+    """The environment npm runs in: this one, plus Windows' certificates for Node.js —
+    NODE_USE_SYSTEM_CA for a Node.js that reads the store itself, NODE_EXTRA_CA_CERTS (see
+    _windows_ca_pem) for one that doesn't. Nothing is switched off: npm still checks every
+    certificate. Either variable already set is kept."""
+    env = dict(os.environ)
+    env.setdefault("NODE_USE_SYSTEM_CA", "1")
+    if not env.get("NODE_EXTRA_CA_CERTS"):
+        pem = _windows_ca_pem()
+        if pem:
+            env["NODE_EXTRA_CA_CERTS"] = pem
+    return env
+
+
+_CMD_SPECIAL = re.compile(r"[\s&|<>^()\[\]{}=;!'+,`~\"]")
+
+
+def _cmdline(args):
+    """The arguments as cmd.exe reads them. A list would go through Windows' own quoting,
+    which quotes only for spaces, so an argument with an & in it would reach cmd bare and end
+    the command there. Any argument with a character cmd treats specially is double-quoted;
+    the command itself (npm, codex) comes first unquoted, so cmd /c keeps every quote as
+    written. (A %NAME% still expands inside quotes — so a folder goes in env_extra, not here.)"""
+    return " ".join(f'"{a}"' if (not a or _CMD_SPECIAL.search(a)) else a for a in args)
+
+
+def _run(args, timeout, env_extra=None):
     """Run `cmd /c <args>` capturing stdout+stderr as decoded UTF-8. Going through cmd.exe is
     required on Windows to launch npm (a .cmd shim); CREATE_NO_WINDOW suppresses the console
-    under pythonw. Returns (returncode, stdout, stderr) or None if it couldn't even spawn.
-    Never raises."""
+    under pythonw. `env_extra` is added to the environment as is — cmd never parses it.
+    Returns (returncode, stdout, stderr) or None if it couldn't even spawn. Never raises."""
     try:
-        r = subprocess.run(["cmd", "/c", *args], capture_output=True, timeout=timeout,
-                           creationflags=_CREATE_NO_WINDOW)
+        env = _npm_env()
+        env.update(env_extra or {})
+        r = subprocess.run("cmd /c " + _cmdline(args), capture_output=True, timeout=timeout,
+                           env=env, creationflags=_CREATE_NO_WINDOW)
     except Exception:
         return None
     dec = lambda b: (b or b"").decode("utf-8", "replace")
@@ -173,8 +250,10 @@ def check_update(force=False, cli="claude"):
         if cached is not None:
             return cached
     inst = installed()
+    if not inst:                 # not installed (no Codex CLI, say): no registry call either
+        return None
     latest = latest_of()
-    if not inst or not latest:
+    if not latest:
         return None
     result = {"installed": inst, "latest": latest,
               "behind": bool(_parse_ver(inst) < _parse_ver(latest))}
@@ -218,7 +297,13 @@ def run_update(cli="claude"):
     if _find_npm() is None:
         return (False, "npm not found on PATH")
     pkg, cache, installed, _latest = _spec(cli)
-    res = _run(["npm", "install", "-g", pkg + "@latest"], _INSTALL_TIMEOUT)
+    args = ["npm", "install", "-g", pkg + "@latest"]
+    prefix = npm_prefix(cli)
+    # Replace the copy that runs (see npm_prefix). As npm_config_prefix — npm's own name for
+    # the same setting, above any .npmrc — not --prefix: cmd.exe never parses an environment
+    # value, so a folder with &, ( or a literal %NAME% in it reaches npm exactly as it is.
+    res = _run(args, _INSTALL_TIMEOUT,
+               **({"env_extra": {"npm_config_prefix": prefix}} if prefix else {}))
     if not res:
         return (False, "couldn't launch npm")
     rc, out, err = res

@@ -4,9 +4,22 @@ Everything is monkeypatched so no real npm / CLI is ever spawned; these assert t
 decision / parsing / caching / degradation logic. Cross-platform: the module is stdlib-only
 and the Windows console flag is 0 off-Windows."""
 import json
+import os
+import sys
 import time
 
+import pytest
+
 import cliupdate as cu
+
+_REAL_NPM_PREFIX = cu.npm_prefix
+
+
+@pytest.fixture(autouse=True)
+def _no_real_npm_folder(monkeypatch):
+    """run_update asks npm_prefix where the running CLI lives: on a developer's machine that
+    is their real %APPDATA%\\npm. The prefix tests below use _REAL_NPM_PREFIX on a fake one."""
+    monkeypatch.setattr(cu, "npm_prefix", lambda cli="claude": None)
 
 
 # ── version parsing (numeric, not lexical) ──────────────────────────────────────────
@@ -204,3 +217,121 @@ def test_codex_run_update_installs_the_codex_package(monkeypatch, tmp_path):
     monkeypatch.setattr(cu, "_CODEX_CACHE_PATH", tmp_path / "codex.json")
     assert cu.run_update(cli="codex") == (True, "0.161.0")
     assert ["npm", "install", "-g", "@openai/codex@latest"] in calls
+
+
+# ── npm on a network that inspects HTTPS (UNABLE_TO_GET_ISSUER_CERT_LOCALLY, 1.25.2) ──
+
+def test_npm_runs_with_the_certificates_windows_trusts(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(cu, "_windows_ca_pem", lambda: r"C:\state\windows-ca.pem")
+    monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
+    monkeypatch.delenv("NODE_USE_SYSTEM_CA", raising=False)
+
+    class R:
+        returncode, stdout, stderr = 0, b"", b""
+
+    def fake_run(args, **kw):
+        seen.update(kw)
+        return R()
+    monkeypatch.setattr(cu.subprocess, "run", fake_run)
+    cu._run(["npm", "view", "x", "version"], 5)
+    assert seen["env"]["NODE_USE_SYSTEM_CA"] == "1"
+    assert seen["env"]["NODE_EXTRA_CA_CERTS"] == r"C:\state\windows-ca.pem"
+
+
+def test_certificate_settings_someone_already_made_are_kept(monkeypatch):
+    monkeypatch.setattr(cu, "_windows_ca_pem", lambda: r"C:\state\windows-ca.pem")
+    monkeypatch.setenv("NODE_EXTRA_CA_CERTS", r"C:\it\proxy-root.pem")
+    monkeypatch.setenv("NODE_USE_SYSTEM_CA", "0")
+    env = cu._npm_env()
+    assert env["NODE_EXTRA_CA_CERTS"] == r"C:\it\proxy-root.pem"
+    assert env["NODE_USE_SYSTEM_CA"] == "0"
+
+
+def test_no_certificate_file_still_runs_npm(monkeypatch):
+    monkeypatch.setattr(cu, "_windows_ca_pem", lambda: None)
+    monkeypatch.delenv("NODE_EXTRA_CA_CERTS", raising=False)
+    env = cu._npm_env()
+    assert "NODE_EXTRA_CA_CERTS" not in env and env["NODE_USE_SYSTEM_CA"] == "1"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows certificate store")
+def test_the_windows_roots_file_loads_and_is_written_once(monkeypatch, tmp_path):
+    from test_windowsca import openssl_loads
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(cu, "_ca_pem", None)
+    pem = cu._windows_ca_pem()
+    assert pem == str(tmp_path / "claude-overlay" / "windows-ca.pem")
+    blocks = open(pem, encoding="ascii").read().count("-----BEGIN CERTIFICATE-----")
+    assert blocks > 0 and openssl_loads(pem) == blocks
+    stamp = os.stat(pem).st_mtime_ns
+    assert cu._windows_ca_pem() == pem and os.stat(pem).st_mtime_ns == stamp   # once a run
+    os.remove(pem)
+    assert cu._windows_ca_pem() == pem and os.path.isfile(pem)   # gone: written again
+    assert not [p for p in os.listdir(tmp_path / "claude-overlay") if p.endswith(".partial")]
+
+
+# ── which copy an update replaces: the one that runs ──
+
+def _npm_folder(tmp_path, pkg_parts, shim):
+    folder = tmp_path / "npm"
+    (folder.joinpath("node_modules", *pkg_parts)).mkdir(parents=True)
+    (folder / shim).write_text("@echo off")
+    return folder
+
+
+def test_npm_prefix_is_the_folder_of_the_running_shim(monkeypatch, tmp_path):
+    folder = _npm_folder(tmp_path, ["@openai", "codex"], "codex.CMD")   # PATHEXT's own case
+    monkeypatch.setattr(cu.shutil, "which", lambda name: str(folder / "codex.CMD"))
+    assert _REAL_NPM_PREFIX("codex") == str(folder)
+
+
+def test_a_native_or_foreign_install_is_not_npms(monkeypatch, tmp_path):
+    native = tmp_path / "claude.exe"
+    native.write_text("")
+    monkeypatch.setattr(cu.shutil, "which", lambda name: str(native))
+    assert _REAL_NPM_PREFIX("claude") is None                  # ~/.local/bin/claude.exe
+    lone = tmp_path / "bin"
+    lone.mkdir()
+    (lone / "claude.cmd").write_text("")                       # a shim with no package by it
+    monkeypatch.setattr(cu.shutil, "which", lambda name: str(lone / "claude.cmd"))
+    assert _REAL_NPM_PREFIX("claude") is None
+    monkeypatch.setattr(cu.shutil, "which", lambda name: None)
+    assert _REAL_NPM_PREFIX("claude") is None and not cu.npm_managed("claude")
+
+
+def test_cmd_reads_an_argument_with_an_ampersand_as_one_argument(monkeypatch, tmp_path):
+    """Windows' list quoting quotes only for spaces: an & went to cmd bare and ended the
+    command there."""
+    assert cu._cmdline(["echo", r"D:\Tools&Apps\npm"]) == 'echo "D:\\Tools&Apps\\npm"'
+    assert cu._cmdline(["npm", "view", "x", "version"]) == "npm view x version"
+    if sys.platform == "win32":
+        monkeypatch.setattr(cu, "_windows_ca_pem", lambda: None)   # no real state file
+        rc, out, err = cu._run(["echo", str(tmp_path / "a&b (c)")], 30)
+        assert rc == 0 and not err.strip()              # nothing ran as a second command
+        assert "a&b (c)" in out
+
+
+def test_the_update_goes_into_the_folder_that_runs(monkeypatch, tmp_path):
+    """An .npmrc prefix moved since the install must not get a second copy that never runs."""
+    calls = []
+    monkeypatch.setattr(cu, "npm_prefix", lambda cli="claude": r"D:\%USERNAME% & co\npm")
+    monkeypatch.setattr(cu, "_find_npm", lambda: "npm")
+    monkeypatch.setattr(cu, "_run", lambda args, timeout, env_extra=None: (
+        calls.append((args, env_extra)), (0, "", ""))[1])
+    monkeypatch.setattr(cu, "installed_version", lambda: "2.1.204")
+    monkeypatch.setattr(cu, "_CACHE_PATH", tmp_path / "c.json")
+    assert cu.run_update() == (True, "2.1.204")
+    assert calls[-1] == (["npm", "install", "-g", "@anthropic-ai/claude-code@latest"],
+                         {"npm_config_prefix": r"D:\%USERNAME% & co\npm"})
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="cmd.exe")
+def test_a_folder_in_the_environment_reaches_the_child_exactly(monkeypatch):
+    """cmd expands %NAME% even inside quotes; it never touches the environment it hands on."""
+    monkeypatch.setattr(cu, "_windows_ca_pem", lambda: None)
+    monkeypatch.setenv("OV_SEGMENT", "expanded")
+    odd = r"C:\%OV_SEGMENT% & (x)\npm"
+    rc, out, _err = cu._run(["set", "npm_config_prefix"], 30,
+                            env_extra={"npm_config_prefix": odd})
+    assert rc == 0 and ("npm_config_prefix=" + odd) in out

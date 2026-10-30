@@ -3,6 +3,44 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.26.0] - 2026-10-30
+
+The Claude and Codex CLIs now update themselves at launch, and Codex setup works on a PC
+that already has npm — including on networks that inspect HTTPS.
+
+### Added
+- **The CLIs update on their own.** Every launch checks both the Claude and the Codex CLI
+  against the latest release, and one that's behind is updated without a click when npm
+  installed it (a native Claude install updates itself and is left alone). A CLI the
+  overlay is using is paused for it — never mid-reply — and resumed on the same
+  conversation, with anything typed meanwhile sent right after; a failed update says why,
+  offers a retry, and the next launch tries again. One update runs at a time (the button's
+  too), the Claude ⇄ Codex switch waits for it, and npm installs into the folder the
+  running CLI came from. `CLI_AUTO_UPDATE: false` keeps the old notice-and-button
+  behaviour.
+
+### Fixed
+- **The one-click Claude CLI update could fail on the overlay's own Claude process**: the
+  running `claude.exe` can't be replaced on Windows. Like the Codex one, it now pauses
+  Claude for the update and resumes the conversation.
+- **On a network that inspects HTTPS, npm couldn't install the Codex CLI**
+  (`UNABLE_TO_GET_ISSUER_CERT_LOCALLY`). Such a network re-signs every site with the
+  organisation's own root certificate; Windows trusts it, but Node.js checks its own
+  built-in list. npm now also gets the root certificates Windows trusts — read from the
+  store by a newer Node.js, and as a file (`%LOCALAPPDATA%\claude-overlay\windows-ca.pem`)
+  for an older one — in the Codex setup and in the overlay's one-click CLI update. Nothing
+  is switched off: every certificate is still checked, and a `NODE_EXTRA_CA_CERTS` you set
+  yourself is kept.
+- **Codex setup could fail without a word on a PC that already had Node.js.** "Installing it
+  with npm" went straight to "Codex CLI not installed", with nothing from npm in between —
+  which is what an npm configured to be silent (`loglevel=silent` in an `.npmrc`) does: it
+  hides its errors and its success alike. The setup now has npm report at its default level,
+  and a failed install ends with npm's exit code and which npm and Node.js ran.
+- **A Codex CLI that npm installed into a folder the overlay doesn't search is installed
+  again where it does.** npm's global folder can be moved by an `.npmrc` prefix, or be
+  Node's own admin-only folder when Node.js didn't come from the official installer; the
+  setup now tries once more into your own `%APPDATA%\npm`.
+
 ## [1.25.2] - 2026-10-29
 
 Codex setup now works on a PC without Node.js or admin rights, and a setup that doesn't

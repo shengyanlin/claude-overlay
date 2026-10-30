@@ -91,14 +91,77 @@ if errorlevel 1 goto manual
 
 :npm
 set "WHY=npm-failed"
+rem A network that inspects HTTPS re-signs every site with the organisation's own root
+rem certificate, which Windows trusts and Node.js's built-in list doesn't: npm then fails with
+rem UNABLE_TO_GET_ISSUER_CERT_LOCALLY (a field report on 1.25.2). So npm gets Windows' roots
+rem too -- NODE_USE_SYSTEM_CA for a Node.js that can read the store itself, and the same roots
+rem as a file in NODE_EXTRA_CA_CERTS for one that can't. windowsca.py writes that file, and
+rem only roots Windows itself accepts for HTTPS (see its header); the overlay's CLI update
+rem uses the same module. Its Python: the one setup.cmd / update.cmd found (%PY%), the one
+rem the overlay runs on (OV_PYTHON, from its Set up Codex button), else a `python` on PATH.
+rem Nothing is turned off: npm still checks every certificate. Either variable already set is
+rem kept -- whoever set it knew what this network needs.
+if not defined NODE_USE_SYSTEM_CA set "NODE_USE_SYSTEM_CA=1"
+if defined NODE_EXTRA_CA_CERTS goto npmgo
+if not exist "%~dp0windowsca.py" goto npmgo
+rem Unquoted set: %PY% carries its own quotes ("C:\...\python.exe") or none (py -3), and an
+rem & in a quoted path stays inside them.
+if not defined PY if defined OV_PYTHON set PY="%OV_PYTHON%"
+if defined PY goto capy
+call python -c "pass" >nul 2>nul
+if errorlevel 1 goto npmgo
+set "PY=python"
+:capy
+call %PY% "%~dp0windowsca.py" "%STATEDIR%\windows-ca.pem" >nul 2>nul
+if errorlevel 1 goto npmgo
+if exist "%STATEDIR%\windows-ca.pem" set "NODE_EXTRA_CA_CERTS=%STATEDIR%\windows-ca.pem"
+:npmgo
 echo     Installing it with npm  ^(npm install -g @openai/codex^) ...
 rem `call`: npm and codex are .cmd shims, and a .cmd run without call never returns here.
-call npm install -g @openai/codex
+rem --loglevel notice is npm's own default, said out loud. A second field report (1.25.2, a PC
+rem that HAS npm) had this step print nothing at all and fail -- which is exactly what an npm
+rem configured silent does (loglevel=silent in an .npmrc, or npm_config_loglevel): it hides
+rem its errors along with everything else, and a silent success looks the same.
+call npm install -g @openai/codex --loglevel notice
+set "NPMRC=%errorlevel%"
 where codex >nul 2>nul
-if errorlevel 1 goto manual
+if not errorlevel 1 goto npmok
+rem Still no codex on PATH. npm's global folder can be one that neither this script nor the
+rem overlay looks in: a prefix set in an .npmrc, or a Node.js not from the official installer,
+rem whose global folder is Node's own (often admin-only, so the install failed). So once more,
+rem into the folder both do look in and a standard user can always write to -- unless that
+rem already was npm's folder, where a second try would only fail the same way.
+set "NPMPREFIX="
+for /f "delims=" %%P in ('npm prefix -g 2^>nul') do set "NPMPREFIX=%%P"
+if not defined NPMPREFIX goto npmretry
+if /i "%NPMPREFIX%"=="%APPDATA%\npm" goto npmfail
+echo     npm's global folder is "%NPMPREFIX%", which isn't where codex is looked for.
+:npmretry
+echo     Trying again into "%APPDATA%\npm" ...
+call npm install -g @openai/codex --loglevel notice --prefix "%APPDATA%\npm"
+set "NPMRC=%errorlevel%"
+where codex >nul 2>nul
+if errorlevel 1 goto npmfail
+:npmok
 set "WHY="
 echo [OK] codex CLI installed.
 goto login
+
+:npmfail
+rem What ran and how it ended, for the screenshot that gets sent: with --loglevel notice an
+rem npm that fails says why above, so one that printed nothing never got going at all.
+rem `if defined`, not "%NPMAT%": a %var% in a for body is read once, before the first line.
+set "NPMAT="
+for /f "delims=" %%N in ('where npm 2^>nul') do if not defined NPMAT set "NPMAT=%%N"
+if not defined NPMAT set "NPMAT=not found"
+set "NODEVER=not on PATH"
+for /f "delims=" %%V in ('node --version 2^>nul') do set "NODEVER=%%V"
+echo [!] npm couldn't install the codex CLI ^(npm exit code %NPMRC%^) -- npm's messages above
+echo     say why. npm: "%NPMAT%"   Node.js: %NODEVER%
+echo     If npm printed nothing above, it never got to run -- security software that blocks
+echo     node.exe does that. A certificate error ^(UNABLE_TO_GET_ISSUER_CERT_LOCALLY and the
+echo     like^) even with Windows' certificates: ask IT for this network's root certificate.
+goto manual
 
 :found
 echo [OK] codex CLI found.

@@ -4,6 +4,7 @@ Sibling of test_ui_cli_update.py, for the OTHER update: the overlay updating its
 update.cmd. Drives the real Overlay methods on the shared hidden-root fixture and asserts the
 chat text / embedded-button state. update.cmd is never spawned — run_overlay_update is stubbed
 wherever a click is exercised, and the notice/result handlers spawn nothing at all."""
+import os
 import sys
 import tkinter as tk
 
@@ -274,6 +275,20 @@ def test_the_launchers_run_from_a_folder_with_an_ampersand_and_parentheses(tmp_p
     monkeypatch.setattr(win32utils, "_CREATE_NEW_CONSOLE", 0)
     assert win32utils.run_overlay_update(str(app)) == (True, "")
     assert win32utils.run_codex_setup(str(app)) == 7
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="cmd.exe")
+def test_the_codex_setup_is_told_which_python_to_use(tmp_path, monkeypatch):
+    """install-codex.cmd runs windowsca.py (Windows' certificates for npm) with OV_PYTHON:
+    this interpreter, as the console python.exe beside it when the overlay runs on pythonw."""
+    (tmp_path / "install-codex.cmd").write_text('@echo %OV_PYTHON%> "%~dp0seen.txt"\n')
+    monkeypatch.setattr(win32utils, "_CREATE_NEW_CONSOLE", 0)
+    for exe, want in ((sys.executable, sys.executable),
+                      (os.path.join(os.path.dirname(sys.executable), "pythonw.exe"),
+                       os.path.join(os.path.dirname(sys.executable), "python.exe"))):
+        monkeypatch.setattr(win32utils.sys, "executable", exe)
+        assert win32utils.run_codex_setup(str(tmp_path)) == 0
+        assert (tmp_path / "seen.txt").read_text().strip() == want
 
 
 def test_run_codex_setup_without_the_script_or_on_a_failed_launch_is_none(tmp_path, monkeypatch):

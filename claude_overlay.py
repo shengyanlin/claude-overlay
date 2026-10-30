@@ -773,6 +773,8 @@ class Overlay:
         self.expanded = True
         self._toggle_request = False
         self._model = None
+        self._chosen_model = None   # the model the user picked this session (menu value), if any
+        self._resume_started = None # monotonic time a Resume click went to the worker, until it lands
         self._ctx_pct = None
         self._ctx_tokens = None         # absolute context size, for pricing a would-be /compact
         self._ctx_hist: list = []       # context % at the end of each of the last few turns →
@@ -831,6 +833,9 @@ class Overlay:
         self._update_available = None     # set to the newer version string if one exists
         self._cli_update_shown = False    # show the "CLI is out of date" notice at most once/session
         self._cli_update_btn_ref = None   # the in-chat Update button, so its result can restyle it
+        self._cli_op = None               # the CLI ("claude"/"codex") an update is running for
+        self._cli_auto_queue = []         # launch auto-updates waiting their turn
+        self._cli_auto_after = None       # the pending two-second re-check, if any
         self._ov_update_shown = False     # show the "a newer overlay exists" notice at most once
         self._ov_update_btn_ref = None    # the in-chat Update-overlay button, same restyle path
         self._session_id = None           # the CLI's id for the current conversation (worker
@@ -1083,6 +1088,10 @@ class Overlay:
         target = "codex" if target == "codex" else "claude"
         if target == self.provider or self._switching:
             return False
+        if not force and getattr(self, "_cli_op", None):
+            # npm may be replacing the very CLI the new agent would start (_begin_cli_update)
+            self.add_sys("⏳ A CLI update is running — switch once it's done (about a minute).")
+            return False
         if not force and not self._refresh_cli_ok().get(target, True):
             self._paint_provider_switch()
             self._explain_missing_cli(target)
@@ -1112,6 +1121,7 @@ class Overlay:
             self.provider = target
             self.effort = _startup_effort(target)
             self._model = None
+            self._chosen_model = None      # the other agent's models are a different list
             self._quota = self._quota_polled = self._quota_said = None
             self._ring_explained = target in told
             self._codex_models = []
@@ -1684,20 +1694,29 @@ class Overlay:
         release, surface a one-click update notice (see cliupdate.py). The overlay and the CLI
         update independently — a current overlay still drives whatever CLI is installed, and an
         old CLI silently runs an older model. Silent on any failure (no npm, offline, corporate
-        proxy) so it never blocks or nags; the check is throttled to once/day inside cliupdate."""
+        proxy) so it never blocks or nags; the check is throttled to once/day inside cliupdate.
+
+        With CLI_AUTO_UPDATE (the default) it is the launch's look at BOTH CLIs, asked fresh
+        every launch rather than once a day, and a behind CLI that npm installed is updated
+        on its own (_auto_update_cli); one npm didn't install gets the notice as before."""
         cli = self.provider
         checked = self.__dict__.setdefault("_cli_update_checked", set())
         if not CLI_UPDATE_CHECK or cli in checked:
             return                       # once per agent per session (the switch re-calls this)
-        checked.add(cli)
+        auto = bool(CLI_AUTO_UPDATE)
+        clis = [cli] + ([c for c in ("claude", "codex") if c != cli and c not in checked]
+                        if auto else [])
+        checked.update(clis)
         def work():
-            try:
-                from cliupdate import check_update
-                info = check_update(cli=cli)
-                if info and info.get("behind"):
-                    self.ui_q.put(("cli_update", dict(info, cli=cli)))
-            except Exception:
-                pass
+            for c in clis:               # the live agent's first: it's the one in use
+                try:
+                    from cliupdate import check_update, npm_managed
+                    info = check_update(force=auto, cli=c)
+                    if info and info.get("behind"):
+                        kind = "cli_auto_update" if auto and npm_managed(c) else "cli_update"
+                        self.ui_q.put((kind, dict(info, cli=c)))
+                except Exception:
+                    pass
         threading.Thread(target=work, name="cli-update-check", daemon=True).start()
 
     def _apply_share_visibility(self):
@@ -4672,6 +4691,7 @@ class Overlay:
                 return "break"
             set_state("working")
             self._set_status("resuming last conversation…")
+            self._resume_started = time.monotonic()
             self.worker.resume(session_id)
             return "break"
         c._click = on_click          # a named handle so the routing is directly testable
@@ -4873,6 +4893,7 @@ class Overlay:
                 return "break"
             set_state("resuming")
             self._set_status("resuming that conversation…")
+            self._resume_started = time.monotonic()
             self.worker.resume(session.id)
             return "break"
 
@@ -5015,37 +5036,35 @@ class Overlay:
     def _cli_update_btn(self, latest, cli="claude"):
         """The 'your CLI is behind' button: runs `npm install -g @anthropic-ai/claude-code@latest`
         (cliupdate.run_update) off the UI thread, then offers a restart so the newest models load.
-        Imported inside the worker so a broken/absent cliupdate can't cost us the button."""
-        self._cli_update_target = cli
+        Imported inside the worker so a broken/absent cliupdate can't cost us the button.
+
+        A click claims the one CLI update that may run at a time (_begin_cli_update, on this
+        thread) — refused while the live agent is replying or another update runs — and the
+        result handler releases it. The target is recorded at the click, not here: a chat can
+        hold a Claude button and a Codex one."""
+        def can_start():
+            why = self._begin_cli_update(cli)
+            if why == "ok":
+                self._cli_update_target = cli
+            elif why == "busy":
+                self.add_sys("⏳ That CLI update waits for the reply to finish — click again then.")
+            else:
+                self.add_sys("⏳ Another CLI update is running — click again once it's done.")
+            return why == "ok"
 
         def work():
             from cliupdate import run_update
-            if cli == "codex":
-                # The overlay's own app-server holds codex.exe open, and Windows won't let
-                # npm replace a running binary — so Codex is stopped for the update and
-                # started again (on the same conversation) once it's done.
-                done = threading.Event()
-                self.ui_q.put(("codex_pause", done))     # Tk is touched on its own thread only
-                done.wait(10)
-                # Wait for the worker to finish its teardown (it closes app-server and waits
-                # for the process), off the Tk thread. A worker stuck in a long request can't
-                # see "stop" until it returns, so past a bound the process is killed outright.
-                old = getattr(self, "_paused_worker", None)
-                if old is not None:
-                    try:
-                        old.join(15)
-                        if old.is_alive():
-                            getattr(old, "kill_server", lambda: None)()
-                            old.join(5)
-                    except Exception:
-                        pass
+            if not self._wait_cli_released():
+                name = "Codex" if cli == "codex" else "Claude"
+                return (False, f"{name} didn't stop in time, so the update wasn't started")
             return run_update(cli=cli)
         return self._one_click_update_btn(
             {"idle": f"⬆  Update CLI to v{latest}",
              "working": "Updating…  (≈1 min)",
              "done": "✓  Updated — click to restart",
              "error": "⚠  Update failed — click to retry"},
-            work, "cli-update", "_cli_update_btn_ref", "cli_update_result")
+            work, "cli-update", "_cli_update_btn_ref", "cli_update_result",
+            can_start=can_start)
 
     def _show_cli_update_result(self, payload):
         """Restyle the Update button to its final state and print a follow-up line: success →
@@ -5061,8 +5080,8 @@ class Overlay:
             except Exception:
                 pass
         cli = getattr(self, "_cli_update_target", "claude")
+        resumed = self._end_cli_update()         # back on the same conversation, either way
         if cli == "codex":
-            self._resume_codex()             # back on the same conversation, either way
             if ok:
                 self.add_sys(f"✅ Codex CLI updated to v{msg} — Codex has restarted on it and "
                              "kept your conversation.")
@@ -5070,17 +5089,82 @@ class Overlay:
                 self.add_err(f"Codex CLI update didn't complete — {msg}. You can also update "
                              "from a terminal:  npm install -g @openai/codex@latest  (close the "
                              "Codex app first if it's open).")
-            return
-        if ok:
+        elif ok and resumed:
+            self.add_sys(f"✅ Claude CLI updated to v{msg} — Claude has restarted on it and kept "
+                         "your conversation. The button above restarts the whole overlay too, "
+                         "if you like (or do it later).")
+        elif ok:
             self.add_sys(f"✅ Claude CLI updated to v{msg}. Click the button above to restart the "
                          "overlay now and load the newest models (or restart it yourself later).")
         else:
             self.add_err(f"CLI update didn't complete — {msg}. You can also update from a terminal: "
                          " npm install -g @anthropic-ai/claude-code@latest")
+        self._cli_auto_next()                    # an automatic one may be waiting its turn
+
+    # ── one CLI update at a time: the claim, the pause, the release ──────────────────────
+
+    def _begin_cli_update(self, cli):
+        """Tk thread. Claim the one CLI update that may run at a time — the button's and the
+        launch's automatic ones share it, so two `npm install -g` never run at once and only
+        the claim's owner ever pauses and resumes the live worker. Returns "ok", "busy" (the
+        live agent is replying, switching or compacting: try again later) or "taken" (another
+        update holds it).
+
+        When `cli` is the live agent, its worker holds the CLI's exe open (claude.exe, Codex's
+        app-server) and Windows won't let npm replace a running binary, so the worker is paused
+        HERE, in the same Tk callback that saw it idle — nothing can start a reply in between."""
+        if getattr(self, "_cli_op", None):
+            return "taken"
+        live = cli == self.provider
+        started = getattr(self, "_resume_started", None)
+        resuming = started is not None and time.monotonic() - started < 90   # never lands: 90 s
+        if live and (self.busy or resuming or getattr(self, "_switching", False)
+                     or getattr(self, "_compacting", False)
+                     or getattr(self, "_codex_paused", False)):
+            return "busy"
+        self._cli_op = cli
+        self._paused_worker = None
+        if live:
+            self._pause_live_worker(f"updating the {'Codex' if cli == 'codex' else 'Claude'} CLI…")
+        return "ok"
+
+    def _wait_cli_released(self):
+        """Off the Tk thread, before npm runs: wait for the paused worker's teardown (it closes
+        its CLI process). A worker stuck in a long request can't see "stop" until it returns, so
+        past a bound Codex's server is killed outright. False when the old worker is STILL
+        alive — npm would only fail on the locked exe, or replace it under a running process."""
+        old = getattr(self, "_paused_worker", None)
+        if old is None:
+            return True
+        try:
+            old.join(15)
+            alive = getattr(old, "is_alive", lambda: False)
+            if alive():
+                getattr(old, "kill_server", lambda: None)()
+                old.join(5)
+            return not alive()
+        except Exception:
+            return True
+
+    def _end_cli_update(self):
+        """Tk thread. Release the claim and put the paused worker back (if this update paused
+        one) on the same conversation. True when a worker was resumed."""
+        self._cli_op = None
+        return self._resume_live_worker()
 
     def _pause_codex(self):
-        """Stop the Codex worker (and its app-server, which holds codex.exe) for an update."""
-        if self.provider != "codex" or getattr(self, "_codex_paused", False):
+        """The Codex CLI update's pause: stop the Codex worker (and its app-server, which holds
+        codex.exe). A no-op unless Codex is the live agent."""
+        if self.provider == "codex":
+            self._pause_live_worker("updating the Codex CLI…")
+
+    def _resume_codex(self):
+        self._resume_live_worker()
+
+    def _pause_live_worker(self, status):
+        """Stop the live worker for an update of the CLI it runs; messages typed meanwhile line
+        up and go out on the same conversation once _resume_live_worker has started a new one."""
+        if getattr(self, "_codex_paused", False):
             return
         self._codex_paused = True
         self._paused_worker = self.worker
@@ -5095,20 +5179,108 @@ class Overlay:
         # land and clear busy — and a send then would go into a worker that is shutting down.
         self._purge_worker_events()
         self._set_busy(True)                 # Enter now lines messages up; they go out once
-        self._set_status("updating the Codex CLI…")   # the restarted Codex is there
+        self._set_status(status)             # the restarted worker is there
 
-    def _resume_codex(self):
+    def _resume_live_worker(self):
+        """Start a fresh worker for the live agent, resuming the conversation — True when there
+        was a paused one to replace. A Clear clicked during the update went to the stopped
+        worker, whose reset_done never comes: the fresh worker IS that new conversation, so
+        it isn't resumed, and the Clear's hold on the line-up is lifted here."""
         if not getattr(self, "_codex_paused", False):
-            return
+            return False
         self._codex_paused = False
         self._paused_worker = None
+        cleared = self._discard_pending
+        self._discard_pending = False
         self.worker = self._make_worker("plan" if self.read_only else self._full_mode)
         self.worker.start()
-        if self._session_id:
+        if self._session_id and not cleared:
             self.worker.resume(self._session_id)
+        if self._chosen_model:
+            # A new worker starts on the configured model; the one picked from the menu this
+            # session comes back (queued behind the resume, so it applies to that session).
+            self.worker.set_model(self._chosen_model)
         self._set_busy(False)
         self._set_status("")
         self._queue_kick()                   # anything typed during the update goes out now
+        return True
+
+    # ── CLI auto-update at launch (CLI_AUTO_UPDATE) ─────────────────────────────────────
+
+    def _auto_update_cli(self, info):
+        """A CLI the launch check found behind, and that npm installed: update it without a
+        click. Lined up and run one at a time (see _begin_cli_update) by _cli_auto_next."""
+        if not isinstance(info, dict) or info.get("cli") not in ("claude", "codex"):
+            return
+        q = self.__dict__.setdefault("_cli_auto_queue", [])
+        if any(i.get("cli") == info["cli"] for i in q):
+            return
+        q.append(info)
+        self._cli_auto_next()
+
+    def _cli_auto_next(self):
+        """Start the next lined-up CLI update — never in the middle of a reply. While the live
+        agent is busy it re-checks every two seconds (one timer at a time); while another
+        update holds the claim it waits for that one's result, which calls back here."""
+        q = self.__dict__.setdefault("_cli_auto_queue", [])
+        if not q:
+            return
+        info = q[0]
+        cli = info["cli"]
+        why = self._begin_cli_update(cli)
+        if why == "busy":
+            if getattr(self, "_cli_auto_after", None) is None:
+                def again():
+                    self._cli_auto_after = None
+                    self._cli_auto_next()
+                self._cli_auto_after = self.root.after(2000, again)
+            return
+        if why != "ok":
+            return
+        q.pop(0)
+        name = "Codex" if cli == "codex" else "Claude"
+        live = cli == self.provider
+        self.add_sys(f"⬆ Updating the {name} CLI v{info.get('installed', '?')} → "
+                     f"v{info.get('latest', '?')} on its own — a new version is out (≈1 min)."
+                     + (" Messages you send meanwhile go out once it's back, on this "
+                        "conversation." if live else ""))
+
+        def work():
+            try:
+                if not self._wait_cli_released():
+                    ok, msg = False, f"{name} didn't stop in time, so the update wasn't started"
+                else:
+                    from cliupdate import run_update
+                    ok, msg = run_update(cli=cli)
+            except Exception as e:
+                ok, msg = False, type(e).__name__
+            self.ui_q.put(("cli_auto_result", (cli, bool(ok), str(msg), info)))
+        threading.Thread(target=work, name="cli-auto-update", daemon=True).start()
+
+    def _show_cli_auto_result(self, payload):
+        """Say how the automatic update went, put the paused worker back (same conversation),
+        release the claim and start the next one. A failure leaves the one-click button for a
+        retry; the next launch tries again by itself."""
+        resumed = self._end_cli_update()
+        try:
+            cli, ok, msg, info = payload
+        except Exception:
+            self._cli_auto_next()
+            return
+        name = "Codex" if cli == "codex" else "Claude"
+        if ok:
+            self.add_sys(f"✅ {name} CLI updated to v{msg}"
+                         + (f" — {name} has restarted on it and kept your conversation."
+                            if resumed else "."))
+        else:
+            self.add_err(f"⚠ Couldn't update the {name} CLI on its own — {msg}. The next launch "
+                         "tries again; to retry now:")
+            self.chat.insert("end", "\n")
+            self.chat.window_create("end", window=self._cli_update_btn(info.get("latest", "?"), cli),
+                                    padx=self.px(16), pady=self.px(2))
+            self.chat.insert("end", "\n")
+            self._scroll_follow()
+        self._cli_auto_next()
 
     # ── "a newer overlay exists" notice + one-click update (runs update.cmd) ────────────
 
@@ -7036,6 +7208,7 @@ class Overlay:
             self.add_sys("⏳ Finish (or Stop) the current reply before switching model.")
             return
         self._set_status("switching model…")
+        self._chosen_model = val            # a worker restarted for a CLI update gets it back
         self.worker.set_model(val)
 
     # ── ⚡ effort switcher (statusline) ──
@@ -7308,11 +7481,6 @@ class Overlay:
                     self.add_err("⚠ Codex isn't signed in, so every message would fail. In a "
                                  "terminal, run:  codex login  — the overlay notices the new "
                                  "login on its own, no restart needed.")
-        elif kind == "codex_pause":      # a Codex CLI update needs codex.exe released
-            try:
-                self._pause_codex()
-            finally:
-                payload.set()
         elif kind == "codex_sandbox":
             self._codex_sandbox = str(payload or "") or None
         elif kind == "approval":
@@ -7340,6 +7508,7 @@ class Overlay:
             if not self._discard_pending:   # ignore a stale id from a Cleared conversation
                 self._session_id = str(payload)
         elif kind == "resumed":
+            self._resume_started = None
             self._has_turns = True       # the resumed context is content, even unseen
             self._paint_provider_switch()
             self._set_status("")
@@ -7354,6 +7523,7 @@ class Overlay:
                          "keep going.")
             self._persist_session()      # keep it resumable even if no new turn follows
         elif kind == "resume_failed":
+            self._resume_started = None
             self._set_status("")
             self._forget_sent_shots()    # whatever session we're on, it isn't the one the
                                          # dedupe cache was describing
@@ -7548,6 +7718,10 @@ class Overlay:
             self._show_cli_update_notice(payload)
         elif kind == "cli_update_result":
             self._show_cli_update_result(payload)
+        elif kind == "cli_auto_update":
+            self._auto_update_cli(payload)
+        elif kind == "cli_auto_result":
+            self._show_cli_auto_result(payload)
 
     # ── Codex approvals ──
     _APPROVAL_HEADS = {"command": "Codex wants to run a command",
