@@ -13,7 +13,9 @@ Behaviour knobs (environment):
   FAKE_CODEX_USED    the 5-hour window's used percent (default 40)
 Turn behaviour is keyed off the prompt text:
   APPROVE → asks for command approval first; FAIL → the turn fails on a usage limit;
-  SLOW → runs until turn/interrupt; DIE → the process exits mid-turn.
+  SLOW → runs until turn/interrupt; DIE → the process exits mid-turn;
+  REVIEW → an auto-review approves a command first (REVIEW DENY → it refuses it; shapes
+  from the codex-cli 0.166.0 schema, item/autoApprovalReview/*).
 """
 import json
 import os
@@ -137,7 +139,22 @@ def handle(msg):
             note("turn/started", {"threadId": tid, "turn": {"id": turn_id}})
             sys.stdout.flush()
             os._exit(3)
-        if "APPROVE" in text:
+        if "REVIEW" in text:
+            note("turn/started", {"threadId": tid, "turn": {"id": turn_id}})
+            action = {"type": "command", "cwd": "C:\\work", "source": "shell",
+                      "command": '"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" '
+                                 "-Command 'Remove-Item build'"}
+            base = {"threadId": tid, "turnId": turn_id, "reviewId": "r1", "targetItemId": "c9",
+                    "startedAtMs": 1790000000000, "action": action}
+            note("item/autoApprovalReview/started",
+                 dict(base, review={"status": "inProgress"}))
+            note("item/autoApprovalReview/completed", dict(
+                base, completedAtMs=1790000004000, decisionSource="agent",
+                review={"status": "denied" if "DENY" in text else "approved", "riskLevel": "high",
+                        "rationale": "Deleting the build folder is destructive and was not "
+                                     "asked for."}))
+            turn_events(tid, turn_id, tool=False)
+        elif "APPROVE" in text:
             note("turn/started", {"threadId": tid, "turn": {"id": turn_id}})
             _state["approval"] = (900, tid, turn_id)
             send({"id": 900, "method": "item/commandExecution/requestApproval",

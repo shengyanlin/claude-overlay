@@ -3,6 +3,29 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.26.1] - 2026-11-05
+
+Codex on a PC with a managed Codex policy now works without an approval for every step, and
+a working Codex sandbox is no longer mistaken for a broken one.
+
+### Changed
+- **Codex on a managed PC no longer asks you to approve every step.** Where the machine's
+  Codex policy forbids running without approvals, each "may I step outside the sandbox?"
+  now goes to Codex's own auto-review — a reviewer that weighs the risk and approves or
+  denies — instead of an Allow / Deny card, so Codex works hands-free the way Claude does.
+  A refusal shows in the chat with the reviewer's reason. Read-only still asks you, and
+  `CODEX_APPROVALS_REVIEWER: "user"` brings the cards back. PCs without such a policy are
+  unchanged: no sandbox, no prompts.
+
+### Fixed
+- **A working Codex sandbox could be taken for a broken one.** The check that the Windows
+  sandbox can run commands gave up after 15 seconds, but its first setup after a Codex
+  update can take longer, and the overlay then ran Codex read-only for that whole version.
+  The check now gets a minute, in the background: a message sent meanwhile waits at most
+  10 seconds, then goes out read-only.
+- **The "⚡ Full access" line for Codex said it asks before stepping outside the sandbox**,
+  even where it runs with no sandbox and never asks.
+
 ## [1.26.0] - 2026-10-30
 
 The Claude and Codex CLIs now update themselves at launch, and Codex setup works on a PC

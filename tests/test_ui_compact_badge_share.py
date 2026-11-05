@@ -518,6 +518,29 @@ def test_apply_permission_mode_flips_paints_and_confirms(overlay):
     assert overlay.gear.cget("fg") == co.T["muted"]
 
 
+@pytest.mark.parametrize("sandbox, reviewer, says, never_says", [
+    # Unmanaged machine: no sandbox and approvalPolicy "never" — nothing will ask.
+    ("danger-full-access", "auto_review", "without asking", "auto-review"),
+    # Managed policy downgraded it: steps outside go to Codex's auto-review...
+    ("workspace-write", "auto_review", "auto-review, not to you", "asks before"),
+    ("read-only", "auto_review", "auto-review, not to you", "asks before"),
+    # ...or, set back to "user", really do come back as cards.
+    ("workspace-write", "user", "asks before stepping outside", "auto-review"),
+])
+def test_codex_full_access_line_matches_the_sandbox_it_got(overlay, monkeypatch, sandbox,
+                                                           reviewer, says, never_says):
+    monkeypatch.setattr(co, "CODEX_APPROVALS_REVIEWER", reviewer)
+    overlay.provider = "codex"
+    overlay.read_only = True
+    overlay._paint_ro_toggle()
+    overlay._codex_sandbox = sandbox          # the worker reports this before the mode
+    before = chat_text(overlay)
+    overlay._apply_permission_mode(overlay._full_mode)
+    added = chat_text(overlay)[len(before):]
+    assert says in added
+    assert never_says not in added
+
+
 def test_apply_permission_mode_unchanged_mode_is_quiet(overlay):
     # Re-confirming the mode we're already in (e.g. after a failed switch re-sync)
     # must not spam the chat.

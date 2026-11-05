@@ -418,6 +418,13 @@ class TestUserConfig:
         assert len(c.USER_CONFIG_WARNINGS) == 1
         assert "PERMISSION_MODE" in c.USER_CONFIG_WARNINGS[0]
 
+    def test_codex_approvals_go_to_auto_review_by_default(self):
+        # Where a managed policy forbids approvalPolicy "never", every step outside the
+        # sandbox would otherwise be a card the user has to click.
+        assert config.CODEX_APPROVALS_REVIEWER == "auto_review"
+        assert set(config._USER_CONFIG_KEYS["CODEX_APPROVALS_REVIEWER"].allowed) == \
+            {"auto_review", "user"}
+
     def test_effort_defaults_to_auto(self):
         # Measured 2026-10-14/15: an inherited xhigh turned a one-line rewrite into 14-24s
         # (thinking plus a tool detour); "low" answered the same in 3-4s and "auto" in ~2s

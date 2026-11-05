@@ -72,7 +72,15 @@ _SANDBOX_NAMES = {"dangerFullAccess": "danger-full-access",
 # Whether this machine's Windows sandbox can actually run a command in workspace-write,
 # remembered per Codex version (see _probe_workspace_write).
 _PROBE_FILE = STATE_FILE.parent / "codex-sandbox-probe.json"
-_PROBE_TIMEOUT = 15
+# Long enough for the sandbox to set itself up. Measured 2026-11-05 (codex-cli 0.166.0, a
+# managed laptop): the first workspace-write command after an upgrade spent 12s in the
+# setup helper's ACL pass and answered after 18.6s; the next one took 4.3s, and one run
+# while the home folder was busy hadn't finished after 45s. The old 15s (18s for the
+# reply) called a working sandbox broken and cached that for the whole version. The probe
+# runs in the background, so the limit costs no one a wait: a turn waits _PROBE_WAIT at
+# most, then goes out read-only (see _start_turn).
+_PROBE_TIMEOUT = 60
+_PROBE_WAIT = 10
 _RATE_POLL_S = 60          # the allowance, re-read while idle — usage.py's cadence for Claude
 _QUOTA_WARN_AT = 0.80      # Codex sends no "warning" status of its own; this is the tier at
                            # which the UI's once-per-transition notice speaks up
@@ -689,7 +697,8 @@ class CodexWorker(threading.Thread):
     def _sandbox_mode(self, probe_aware=True):
         """The sandbox to ask for: Read-only, or the strongest mode the machine allows at or
         below CODEX_SANDBOX — skipping workspace-write where the probe found it can't run
-        commands. Full access then means read-only WITH approvals: Codex asks to step
+        commands, or hasn't said yet (a turn sent while it runs must not stall in a sandbox
+        that may hang). Full access then means read-only WITH approvals: Codex asks to step
         outside the sandbox, and the reviewer (or the in-chat card) says yes or no."""
         if self._read_only:
             return "read-only"
@@ -698,7 +707,8 @@ class CodexWorker(threading.Thread):
         for mode in _SANDBOX_ORDER[_SANDBOX_ORDER.index(want):]:
             if allowed is not None and mode not in allowed:
                 continue
-            if mode == "workspace-write" and probe_aware and self._ws_ok is False:
+            if mode == "workspace-write" and probe_aware and (self._ws_ok is False
+                                                               or self._ws_probing):
                 continue
             return mode
         return "read-only"
@@ -714,6 +724,19 @@ class CodexWorker(threading.Thread):
             if allowed is None or p in allowed:
                 return p
         return allowed[0] if allowed else "on-request"
+
+    def _approvals_reviewer(self):
+        """Who answers when Codex asks to step outside the sandbox. Nobody is asked under
+        "never", so nothing is sent there. Read-only is the user's own lock, so the user
+        answers — a reviewer that approved a write there would break it. Otherwise
+        CODEX_APPROVALS_REVIEWER: Codex's auto-review by default, which keeps a managed
+        policy's approvals while sparing the user a card for every step."""
+        if self._approval_policy() == "never":
+            return None
+        if self._read_only:
+            return "user"
+        return CODEX_APPROVALS_REVIEWER if CODEX_APPROVALS_REVIEWER in ("auto_review", "user") \
+            else "auto_review"
 
     def _announce_sandbox(self):
         mode = self._sandbox_mode()
@@ -736,14 +759,19 @@ class CodexWorker(threading.Thread):
             why.append("its Windows sandbox can't run commands in workspace-write here "
                        "(the setup helper fails)")
         if why:
+            who = ("Codex's auto-review decides anything that writes or runs outside the "
+                   "sandbox, so you aren't asked." if self._approvals_reviewer() == "auto_review"
+                   else "Codex asks before anything that writes or runs outside the sandbox.")
             self.ui.put(("system", f"🛡 Full access runs in {mode}: " + ", and ".join(why)
-                                   + ". Codex asks before anything that writes or runs "
-                                   "outside the sandbox."))
+                                   + ". " + who))
 
     def _thread_params(self):
         p = {"cwd": WORKING_DIR, "sandbox": self._sandbox_mode(),
              "approvalPolicy": self._approval_policy(),
              "developerInstructions": CODEX_SYSTEM_APPEND}
+        reviewer = self._approvals_reviewer()
+        if reviewer:
+            p["approvalsReviewer"] = reviewer
         if self._model:
             p["model"] = self._model
         return p
@@ -859,8 +887,12 @@ class CodexWorker(threading.Thread):
             self.ui.put(("turn_done", None))
             return
         if self._ws_probing and self._wants_workspace_write():
+            # Wait briefly for the verdict (seconds, usually), not for the whole probe: a
+            # first-time sandbox setup can take most of a minute. A turn that goes out first
+            # runs read-only — steps outside it go to the reviewer — instead of stalling, and
+            # the turns after it get the verdict.
             self.ui.put(("status", "checking Codex's sandbox…"))
-            self._drain_until(lambda: not self._ws_probing, _PROBE_TIMEOUT + 5)
+            self._drain_until(lambda: not self._ws_probing, _PROBE_WAIT)
             self.ui.put(("status", "thinking…"))
         if self._effort == "auto" and not self.models:
             # Auto resolves through the model list, which now loads in the background; it is
@@ -873,6 +905,9 @@ class CodexWorker(threading.Thread):
         params = {"threadId": self._thread_id, "input": items, "summary": "auto",
                   "sandboxPolicy": _SANDBOX_POLICY[self._sandbox_mode()],
                   "approvalPolicy": self._approval_policy()}
+        reviewer = self._approvals_reviewer()     # per turn too: Read-only can flip mid-thread
+        if reviewer:
+            params["approvalsReviewer"] = reviewer
         if self._model:
             params["model"] = self._model
         effort = self._effort
@@ -1104,6 +1139,9 @@ class CodexWorker(threading.Thread):
             self.ui.put(("status", "auto-review…"))
         elif method in ("item/autoApprovalReview/completed",):
             self.ui.put(("status", "thinking…" if self._turn is not None else ""))
+            line = _review_refusal(params)
+            if line:
+                self.ui.put(("system", line))
         elif method in ("warning", "configWarning", "deprecationNotice", "guardianWarning"):
             dbg("codex_" + method, str(params.get("message") or params.get("summary"))[:300])
 
@@ -1437,6 +1475,41 @@ def _unwrap_shell(cmd):
     if len(inner) >= 2 and inner[0] == inner[-1] and inner[0] in "'\"":
         inner = inner[1:-1]
     return inner
+
+
+def _review_refusal(params):
+    """The chat line for an auto-review that went against a step, or None. The user handed
+    that decision over, so a refusal (or a review that ran out of time, which also stops the
+    step) is shown with the reviewer's reason; an approval stays quiet — the step's own tool
+    line already says it ran. The payload is marked unstable upstream, so every field is
+    optional here."""
+    review = params.get("review") if isinstance(params.get("review"), dict) else {}
+    status = review.get("status")
+    if status not in ("denied", "timedOut"):
+        return None
+    a = params.get("action") if isinstance(params.get("action"), dict) else {}
+    kind = a.get("type")
+    if kind == "command" and a.get("command"):
+        what = f"`{_clip(_unwrap_shell(str(a['command'])), 80)}`"
+    elif kind == "execve" and (a.get("argv") or a.get("program")):
+        what = f"`{_clip(' '.join(str(x) for x in (a.get('argv') or [a.get('program')])), 80)}`"
+    elif kind == "applyPatch":
+        n = len(a.get("files") or [])
+        what = f"a change to {n} file{'s' if n != 1 else ''}" if n else "a file change"
+    elif kind == "networkAccess" and a.get("host"):
+        what = f"network access to {a['host']}"
+    elif kind == "mcpToolCall" and (a.get("toolTitle") or a.get("toolName")):
+        what = f"the {a.get('toolTitle') or a.get('toolName')} tool"
+    else:
+        what = "a step outside the sandbox"
+    verb = "blocked" if status == "denied" else "ran out of time on (so it didn't run)"
+    why = str(review.get("rationale") or "").strip()
+    return f"🛡 Codex's auto-review {verb} {what}" + (f": {_clip(why, 240)}" if why else ".")
+
+
+def _clip(s, n):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[:n - 1].rstrip() + "…"
 
 
 def _toml(v):

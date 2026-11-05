@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 
-__version__ = "1.26.0"
+__version__ = "1.26.1"
 
 def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     try:
@@ -428,8 +428,17 @@ CODEX_EFFORT = "low"            # the overlay's own default, for the same reason
 # it (measured 2026-10-28: a policy allowing only read-only / workspace-write turned
 # "danger-full-access" into read-only — the opposite of what was asked). So the worker reads
 # the allowed set first, asks for the strongest mode the policy permits, and says so in the
-# chat; approvals the policy insists on are answered from an in-chat card.
+# chat; approvals the policy insists on go to CODEX_APPROVALS_REVIEWER.
 CODEX_SANDBOX = "danger-full-access"
+# Who answers Codex's "may I step outside the sandbox?" where the machine's policy forbids
+# approvalPolicy "never" (unused where it doesn't: nothing is asked there). "auto_review"
+# hands each request to Codex's own reviewer, a subagent that weighs the risk and approves
+# or denies — the closest Codex has to the Claude side's no-prompt experience that still
+# lets the policy's review happen; the user just isn't the one clicking. The managed policy
+# measured 2026-11-05 (codex-cli 0.166.0) constrains sandbox and approval policy only, not
+# the reviewer. "user" = an Allow / Deny card in the chat for each request. Read-only always
+# uses "user": a reviewer must not approve a write the user switched off.
+CODEX_APPROVALS_REVIEWER = "auto_review"
 CODEX_EFFORT_LEVELS = [("Low", "low"), ("Medium", "medium"), ("High", "high"),
                        ("Extra high", "xhigh"), ("Max", "max"),
                        ("Default (your Codex setting)", "")]   # fallback when the model list
@@ -600,6 +609,7 @@ _USER_CONFIG_KEYS = {
     "CODEX_MODEL": _v_str,
     "CODEX_EFFORT": _v_choice("", "auto", "low", "medium", "high", "xhigh", "max", "ultra"),
     "CODEX_SANDBOX": _v_choice("workspace-write", "danger-full-access"),
+    "CODEX_APPROVALS_REVIEWER": _v_choice("auto_review", "user"),
     # capture
     "AUTO_SCREENSHOT_DEFAULT": _v_bool,
     "SHOT_SCOPE": _v_choice("screens", "window"),

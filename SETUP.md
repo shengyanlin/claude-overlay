@@ -81,9 +81,11 @@ comfortable with that, change it to:
 **Codex mode** asks for the same full access (`CODEX_SANDBOX = "danger-full-access"`:
 no sandbox, no prompts) — but only where the machine allows it. A managed machine's Codex
 policy can forbid that; the overlay then runs the strongest sandbox the policy permits
-(and, if Windows' `workspace-write` sandbox can't start on that PC, read-only), says so in
-the chat, and shows an **Allow / Deny** card whenever Codex wants to step outside it.
-Read-only always means Codex's `read-only` sandbox.
+(and, if Windows' `workspace-write` sandbox can't start on that PC, read-only) and says so
+in the chat. Whenever Codex wants to step outside that sandbox, Codex's own auto-review
+weighs the risk and approves or denies it, so you aren't asked; a refusal shows in the chat
+with its reason. `CODEX_APPROVALS_REVIEWER = "user"` shows an **Allow / Deny** card
+instead. Read-only always means Codex's `read-only` sandbox, and there the card always asks you.
 
 ## Notes / fallbacks
 

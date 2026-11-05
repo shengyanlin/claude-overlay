@@ -6150,10 +6150,24 @@ class Overlay:
         if changed:
             _save_state(read_only=ro)   # persist only CONFIRMED switches, never requests
         if changed and self.provider == "codex":
-            self.add_sys("🔒 Read-only: Codex runs in the read-only sandbox — it can see your "
-                         "screen, read files and answer, but changes nothing." if ro else
-                         f"⚡ Full access: Codex runs in {self._codex_sandbox or 'its sandbox'} "
-                         "and asks before stepping outside it. Flip Read-only back on any time.")
+            # The worker reports the sandbox it actually got (codex_sandbox) before it
+            # confirms the mode. Unsandboxed means approvalPolicy "never" too — Codex's
+            # bypassPermissions, the default wherever no managed policy forbids it. In a
+            # sandbox, steps outside it go to CODEX_APPROVALS_REVIEWER (auto-review unless
+            # set to "user"), so only then does Codex really ask the user.
+            if ro:
+                self.add_sys("🔒 Read-only: Codex runs in the read-only sandbox — it can see "
+                             "your screen, read files and answer, but changes nothing.")
+            elif self._codex_sandbox == "danger-full-access":
+                self.add_sys("⚡ Full access: Codex runs without a sandbox and edits files and "
+                             "runs commands without asking. Flip Read-only back on any time.")
+            else:
+                outside = ("steps outside it go to Codex's auto-review, not to you"
+                           if CODEX_APPROVALS_REVIEWER != "user"
+                           else "it asks before stepping outside it")
+                self.add_sys(f"⚡ Full access: Codex runs in "
+                             f"{self._codex_sandbox or 'its sandbox'}; {outside}. "
+                             "Flip Read-only back on any time.")
         elif changed and ro:
             self.add_sys("🔒 Read-only: Claude can see your screen, read files, and "
                          "answer — but won't edit anything or run commands.")

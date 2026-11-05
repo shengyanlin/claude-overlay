@@ -127,6 +127,9 @@ def test_unmanaged_full_access_means_no_sandbox_and_no_prompts(harness):
     assert turn["sandboxPolicy"] == {"type": "dangerFullAccess"}
     assert turn["approvalPolicy"] == "never"
     assert not harness.requests("command/exec")        # no sandbox, nothing to probe
+    # Nothing is asked under "never", so no reviewer is named (config.toml's stays put).
+    assert "approvalsReviewer" not in turn
+    assert "approvalsReviewer" not in harness.requests("thread/start")[0]
 
 
 def test_managed_policy_downgrades_and_says_so(harness, monkeypatch):
@@ -137,8 +140,92 @@ def test_managed_policy_downgrades_and_says_so(harness, monkeypatch):
     turn = harness.requests("turn/start")[0]
     assert turn["sandboxPolicy"] == {"type": "workspaceWrite"}
     assert turn["approvalPolicy"] == "on-request"      # "never" is not allowed by the policy
+    # ...so the asking goes to Codex's auto-review, not to a card per step.
+    assert turn["approvalsReviewer"] == "auto_review"
+    assert harness.requests("thread/start")[0]["approvalsReviewer"] == "auto_review"
     notes = [p for k, p in harness.seen if k == "system"]
-    assert any("doesn't allow danger-full-access" in n for n in notes)
+    line = next(n for n in notes if "doesn't allow danger-full-access" in n)
+    assert "auto-review decides" in line and "asks before" not in line
+
+
+def test_read_only_keeps_the_user_as_the_reviewer(harness, monkeypatch):
+    # Read-only is the user's own lock; a reviewer that approved a write would break it.
+    monkeypatch.setenv("FAKE_CODEX_POLICY", "managed")
+    harness.start(permission_mode="plan", sandbox="danger-full-access")
+    harness.w.ask("one")
+    harness.wait("turn_done")
+    harness.w.set_permission_mode("bypassPermissions")
+    assert harness.wait("permission_mode") == "bypassPermissions"
+    harness.w.ask("two")
+    harness.wait("turn_done")
+    first, second = harness.requests("turn/start")[:2]
+    assert first["sandboxPolicy"] == {"type": "readOnly"}
+    assert first["approvalsReviewer"] == "user"
+    assert harness.requests("thread/start")[0]["approvalsReviewer"] == "user"
+    assert second["approvalsReviewer"] == "auto_review"   # per turn: the flip applies at once
+
+
+def test_reviewer_can_be_set_back_to_cards(harness, monkeypatch):
+    monkeypatch.setenv("FAKE_CODEX_POLICY", "managed")
+    monkeypatch.setattr(cw, "CODEX_APPROVALS_REVIEWER", "user")
+    harness.start(sandbox="danger-full-access")
+    harness.w.ask("hi")
+    harness.wait("turn_done")
+    assert harness.requests("turn/start")[0]["approvalsReviewer"] == "user"
+    notes = [p for k, p in harness.seen if k == "system"]
+    assert any("Codex asks before" in n for n in notes)
+
+
+def test_auto_review_refusal_is_said_in_the_chat(harness, monkeypatch):
+    monkeypatch.setenv("FAKE_CODEX_POLICY", "managed")
+    harness.start(sandbox="danger-full-access")
+    harness.w.ask("REVIEW DENY")
+    harness.wait("turn_done")
+    notes = [p for k, p in harness.seen if k == "system"]
+    line = next(n for n in notes if "auto-review blocked" in n)
+    assert "`Remove-Item build`" in line                  # the shell wrapper peeled off
+    assert "destructive" in line                          # with the reviewer's reason
+    assert "approval" not in harness.kinds()              # and no card for the user
+
+
+def test_auto_review_approval_stays_quiet(harness, monkeypatch):
+    monkeypatch.setenv("FAKE_CODEX_POLICY", "managed")
+    harness.start(sandbox="danger-full-access")
+    harness.w.ask("REVIEW")
+    harness.wait("turn_done")
+    notes = [p for k, p in harness.seen if k == "system"]
+    assert not any("blocked" in n or "ran out of time" in n for n in notes)
+    assert "approval" not in harness.kinds()
+
+
+@pytest.mark.parametrize("params, ends", [
+    ({"review": {"status": "approved"}}, None),
+    ({}, None),
+    ({"review": "garbage", "action": []}, None),
+    ({"review": {"status": "timedOut"}, "action": {"type": "networkAccess", "host": "pypi.org"}},
+     "ran out of time on (so it didn't run) network access to pypi.org."),
+    ({"review": {"status": "denied", "rationale": "Not asked for."},
+      "action": {"type": "applyPatch", "files": ["a.py", "b.py"]}},
+     "blocked a change to 2 files: Not asked for."),
+    ({"review": {"status": "denied"}, "action": {"type": "execve", "program": "rm",
+                                                 "argv": ["rm", "-rf", "x"]}},
+     "blocked `rm -rf x`."),
+    ({"review": {"status": "denied"}, "action": {"type": "somethingNew"}},
+     "blocked a step outside the sandbox."),
+])
+def test_review_refusal_wording(params, ends):
+    line = cw._review_refusal(params)
+    if ends is None:
+        assert line is None
+    else:
+        assert line.startswith("🛡 Codex's auto-review ") and line.endswith(ends)
+
+
+def test_probe_waits_out_a_first_time_sandbox_setup():
+    # Measured 2026-11-05: the first workspace-write command after a Codex upgrade answered
+    # after 18.6s (12s of it the setup helper's ACL pass). A shorter limit called a working
+    # sandbox broken, cached that for the whole version, and made every write an approval.
+    assert cw._PROBE_TIMEOUT >= 30
 
 
 def test_broken_workspace_sandbox_falls_back_to_read_only(harness, monkeypatch):
@@ -154,6 +241,24 @@ def test_broken_workspace_sandbox_falls_back_to_read_only(harness, monkeypatch):
     notes = [p for k, p in harness.seen if k == "system"]
     assert sum("Full access runs in read-only" in n for n in notes) == 1   # said once
     assert json.loads(cw._PROBE_FILE.read_text("utf-8")) == {"version": "9.9.9", "ok": False}
+
+
+def test_a_slow_probe_doesnt_hold_the_first_turn(harness, monkeypatch):
+    # A first-time sandbox setup can take most of a minute. A turn sent meanwhile goes out
+    # read-only after a short wait instead of stalling; auto-review covers what it can't do.
+    monkeypatch.setenv("FAKE_CODEX_POLICY", "managed")
+    monkeypatch.setenv("FAKE_CODEX_WS", "hang")
+    monkeypatch.setattr(cw, "_PROBE_TIMEOUT", 30)
+    monkeypatch.setattr(cw, "_PROBE_WAIT", 0.5)
+    harness.start(sandbox="danger-full-access")
+    t0 = time.monotonic()
+    harness.w.ask("hi")
+    harness.wait("turn_done", timeout=10)
+    assert time.monotonic() - t0 < 8
+    turn = harness.requests("turn/start")[0]
+    assert turn["sandboxPolicy"] == {"type": "readOnly"}
+    assert turn["approvalsReviewer"] == "auto_review"
+    assert not cw._PROBE_FILE.exists()                 # no verdict yet, so none cached
 
 
 def test_probe_verdict_is_cached_per_cli_version(harness, monkeypatch):
