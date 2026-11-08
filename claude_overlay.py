@@ -7284,15 +7284,34 @@ class Overlay:
                          level or "default")
             self.add_sys(f"⚡ Effort is now {label}.")
 
+    # One wheel notch (delta 120) scrolls this many body-text lines: Windows' default, and about
+    # what a notch over plain text did before (one "unit" from here plus Tk's own 40 px).
+    WHEEL_LINES = 3
+
+    def _wheel_pixels(self, delta):
+        """How far one wheel event scrolls the chat, in PIXELS (positive = down).
+
+        Pixels, not "units": a Text counts each embedded widget (a markdown table, a long user
+        bubble) as ONE display line, and a units scroll can only stop at the top of a line. So
+        a table taller than the window showed its first rows, one notch later Tk jumped to the
+        line after it and then pulled the view back so the end wasn't left blank, showing the
+        table's last rows, and the rows in between could never be scrolled to. That was the
+        "the list goes 1, 2, 3, then 10" report. Scaled by the body font so it follows Ctrl +/-
+        zoom, and a precision-touchpad delta (30, not 120) still moves instead of rounding to 0."""
+        step = self.WHEEL_LINES * self.f_body.metrics("linespace")
+        n = int(round(-delta / 120 * step))
+        if n == 0 and delta:
+            n = -1 if delta > 0 else 1
+        return n
+
     def _on_wheel(self, e):
-        # Same scroll as before (no "break", so behavior is unchanged) — but timed. Tk
-        # relayouts a Text holding many embedded canvases (our message bubbles + tool
+        # Timed: Tk relayouts a Text holding many embedded canvases (our message bubbles + tool
         # chips) synchronously inside yview_scroll, so a janky scroll frame shows up as a
         # slow call here. Log only the slow frames (>50 ms) plus whether a reply is
         # streaming and how big the transcript is, so the intermittent scroll lag can be
         # caught in the act and attributed (large transcript vs. streaming contention).
         t0 = time.monotonic()
-        self.chat.yview_scroll(int(-e.delta / 120), "units")
+        self.chat.yview_scroll(self._wheel_pixels(e.delta), "pixels")
         self._sync_follow()          # scrolling up stops the follow; back to the end resumes it
         if DEBUG_LOG:
             dt = (time.monotonic() - t0) * 1000
@@ -7303,6 +7322,10 @@ class Overlay:
                 except Exception:
                     lines = -1; wins = -1
                 dbg("scroll_slow", f"{dt:.0f}ms streaming={getattr(self, 'busy', False)} lines={lines} embeds={wins}")
+        # This handler did the whole scroll. Without "break", Tk's own Text binding (40 px per
+        # notch) scrolled a second time, so a notch over text moved further than one over a
+        # table or bubble (those forward here through _fwd_wheel, which already breaks).
+        return "break"
 
     # ── event pump ──
     def _poll(self):

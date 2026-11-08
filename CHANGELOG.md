@@ -3,6 +3,20 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.26.2] - 2026-11-08
+
+The mouse wheel now scrolls through a table or a message taller than the window, instead of
+skipping its middle.
+
+### Fixed
+- **Part of a long table couldn't be scrolled to with the mouse wheel.** When a table in a
+  reply was taller than the window, the wheel showed its first rows and, one notch later,
+  its last rows — a list could go 1, 2, 3, then 10 — and the rows in between were only
+  reachable by dragging the scrollbar. The wheel now scrolls smoothly through the whole
+  table, and through a long message of your own the same way. A notch now moves the same
+  distance wherever the pointer is (before, it went further over text than over a table),
+  and a precision touchpad scrolls over a table too, where it used to do nothing.
+
 ## [1.26.1] - 2026-11-05
 
 Codex on a PC with a managed Codex policy now works without an approval for every step, and
