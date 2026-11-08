@@ -317,6 +317,39 @@ def can_self_update(repo=None):
         return False
 
 
+def overlay_update_blocker(repo=None):
+    """Why update.cmd would STOP on this clone instead of updating it, or None when it would go
+    ahead. The same two checks update.cmd makes before it pulls: the clone is on main, and no
+    tracked file is modified (untracked files don't count -- update.cmd ignores them too).
+
+    The launch's AUTOMATIC update asks this first, because each of those stops ends in a console
+    waiting at `pause`. That is right after a click -- the console is the error UI -- but a
+    console that pops up and waits on every launch of a developer's clone isn't an update, it's
+    a nag. A blocked clone gets the notice and its button instead. Never raises: a git that
+    can't answer counts as blocked."""
+    repo = repo or _REPO_DIR
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=repo, capture_output=True, timeout=15,
+                              encoding="utf-8", errors="replace",
+                              creationflags=_CREATE_NO_WINDOW)
+    try:
+        r = git("rev-parse", "--abbrev-ref", "HEAD")
+        branch = (r.stdout or "").strip()
+        if r.returncode != 0 or not branch:
+            return "git couldn't read this clone's branch"
+        if branch.lower() != "main":                     # update.cmd compares with `if /i`
+            return f'this clone is on branch "{branch}", not main'
+        rc = git("diff", "--quiet", "HEAD").returncode
+        if rc == 1:
+            return "this clone has uncommitted changes"
+        if rc != 0:
+            return "git couldn't check this clone for local changes"
+        return None
+    except Exception as e:
+        return f"git didn't answer ({type(e).__name__})"
+
+
 def _cmd_c(script, *args):
     """`cmd /s /c` command line that runs a .cmd from ANY app folder. A list argv would leave a
     path without spaces unquoted (that's how Windows quoting works), and cmd.exe then reads

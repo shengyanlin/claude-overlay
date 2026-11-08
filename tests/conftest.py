@@ -197,7 +197,7 @@ def _clean_overlay(ov):
     # Cancel any after() timers a prior test may have scheduled (zoom re-render, region
     # re-apply, compaction animation, precapture) so none fires mid-next-test.
     for _attr in ("_rezoom_after", "_round_after", "_compact_anim_after",
-                  "_precapture_after", "_queue_after", "_cli_auto_after"):
+                  "_precapture_after", "_queue_after", "_cli_auto_after", "_ov_auto_after"):
         _tid = getattr(ov, _attr, None)
         if _tid is not None:
             try:
@@ -209,6 +209,8 @@ def _clean_overlay(ov):
     # claim would refuse the next test's clicks and switches, a pause would leave it busy.
     ov._cli_op = None
     ov._cli_auto_queue = []
+    ov._release_update_lock()           # an automatic overlay update a test started keeps the
+    ov._ov_update_shown = False         # lock and the once-per-session offer flag otherwise
     ov._codex_paused = False
     ov._paused_worker = None
     ov._chosen_model = None
@@ -276,6 +278,7 @@ def _clean_overlay(ov):
                                         # worker's reset_done, which the fixture never delivers
     ov._capture_busy = False
     ov._paste_busy = False
+    ov._acting = 0                      # a send / Snap in progress (auto-update's in-use guard)
     ov._auth_dead = False               # credential-watchdog state: a gate test must not leak
     ov._auth_told = False               # a "login is dead" verdict into the next test
     ov._auth_checked = 0.0

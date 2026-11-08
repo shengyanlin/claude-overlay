@@ -1607,8 +1607,10 @@ class Overlay:
 
     def _check_for_update(self):
         """Best-effort: ask GitHub for the newest tag in a background thread and, if it's
-        newer than __version__, flag it. Stays silent on any failure (offline, GitHub
-        down, corporate TLS interception) so it never blocks or nags."""
+        newer than __version__, flag it — as "update_auto" when this install may update itself
+        right now (_update_kind), else "update" (the notice and its button). Stays silent on
+        any failure (offline, GitHub down, corporate TLS interception) so it never blocks or
+        nags."""
         def work():
             try:
                 import urllib.request
@@ -1625,10 +1627,70 @@ class Overlay:
                 latest = max((self._parse_ver(t.get("name", "")) for t in tags[:MAX_UPDATE_TAGS]
                               if isinstance(t, dict)), default=None)
                 if latest and latest > self._parse_ver(__version__):
-                    self.ui_q.put(("update", ".".join(map(str, latest))))
+                    ver = ".".join(map(str, latest))
+                    self.ui_q.put((self._update_kind(ver), ver))
             except Exception:
                 pass
         threading.Thread(target=work, daemon=True).start()
+
+    def _update_kind(self, ver):
+        """Off the Tk thread, once the launch check found `ver`: "update_auto" when this install
+        may update itself, else "update". Auto needs OVERLAY_AUTO_UPDATE, a git clone
+        (can_self_update), a clone update.cmd would really update rather than stop at a `pause`
+        (overlay_update_blocker: on main, nothing modified), this version not already found
+        un-updatable by an earlier launch (see _show_overlay_auto_result), and no other overlay
+        window updating at the same moment (the lock). Whether the conversation is still empty
+        is the Tk thread's call, made when the event lands (_start_overlay_auto_update)."""
+        try:
+            if not (OVERLAY_AUTO_UPDATE and can_self_update()):
+                return "update"
+            if _load_state().get("ov_auto_update_skip") == ver:
+                return "update"
+            why = overlay_update_blocker()
+            if why:
+                dbg(f"overlay auto-update: not automatic - {why}")
+                return "update"
+            return "update_auto" if self._claim_update_lock() else "update"
+        except Exception:
+            return "update"
+
+    # An automatic update that died mid-run (the window killed while update.cmd waited at a
+    # `pause`) leaves its lock behind; past this age the next launch takes it over.
+    UPDATE_LOCK_STALE = 15 * 60
+
+    @staticmethod
+    def _update_lock_path():
+        return STATE_FILE.parent / "overlay-update.lock"
+
+    def _claim_update_lock(self):
+        """One automatic update at a time. Two overlay windows opened together would otherwise
+        both run update.cmd, and the second pull fails on git's own lock and stops at a `pause`
+        in a second console. Exclusive-create a lock file next to STATE_FILE (per user, like the
+        install); a stale one is taken over. False — the notice instead — on any doubt."""
+        p = self._update_lock_path()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if time.time() - p.stat().st_mtime > self.UPDATE_LOCK_STALE:
+                    p.unlink()
+            except FileNotFoundError:
+                pass
+            fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w") as f:
+                f.write(str(os.getpid()))
+            self._update_lock_held = True
+            return True
+        except Exception:
+            return False
+
+    def _release_update_lock(self):
+        if not getattr(self, "_update_lock_held", False):
+            return
+        self._update_lock_held = False
+        try:
+            self._update_lock_path().unlink()
+        except Exception:
+            pass
 
     def _install_id(self):
         """This copy's random id for the usage ping, minted on first use and remembered in
@@ -5352,6 +5414,127 @@ class Overlay:
             self.add_err(f"Overlay update didn't complete — {msg}. You can also update it by "
                          "hand: double-click update.cmd in the app folder.")
 
+    # ── the same update, on its own at launch (OVERLAY_AUTO_UPDATE) ─────────────────────
+
+    def _start_overlay_auto_update(self, latest):
+        """The launch found a newer overlay and this clone can take it (_update_kind). Update now,
+        but only while the conversation is still empty: "at launch" means before the user has
+        started, so a session that already has a message, a resumed conversation or a queued
+        line gets the notice and its button instead, as before. update.cmd runs in its visible
+        console (run_overlay_update says why); _show_overlay_auto_result decides on the restart."""
+        if self._overlay_in_use() or getattr(self, "_ov_update_shown", False):
+            dbg("ov_auto", f"v{latest}: the session already started - notice instead")
+            self._release_update_lock()
+            self._show_overlay_update_notice(latest)
+            return
+        dbg("ov_auto", f"v{latest}: running update.cmd")
+        self._ov_update_shown = True              # one update offer per session, auto or not
+        self.add_sys(f"⬆ Updating the overlay v{__version__} → v{latest} on its own — a new "
+                     "version is out. A console window shows the progress (about a minute), "
+                     "then the overlay restarts into it. If you start chatting first, it won't "
+                     "restart: the new version runs the next time you open the overlay.")
+
+        def work():
+            try:
+                ok, msg = run_overlay_update()   # looked up at call time, so it stays patchable
+            except Exception as e:
+                ok, msg = False, type(e).__name__
+            self.ui_q.put(("ov_auto_result", (bool(ok), str(msg), latest)))
+        threading.Thread(target=work, name="overlay-auto-update", daemon=True).start()
+
+    def _show_overlay_auto_result(self, payload):
+        """update.cmd is done. Failed: say why and leave the retry button (the console that
+        explained it stays open at its `pause`); the next launch tries again by itself. Succeeded
+        but the folder is NOT on the new version (a fork whose remotes lack it, say): don't
+        restart — the fresh window would find the same "newer" release and update and restart
+        again on every launch — and stop doing it automatically for this version. Otherwise
+        restart, if the session is still unused (_finish_overlay_auto_update)."""
+        self._release_update_lock()
+        try:
+            ok, msg, latest = payload
+        except Exception:
+            return
+        dbg("ov_auto", f"v{latest}: update.cmd ok={ok} {msg} on_disk=v{_file_version()}")
+        if not ok:
+            self.add_err(f"Couldn't update the overlay on its own — {msg}. The next launch tries "
+                         "again; to retry now:")
+            self._embed_line(self._ov_update_btn(latest))
+            return
+        on_disk = _file_version()
+        if self._parse_ver(on_disk) < self._parse_ver(latest):
+            _save_state(ov_auto_update_skip=latest)
+            self.add_err(f"The update ran, but this folder is still on v{on_disk or '?'}, not "
+                         f"v{latest}, so the overlay isn't restarting (and won't retry this "
+                         "version on its own). Run update.cmd by hand to see why.")
+            return
+        self._finish_overlay_auto_update(latest)
+
+    def _overlay_in_use(self):
+        """Has the user started since launch? A message sent or lined up, a conversation resumed
+        or resuming (from the Resume offer or a history card), a reply running or a compaction, a
+        draft or attachment in the box, or a paste or screenshot still being processed into one:
+        a restart would cut off the first or throw away the second.
+
+        Not _switch_locked() as it stands: that also reads `busy`, and a CLI update pausing the
+        live worker sets busy too (so Enter lines messages up meanwhile). That is the launch's
+        own maintenance, not the user — counted as use, it would make the overlay's update fall
+        back to the button whenever a CLI update happened to run at the same launch."""
+        rb = self._resume_btn
+        return bool(self._has_turns or self._queue or self._compacting
+                    or (self.busy and not getattr(self, "_codex_paused", False))
+                    or (rb is not None and getattr(rb, "_ustate", "") == "working")
+                    or getattr(self, "_resume_started", None) is not None
+                    or getattr(self, "_acting", 0) > 0          # a send or a Snap mid-way
+                    or self._entry_text()
+                    or self.pending_images or self.pending_docs or self.pending_shot
+                    or getattr(self, "_paste_busy", False) or getattr(self, "_capture_busy", False))
+
+    def _cli_maintenance(self):
+        """A CLI update running, lined up, or holding the live worker paused."""
+        return bool(getattr(self, "_cli_op", None) or getattr(self, "_cli_auto_queue", None)
+                    or getattr(self, "_codex_paused", False))
+
+    def _finish_overlay_auto_update(self, latest):
+        """Restart into the update — never into the user's way. A CLI update still running (the
+        launch's other automatic update): wait for it, since a restart now would leave npm
+        halfway through replacing the CLI; check again every two seconds, and judge whether the
+        user has started only once it's done. In use: keep this window, say the new version runs
+        next launch, and offer the restart as a button."""
+        self._ov_auto_after = None
+        if self._cli_maintenance():
+            self._ov_auto_after = self.root.after(
+                2000, lambda: self._finish_overlay_auto_update(latest))
+            return
+        if self._overlay_in_use():
+            dbg("ov_auto", f"v{latest}: in use - no restart, button offered")
+            self.add_sys(f"✅ Overlay updated to v{latest}. You'd already started, so it didn't "
+                         "restart: the new version runs the next time you open the overlay — "
+                         "or restart now:")
+            self._embed_line(self._ov_restart_btn(latest))
+            return
+        dbg("ov_auto", f"v{latest}: restarting")
+        self.add_sys(f"✅ Overlay updated to v{latest} — restarting into it.")
+        self._restart_overlay()
+
+    def _ov_restart_btn(self, latest):
+        """'Restart now', for an automatic update that didn't restart because the session was in
+        use. The shared update button, parked in its 'done' state (a click restarts), so it
+        draws, zooms and forwards the wheel like the others."""
+        label = f"↻  Restart into v{latest}"
+        c = self._one_click_update_btn(
+            {"idle": label, "working": label, "done": label, "error": label},
+            lambda: (True, ""), "overlay-restart", "_ov_restart_btn_ref", "ov_update_result")
+        c._set_ustate("done")
+        return c
+
+    def _embed_line(self, widget):
+        """Put an embedded widget (a button) on a line of its own at the end of the chat."""
+        self.chat.insert("end", "\n")
+        self.chat.window_create("end", window=widget, padx=self.px(16), pady=self.px(2))
+        self.chat.insert("end", "\n")
+        self._scroll_follow()
+        self._prune_chat()
+
     def _restart_overlay(self):
         """Relaunch a fresh overlay instance, then close this one — the 'click to restart' action
         on the Update button (and reusable for any future restart affordance). Launches the new
@@ -5520,12 +5703,19 @@ class Overlay:
             return
         if self._auth_blocks_send():     # BEFORE anything is consumed (text, shot, attachments)
             return
-        item = self._collect_send()
-        if item is None:
-            return
-        self._queue_hold = None          # a deliberate send outranks a rate hold: the user
+        # A send is the user starting, from the keypress on: _collect_send's screen capture can
+        # pump Tk events (root.update), and an automatic overlay update finishing in there must
+        # not take a screenshot-only send for an idle window and restart under it.
+        self._acting = getattr(self, "_acting", 0) + 1
+        try:
+            item = self._collect_send()
+            if item is None:
+                return
+            self._queue_hold = None      # a deliberate send outranks a rate hold: the user
                                          # is choosing to try the wire again right now
-        self._deliver(item)
+            self._deliver(item)
+        finally:
+            self._acting -= 1
 
     def _send_or_queue(self):
         """Enter: send — or, while a reply is streaming, line the message up the way the
@@ -6091,7 +6281,14 @@ class Overlay:
         return shots
 
     def snap_now(self):
-        self.capture(announce=True)
+        # A Snap is the user starting, like a send: capture() withdraws the window and pumps Tk
+        # events (root.update), and an automatic overlay update finishing in there must not
+        # restart before the shot lands in pending_shot (see _overlay_in_use).
+        self._acting = getattr(self, "_acting", 0) + 1
+        try:
+            self.capture(announce=True)
+        finally:
+            self._acting -= 1
 
     def _prune_shots(self):
         # Best-effort from the very first filesystem op: a concurrent deleter (AV/quarantine,
@@ -7743,10 +7940,15 @@ class Overlay:
             self._apply_effort(str(payload or ""))
         elif kind == "system":
             self.add_sys(str(payload))
-        elif kind == "update":
+        elif kind in ("update", "update_auto"):
             self._update_available = str(payload)
-            self._show_overlay_update_notice(str(payload))
+            if kind == "update_auto":
+                self._start_overlay_auto_update(str(payload))
+            else:
+                self._show_overlay_update_notice(str(payload))
             self._refresh_statusline()
+        elif kind == "ov_auto_result":
+            self._show_overlay_auto_result(payload)
         elif kind == "ov_update_result":
             self._show_overlay_update_result(payload)
         elif kind == "codex_setup_result":

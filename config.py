@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 
-__version__ = "1.26.2"
+__version__ = "1.27.0"
 
 def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     try:
@@ -326,6 +326,15 @@ CLI_AUTO_UPDATE = _env_bool("CLAUDE_OVERLAY_CLI_AUTO_UPDATE", True)   # with the
                             # is paused for it, never mid-reply; what you type meanwhile goes out
                             # afterwards, on the same conversation. Set
                             # CLAUDE_OVERLAY_CLI_AUTO_UPDATE=0 for the notice and button only.
+OVERLAY_AUTO_UPDATE = _env_bool("CLAUDE_OVERLAY_AUTO_UPDATE", True)   # when the launch finds a
+                            # newer overlay release, update to it on its own (update.cmd, in its
+                            # console) and restart into it -- but ONLY at launch: once you have
+                            # sent a message, resumed a conversation, typed a draft or attached
+                            # something, it never restarts on you; the update then waits for
+                            # your next launch. Needs
+                            # a git clone on main with no local edits (what update.cmd itself
+                            # requires); anything else gets the notice and its button. Set
+                            # CLAUDE_OVERLAY_AUTO_UPDATE=0 for the notice and button only.
 TELEMETRY = _env_bool("CLAUDE_OVERLAY_TELEMETRY", True)   # master switch for the anonymous
                             # usage ping (telemetry.py has the complete payload and PRIVACY.md
                             # the plain-English version). This is OPT-OUT: True plus the endpoint
@@ -602,6 +611,7 @@ _USER_CONFIG_KEYS = {
     "MCP_SERVERS": _v_mcp_servers,             # {name: {...}} — loads even under strict
     "CLI_UPDATE_CHECK": _v_bool,
     "CLI_AUTO_UPDATE": _v_bool,                # false = notice + button only, no auto-update
+    "OVERLAY_AUTO_UPDATE": _v_bool,            # false = the overlay's own notice + button only
     "TELEMETRY": _v_bool,                      # false = never send the anonymous usage ping
     "TELEMETRY_URL": _v_telemetry_url,         # "" = no endpoint; https only, see telemetry.state
     # Codex mode (the titlebar Claude ⇄ Codex switch)
@@ -640,6 +650,7 @@ _ENV_BEATS_JSON = {
     "STRICT_MCP_CONFIG": "CLAUDE_OVERLAY_STRICT_MCP",
     "CLI_UPDATE_CHECK": "CLAUDE_OVERLAY_CLI_UPDATE_CHECK",
     "CLI_AUTO_UPDATE": "CLAUDE_OVERLAY_CLI_AUTO_UPDATE",
+    "OVERLAY_AUTO_UPDATE": "CLAUDE_OVERLAY_AUTO_UPDATE",
     "TELEMETRY": "CLAUDE_OVERLAY_TELEMETRY",
     "TELEMETRY_URL": "CLAUDE_OVERLAY_TELEMETRY_URL",
 }

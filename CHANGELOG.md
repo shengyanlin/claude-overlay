@@ -3,6 +3,26 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.27.0] - 2026-11-08
+
+The overlay now installs its own updates when you open it, and restarts into the new version
+before you've started — never in the middle of a conversation. (This is the last update you
+install with the button: from 1.27.0 on, it happens by itself.)
+
+### Added
+- **The overlay updates itself when you open it.** A newer release found at launch is
+  installed without a click on a `git clone` install: `update.cmd` runs in its console
+  window and the overlay restarts into the new version. Only at launch — once you've sent a
+  message, resumed a conversation, typed into the box, or attached a file or a screenshot, it
+  never restarts on you: the new version runs the next time you open the overlay, with a
+  **↻ Restart** button if you want it sooner. A Claude or Codex CLI update running at the same
+  launch doesn't count as you starting: the restart simply waits for it to finish. A clone
+  `update.cmd` would stop on (not on `main`, or with local edits) gets the usual notice and
+  button instead, so a developer's clone isn't greeted by a waiting console
+  at every launch; a failed update offers a retry and is tried again at the next launch; two
+  windows opened together run one update, not two. `OVERLAY_AUTO_UPDATE: false` (or
+  `CLAUDE_OVERLAY_AUTO_UPDATE=0`) keeps the notice and button only.
+
 ## [1.26.2] - 2026-11-08
 
 The mouse wheel now scrolls through a table or a message taller than the window, instead of

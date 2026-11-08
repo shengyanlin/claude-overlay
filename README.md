@@ -232,10 +232,27 @@ isn't on PATH, and `ensurepip` bootstraps `pip` if your Python install shipped w
 ## Update
 
 The overlay shows its version in the bottom status line (e.g. `v1.7.2`) and checks
-GitHub for a newer release on startup — when one exists you'll see a 🔔 note and a `⬆`
-next to the version. To upgrade:
+GitHub for a newer release on startup.
 
-### 🖱️ One click — the button in the chat (recommended)
+### On its own, when you open it
+
+On a `git clone` install, a newer release found at launch is installed **without a click**:
+the chat says so, `update.cmd` runs in a console window (the pull, the packages, the check
+that the new code starts), and the overlay restarts into the new version — usually within
+a minute of opening it. It only ever does this at launch. If you've already started — sent a
+message, resumed a conversation, typed something into the box, or attached a file or a
+screenshot — it doesn't restart on you: the new version runs the next time you open the overlay, and a **↻ Restart into
+vX.Y.Z** button is there if you want it sooner.
+
+It steps aside, and shows the button below instead, when `update.cmd` would stop rather than
+update: a clone that isn't on `main` or has local edits. If an update fails, the console
+stays open on the reason, the chat offers a retry, and the next launch tries again. Set
+`OVERLAY_AUTO_UPDATE` to `false` in `config.json` (or `CLAUDE_OVERLAY_AUTO_UPDATE=0`) to get
+only the notice and its button.
+
+### 🖱️ One click — the button in the chat
+
+When the update isn't automatic, you'll see a 🔔 note and a `⬆` next to the version.
 
 On a `git clone` install, the 🔔 notice comes with an **⬆ Update overlay to vX.Y.Z**
 button. Clicking it runs `update.cmd` for you in a console window, so you can watch the
@@ -454,7 +471,8 @@ to change, using the constant names below — for example:
 
 Overridable: `WORKING_DIR`, `MODEL`, `MODEL_MENU_FILTER`, `QUEUE_MESSAGES`, `EFFORT`,
 `PERMISSION_MODE`,
-`SKILLS`, `STRICT_MCP_CONFIG`, `CLI_UPDATE_CHECK`, `CLI_AUTO_UPDATE`, `TELEMETRY`,
+`SKILLS`, `STRICT_MCP_CONFIG`, `CLI_UPDATE_CHECK`, `CLI_AUTO_UPDATE`, `OVERLAY_AUTO_UPDATE`,
+`TELEMETRY`,
 `TELEMETRY_URL`,
 `AUTO_SCREENSHOT_DEFAULT`, `SHOT_SCOPE`,
 `SHOT_FORMAT`, `SHOT_JPEG_QUALITY`, `SHOT_DEDUPE_BITS`, `HIDE_SCREENSHOT_TOOL`, `THEME`,
