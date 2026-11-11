@@ -197,7 +197,8 @@ def _clean_overlay(ov):
     # Cancel any after() timers a prior test may have scheduled (zoom re-render, region
     # re-apply, compaction animation, precapture) so none fires mid-next-test.
     for _attr in ("_rezoom_after", "_round_after", "_compact_anim_after",
-                  "_precapture_after", "_queue_after", "_cli_auto_after", "_ov_auto_after"):
+                  "_precapture_after", "_queue_after", "_cli_auto_after", "_ov_auto_after",
+                  "_pet_after"):
         _tid = getattr(ov, _attr, None)
         if _tid is not None:
             try:
@@ -241,6 +242,8 @@ def _clean_overlay(ov):
     ov.window_shot = (co.SHOT_SCOPE == "window")
     ov.share_visible = co.SHOW_IN_SCREEN_SHARE_DEFAULT
     ov.read_only = (co.PERMISSION_MODE == "plan")
+    ov.orb_pet = co.ORB_PET_DEFAULT     # the animated-icon setting, and a brain with no leftovers
+    ov._pet_brain.reset(0.0)
     ov.overlay_name = ""
     ov._model = None
     ov._ctx_pct = None

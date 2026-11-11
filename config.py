@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 
-__version__ = "1.27.0"
+__version__ = "1.28.0"
 
 def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     try:
@@ -176,6 +176,14 @@ ORB_FLOAT = True                 # True + an ORB_IMAGE → the collapsed orb is 
                                  # False → the classic circular orb. Ignored without artwork.
 ORB_ALPHA_THRESHOLD = 110        # pixels at/above this alpha (0-255) count as "solid" when
                                  # building the silhouette — higher = tighter, crisper edge
+ORB_PET_DEFAULT = True           # the collapsed orb behaves like a small desktop pet: Clawd
+                                 # blinks, glances around, waves at the pointer, shuffles while
+                                 # a reply is running and cheers when it lands. Flip it live in
+                                 # the ⚙ menu ("Animated icon"); the choice is remembered. Only
+                                 # for the stock floating Clawd (ORB_IMAGE as shipped + ORB_FLOAT);
+                                 # custom artwork stays still. Costs nothing while expanded: no
+                                 # timer runs then (see orbpet.py).
+ORB_PET_IMAGE = "claude_overlay_2.png"  # the artwork orbpet.py knows how to redraw
 # Fonts. Noto Sans/Serif TC cover Chinese + English in one family (closest free
 # stand-in for Claude's proprietary Styrene/Copernicus). First available wins.
 FONT_SANS = ["Noto Sans TC", "Inter", "Segoe UI Variable Text", "Segoe UI"]

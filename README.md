@@ -424,10 +424,11 @@ script here *scans* that folder and uses whatever runs, no matter how it got the
 | Remove one attachment | that row's **✕** |
 | Clear them all | **Clear all** at the right of the strip |
 | Toggle auto-screenshot | **◉ / ○ Auto-shot** (orange = on) |
-| Settings menu | click **⚙** — Window-only, Shareable, Read-only (✓ = on), then **Attach files…** and **Past conversations…**; the gear turns orange while Read-only is on |
+| Settings menu | click **⚙** — Window-only, Shareable, Read-only, Animated icon (✓ = on), then **Attach files…** and **Past conversations…**; the gear turns orange while Read-only is on |
 | &nbsp;&nbsp;• Capture only the active window | **⚙ → Window-only** (window only; off = every monitor) |
 | &nbsp;&nbsp;• Show / hide in screen shares | **⚙ → Shareable** (visible to Teams/Zoom/OBS; off = private, the default) |
 | &nbsp;&nbsp;• Lock Claude read-only | **⚙ → Read-only** ("plan" mode: looks and answers, changes nothing; off = the configured `PERMISSION_MODE`) |
+| &nbsp;&nbsp;• Animate the collapsed icon | **⚙ → Animated icon** (on by default, remembered). Collapsed, Clawd blinks, looks towards your pointer, and now and then nods, dances, bounces or plays peekaboo; he waves when the pointer arrives, shuffles while a reply is running, cheers when it lands and naps after three quiet minutes. Off = the still icon. Nothing runs while the overlay is expanded |
 | Switch model | click the **statusline** (`model ▾`) — the list shows the model families **your** login can actually pick, read from the CLI's own record of them, so it can't offer you a model that would silently fall back to another one |
 | Change how hard it thinks | click the statusline's **`⚡ auto ▾`** — Low / Medium / High / Extra high / Max, **Auto** (no fixed level: the model decides per request), or Default (your CLI's own `effortLevel`). Ships at **Auto**: the overlay is for quick turns, and at an inherited `xhigh` a one-line rewrite took 14–24s against ~2s at Auto with the same answer — while a hard question can still get the thinking it needs. Pin a level when you want one. Switching is instant and keeps the conversation (it is the CLI's own `/effort` command); only **Default** relaunches Claude, resuming the conversation (~10s). Your choice is remembered across launches |
 | Glance the allowance | the ring on the titlebar **✻** — inner arc is the 5-hour window, outer is weekly, amber near the limit, red past it. **Hover** it for the numbers: both windows, reset times, and roughly how many turns of context are left |

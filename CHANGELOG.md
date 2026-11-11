@@ -3,6 +3,23 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [1.28.0] - 2026-11-11
+
+The collapsed icon is now a small desktop pet: Clawd blinks, looks around, and reacts to what
+the overlay is doing. It costs the overlay nothing while it's open, and there's a switch.
+
+### Added
+- **Clawd keeps you company while the overlay is collapsed.** Left alone he blinks, looks
+  towards your pointer, and now and then nods, stretches, dances, bounces or plays peekaboo.
+  He waves when the pointer arrives, shuffles his feet while a reply is running, and cheers
+  when it lands (the green check still appears). Drag him and he throws his arms up; after
+  three quiet minutes he yawns and naps, and wakes with a start when the pointer touches him.
+  Nothing runs while the overlay is expanded, and a standing Clawd is a single sleeping
+  timer: every frame is drawn once, in the background, the first time you collapse.
+  **⚙ → Animated icon** turns it off or on, and the choice is remembered
+  (`ORB_PET_DEFAULT` in `config.py` sets the starting value). Only the stock Clawd icon is
+  animated; a custom `ORB_IMAGE` stays still.
+
 ## [1.27.0] - 2026-11-08
 
 The overlay now installs its own updates when you open it, and restarts into the new version

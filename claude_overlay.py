@@ -158,6 +158,7 @@ try:
     import authstate
     import codexworker
     import modelresolve
+    import orbpet
     import sessions
     import telemetry
     import usage
@@ -766,6 +767,20 @@ class Overlay:
         self._paste_busy = False        # a background clipboard paste is in flight
         self._quitting = False          # make quit() idempotent (double-close → one teardown)
         self._orb_imgs: dict = {}       # (size, hover) → PhotoImage cache for the orb
+        # The collapsed orb as a desktop pet (orbpet.py). Everything below is idle unless the
+        # overlay is collapsed with the setting on: the timer is armed on collapse and
+        # cancelled on expand, so none of it can cost the expanded overlay anything.
+        self.orb_pet = bool(_load_state().get("orb_pet", ORB_PET_DEFAULT))
+        self._pet_brain = orbpet.PetBrain()
+        self._pet_frames = None         # {pose: PIL image}, drawn once on a background thread
+        self._pet_rendering = False     # that thread is running
+        self._pet_photos: dict = {}     # pose → PhotoImage, made on first use
+        self._pet_rgns: dict = {}       # silhouette → HRGN we own (a copy goes to the window)
+        self._pet_extras = False        # HRGN of name pill ∪ done-badge; False = not built yet
+        self._pet_pose = orbpet.REST    # what the orb is showing
+        self._pet_sil = None            # silhouette the window is clipped to right now
+        self._pet_after = None          # the one pending timer id
+        self._orb_img_item = None       # canvas item holding the sprite
         self._send_imgs: dict = {}      # (diameter, state) → PhotoImage cache for the send button
         self._send_hover = False
         self.busy = False
@@ -2550,8 +2565,8 @@ class Overlay:
         self.orb.bind("<ButtonPress-1>", self._orb_press)
         self.orb.bind("<B1-Motion>", self._orb_drag)
         self.orb.bind("<ButtonRelease-1>", self._orb_release)
-        self.orb.bind("<Enter>", lambda e: self._draw_orb(hover=True))
-        self.orb.bind("<Leave>", lambda e: self._draw_orb(hover=False))
+        self.orb.bind("<Enter>", lambda e: self._orb_hover(True))
+        self.orb.bind("<Leave>", lambda e: self._orb_hover(False))
         # Name pill shown UNDER the orb while collapsed (only when this overlay has a custom
         # name). The whole collapsed cluster (orb + pill) shares the orb's click=expand /
         # drag=move handlers, so clicking the name expands too. Hidden until collapse.
@@ -2660,10 +2675,242 @@ class Overlay:
     def _draw_orb(self, hover=False):
         s = self.orb_size
         self.orb.delete("all")
-        self._orb_photo = self._orb_image(s, hover)   # keep a ref so Tk won't GC it
-        self.orb.create_image(s // 2, s // 2, image=self._orb_photo)
+        pet = self._pet_photo(self._pet_pose) if self._pet_live() else None
+        self._orb_photo = pet or self._orb_image(s, hover)   # keep a ref so Tk won't GC it
+        self._orb_img_item = self.orb.create_image(s // 2, s // 2, image=self._orb_photo)
         if getattr(self, "_task_done_badge", False):
             self._draw_orb_badge()
+
+    def _orb_hover(self, on):
+        """Pointer over the collapsed orb. The still icon brightens; the pet waves instead
+        (or wakes up), and does nothing on the way out."""
+        if self._pet_live():
+            if on and self._pet_brain.poke(time.monotonic()):
+                self._pet_kick()
+            return
+        self._draw_orb(hover=on)
+
+    # ── the collapsed orb as a desktop pet (orbpet.py) ──
+    # The hard rule here is that none of this may slow the overlay down. What guarantees it:
+    #   * no timer exists while expanded (armed in toggle_collapse, cancelled on expand);
+    #   * a tick draws nothing. Frames are rendered once, on a background thread, and a tick
+    #     swaps the canvas image for one already made (plus a region copy when the outline
+    #     moved, which is a few native calls on a cached handle);
+    #   * the brain returns a delay with each pose, so a standing Clawd is one sleeping
+    #     after() and no work at all until the next blink, seconds away.
+    def _pet_supported(self):
+        """Only the stock floating Clawd can be animated: orbpet redraws that one artwork."""
+        return bool(ORB_FLOAT and ORB_IMAGE and Path(ORB_IMAGE).name == ORB_PET_IMAGE)
+
+    def _pet_live(self):
+        """Is the pet what the collapsed orb should be showing right now?"""
+        return bool(self.orb_pet and not self.expanded and self._pet_frames
+                    and self._pet_supported())
+
+    def _pet_prepare(self):
+        """Draw every frame, once, off the UI thread. Safe to call repeatedly."""
+        if self._pet_frames is not None or self._pet_rendering or not self._pet_supported():
+            return
+        self._pet_rendering = True
+        size = self.orb_size
+
+        def work():
+            try:
+                frames = orbpet.render_all(size, ORB_IMAGE_MARGIN)
+            except Exception:
+                frames = {}               # falsy → the still icon stays; never retried
+            self._pet_frames = frames     # one assignment; the UI thread only ever reads it
+            self._pet_rendering = False
+
+        threading.Thread(target=work, name="orb-pet-render", daemon=True).start()
+
+    def _pet_photo(self, pose):
+        photo = self._pet_photos.get(pose)
+        if photo is None:
+            img = (self._pet_frames or {}).get(pose)
+            if img is None:
+                return None
+            photo = self._pet_photos[pose] = ImageTk.PhotoImage(img)
+        return photo
+
+    def _pet_start(self):
+        """Called on collapse (and when the setting is switched on while collapsed)."""
+        self._pet_stop()
+        if not (self.orb_pet and self._pet_supported()) or self.expanded:
+            return
+        self._pet_prepare()
+        self._pet_brain.reset(time.monotonic(), busy=self.busy)
+        self._pet_pose = orbpet.REST
+        self._pet_sil = None
+        # Well after the collapse's own after(30, _apply_region), so the first frame never
+        # competes with the collapse itself.
+        self._pet_after = self.root.after(350, self._pet_tick)
+
+    def _pet_stop(self):
+        if self._pet_after is not None:
+            try:
+                self.root.after_cancel(self._pet_after)
+            except Exception:
+                pass
+            self._pet_after = None
+
+    def _pet_kick(self):
+        """Something happened (hover, drag, reply started or landed): drop the pending delay,
+        which belonged to the old plan, and take the next step now."""
+        if self._pet_after is not None:
+            self._pet_stop()
+            self._pet_tick()
+
+    def _pet_tick(self):
+        self._pet_after = None
+        if self.expanded or not self.orb_pet or self._quitting:
+            return
+        if not self._pet_frames:
+            if self._pet_frames is None:              # still rendering: look again shortly
+                self._pet_after = self.root.after(120, self._pet_tick)
+            return                                    # {} = rendering failed; stay still
+        if not self.visible:                          # hidden by the hotkey: just idle
+            self._pet_after = self.root.after(1000, self._pet_tick)
+            return
+        try:
+            now = time.monotonic()
+            # _set_busy tells the brain at once; a compaction flips self.busy directly, so
+            # pick that up here (a no-op when nothing changed).
+            self._pet_brain.set_busy(self.busy or self._compacting, now)
+            # Which side the pointer is on, for the "watch" idle clip. Read once per tick
+            # (two Tk lookups), never polled: Clawd looks over when he next feels like it.
+            dx = self.root.winfo_pointerx() - (self.orb.winfo_rootx() + self.orb_size // 2)
+            self._pet_brain.pointer = (dx > self.orb_size) - (dx < -self.orb_size)
+            pose, delay = self._pet_brain.step(now)
+            self._pet_show(pose)
+        except Exception:
+            return                                    # a broken pet stops; the orb still works
+        self._pet_after = self.root.after(max(1, delay), self._pet_tick)
+
+    def _pet_show(self, pose):
+        """Put one ready frame on the orb. The window region is only touched when the
+        outline differs from the one it is clipped to (a blink or a glance never does)."""
+        first = self._pet_sil is None
+        if pose == self._pet_pose and not first:
+            return
+        photo = self._pet_photo(pose)
+        if photo is None:
+            return
+        sil = orbpet.silhouette_key(pose)
+        grow = sil != self._pet_sil
+        self._pet_pose = pose
+        if grow:
+            self._pet_sil = sil
+            self._pet_set_region()                    # widen the clip before painting into it
+        if first or self._orb_img_item is None:
+            self._draw_orb()                          # first frame: swap the still icon out
+        else:
+            self._orb_photo = photo
+            self.orb.itemconfigure(self._orb_img_item, image=photo)
+
+    def _collapsed_layout(self):
+        """(W, H, x_orb) of the collapsed window: the orb alone, or the orb over its name."""
+        s = self.orb_size
+        if (self.overlay_name or "").strip() and getattr(self, "_name_pill_size", None):
+            pw, ph = self._name_pill_size
+            W, H = max(s, pw), s + self.px(5) + ph
+            return W, H, (W - s) // 2
+        return s, s, 0
+
+    def _pet_extras_rgn(self):
+        """HRGN of what shares the collapsed window with the sprite (the name under it, the
+        done-badge on it), or None. Built once per collapse / badge change, not per frame."""
+        if self._pet_extras is not False:
+            return self._pet_extras
+        self._pet_extras = None
+        named = bool((self.overlay_name or "").strip())
+        badge = bool(getattr(self, "_task_done_badge", False))
+        if named or badge:
+            try:
+                W, H, x_orb = self._collapsed_layout()
+                s = self.orb_size
+                mask = Image.new("L", (W, H), 0)
+                if named:
+                    pw, ph = self._name_pill_size
+                    box = ((W - pw) // 2, s + self.px(5))
+                    lm = getattr(self, "_name_label_mask", None)
+                    if lm is not None and lm.size == (pw, ph):
+                        mask.paste(lm, box)
+                    else:
+                        ImageDraw.Draw(mask).rectangle(
+                            [box[0], box[1], box[0] + pw - 1, box[1] + ph - 1], fill=255)
+                if badge:
+                    bx, by, br = self._badge_geom(x_orb)
+                    ImageDraw.Draw(mask).ellipse([bx - br, by - br, bx + br, by + br], fill=255)
+                self._pet_extras = self._build_alpha_region(mask)
+            except Exception:
+                self._pet_extras = None
+        return self._pet_extras
+
+    def _pet_drop_extras(self):
+        if self._pet_extras:
+            _gdi32.DeleteObject(self._pet_extras)
+        self._pet_extras = False
+
+    def _pet_region(self, w, h):
+        """A fresh HRGN for the current frame at window size (w, h), or None when the pet
+        can't supply one (the caller falls back to the still silhouette). The per-outline
+        region is built once and kept; each call hands out a copy, since Windows takes
+        ownership of whatever SetWindowRgn is given."""
+        if not self._pet_live() or self._pet_sil is None:
+            return None
+        W, H, x_orb = self._collapsed_layout()
+        if (W, H) != (w, h):
+            return None
+        master = self._pet_rgns.get(self._pet_sil)
+        if master is None:
+            img = self._pet_frames.get(self._pet_pose)
+            master = self._build_alpha_region(img.split()[3]) if img is not None else None
+            if not master:
+                return None
+            self._pet_rgns[self._pet_sil] = master
+        rgn = _gdi32.CreateRectRgn(0, 0, 0, 0)
+        if not rgn:
+            return None
+        _gdi32.CombineRgn(rgn, master, None, 5)            # RGN_COPY
+        if x_orb:
+            _gdi32.OffsetRgn(rgn, x_orb, 0)
+        extras = self._pet_extras_rgn()
+        if extras:
+            _gdi32.CombineRgn(rgn, rgn, extras, 2)         # RGN_OR
+        return rgn
+
+    def _pet_set_region(self):
+        """Clip the window to the current frame. Unlike _apply_region this skips
+        update_idletasks(): the window's size has not changed, only the outline inside it."""
+        try:
+            rgn = self._pet_region(self.root.winfo_width(), self.root.winfo_height())
+            if not rgn:
+                return
+            hwnd = _user32.GetAncestor(self.root.winfo_id(), 2) or self.root.winfo_id()
+            if not _user32.SetWindowRgn(hwnd, rgn, True):
+                _gdi32.DeleteObject(rgn)
+        except Exception:
+            pass
+
+    def toggle_orb_pet(self):
+        """⚙ → Animated icon. Remembered across launches; takes effect at once if collapsed."""
+        self.orb_pet = not self.orb_pet
+        _save_state(orb_pet=self.orb_pet)
+        if self.orb_pet:
+            self._pet_prepare()                       # ready by the time the — is clicked
+            self._pet_start()
+            self.add_sys("🦀 Animated icon on — collapse the overlay and Clawd keeps you company."
+                         if self._pet_supported() else
+                         "Animated icon is on, but it only animates the stock Clawd icon "
+                         "(ORB_IMAGE / ORB_FLOAT were changed in config.py).")
+        else:
+            self._pet_stop()
+            self._pet_pose, self._pet_sil = orbpet.REST, None
+            if not self.expanded:
+                self._draw_orb()
+                self.root.after(10, self._apply_region)
+            self.add_sys("Animated icon off — the collapsed icon stays still.")
 
     def _badge_geom(self, x_off=0):
         """(centre_x, centre_y, radius) of the done-badge, relative to a collapsed-window origin
@@ -2864,12 +3111,18 @@ class Overlay:
         self._drag = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
 
     def _orb_drag(self, e):
+        if not self._orb_moved and self._pet_live():   # picked up: once per drag, not per motion
+            self._pet_brain.hold(True, time.monotonic())
+            self._pet_kick()
         self._orb_moved = True
         self.root.geometry(f"+{e.x_root - self._drag[0]}+{e.y_root - self._drag[1]}")
 
     def _orb_release(self, e):
         if not self._orb_moved:
             self.toggle_collapse()   # click the bubble → expand
+        elif self._pet_brain.held:
+            self._pet_brain.hold(False, time.monotonic())   # put down
+            self._pet_kick()
 
     # ── small widgets ──
     def _title_btn(self, parent, text, cmd):
@@ -2993,6 +3246,7 @@ class Overlay:
             (row(self.window_shot, "Window-only"), self.toggle_window_shot),
             (row(self.share_visible, "Shareable"), self.toggle_screen_share),
             (row(self.read_only, "Read-only"), self.toggle_read_only),
+            (row(self.orb_pet, "Animated icon"), self.toggle_orb_pet),
             (self.GEAR_SEP, None),
             ("      Attach files…", self._pick_attachments),
             ("      Past conversations…", self.show_sessions),
@@ -3710,11 +3964,13 @@ class Overlay:
                 r = self.px(CORNER_RADIUS)
                 rgn = _gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, r, r)
             else:
-                rgn = None
+                # The animated orb is clipped to the frame it is showing, not to the still
+                # artwork: re-applying the still outline here would cut a raised arm off.
+                rgn = self._pet_region(w, h)
                 # Named-collapse: clip to the composite silhouette (orb sprite ∪ name pill) so the
                 # pill floats as its own rounded tag under the free-floating orb.
                 cm = getattr(self, "_collapsed_mask", None)
-                if cm is not None and cm.size == (w, h):
+                if rgn is None and cm is not None and cm.size == (w, h):
                     rgn = self._build_alpha_region(cm)
                 if rgn is None and ORB_FLOAT and getattr(self, "_orb_mask", None) is not None \
                         and self._orb_mask_size == (w, h):
@@ -3769,6 +4025,7 @@ class Overlay:
         [+ badge] with no surrounding box. None when neither extra is present (the plain orb
         sprite/ellipse fast path handles that). Built only on collapse / badge-or-name change — never
         in a <Configure> loop, so it stays off the v1.1.9 freeze path. None on failure too."""
+        self._pet_drop_extras()           # the animated orb's copy of the pill/badge outline
         if self.expanded:
             self._collapsed_mask = None
             return
@@ -3819,6 +4076,9 @@ class Overlay:
             self._draw_orb()                 # draw (or remove) the badge dot
             self._rebuild_collapsed_mask()   # include/exclude the badge circle in the clip region
             self.root.after(10, self._apply_region)
+            if on and self._pet_live():      # the reply landed while collapsed: Clawd cheers
+                self._pet_brain.celebrate(time.monotonic())
+                self._pet_kick()
 
     def _maybe_flag_done(self):
         """A reply just finished — flag the orb as 'done' if it actually produced text. The badge
@@ -6509,9 +6769,12 @@ class Overlay:
                 self.root.minsize(s, s)
                 self.root.geometry(f"{s}x{s}+{gx + gw - s}+{gy}")   # stay at top-right corner
             self.expanded = False
+            self._pet_pose, self._pet_sil = orbpet.REST, None
             self._draw_orb()                  # ensure the badge (if any) is drawn for this collapse
             self._rebuild_collapsed_mask()    # silhouette = sprite [+ name] [+ badge]
+            self._pet_start()                 # arms the pet's one timer (no-op when switched off)
         else:
+            self._pet_stop()                  # expanded → no pet timer at all
             self._collapsed_mask = None
             # Do NOT clear the done-badge on expand: it must survive expand→collapse and only go
             # away when the next turn starts (add_user) or on reset. Re-collapsing redraws it.
@@ -6579,6 +6842,9 @@ class Overlay:
 
     def _set_busy(self, busy):
         self.busy = busy
+        if self._pet_after is not None:   # collapsed with the pet running: shuffle / stop
+            self._pet_brain.set_busy(busy or self._compacting, time.monotonic())
+            self._pet_kick()
         self._refresh_send()
         self._paint_provider_switch()
         self.busy_lbl.configure(text="thinking…" if busy else "")
