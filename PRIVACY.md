@@ -39,7 +39,7 @@ body specifically so that you can paste the URL into a browser and see what leav
 |---|---|---|
 | `v` | the overlay version | `1.22.1` |
 | `id` | a random install id | `3f2a…` (a uuid4) |
-| `os` | the OS build | `10.0.26100` |
+| `os` | the OS build | `10.0.26100` (Windows) · `macos-15.5` (macOS) |
 | `py` | the Python version, major.minor | `3.14` |
 
 Those are the four **telemetry parameters**, and a test pins the key set so a fifth

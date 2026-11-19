@@ -102,6 +102,10 @@ def _os_build():
     "can I stop supporting Windows 10 yet" and nothing finer."""
     try:
         import platform
+        if sys.platform == "darwin":
+            # platform.version() is the Darwin kernel's build banner there. The product
+            # version, prefixed so it can't be mistaken for a Windows build: "macos-15.5".
+            return _clean("macos-" + platform.mac_ver()[0])
         return _clean(platform.version())
     except Exception:
         return ""

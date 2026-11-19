@@ -85,6 +85,23 @@ class FakeWorker:
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _no_real_keychain():
+    """No test may read the developer's real Claude login out of the macOS keychain.
+
+    The real Overlay asks authstate.dead_reason() on a timer, and on a Mac that spawns
+    `security find-generic-password -w` — the actual OAuth record of whoever runs the
+    suite. Nothing was ever done with it, but a test run has no business holding it. The
+    tests about the keychain replace this reader with their own fake (function-scoped, so
+    it wins and is undone); every other test sees a Mac with no stored login."""
+    import authstate
+    real = authstate._keychain_read
+    authstate._real_keychain_read = real    # for the one test of the reader itself, which
+    authstate._keychain_read = lambda: None  # fakes the subprocess underneath it
+    yield
+    authstate._keychain_read = real
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _no_real_telemetry():
     """Hard floor: no test may reach the real collector, whatever else it stubs.
 

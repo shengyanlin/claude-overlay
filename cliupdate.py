@@ -67,9 +67,16 @@ def npm_prefix(cli="claude"):
     if not exe or os.path.splitext(exe)[1].lower() not in (".cmd", ".bat", ".ps1", ""):
         return None
     folder = os.path.dirname(exe)
-    if not os.path.isdir(os.path.join(folder, "node_modules", *pkg.split("/"))):
-        return None
-    return folder
+    if os.path.isdir(os.path.join(folder, "node_modules", *pkg.split("/"))):
+        return folder                    # Windows layout: the shim sits beside node_modules
+    if sys.platform == "win32":
+        return None                      # ...and it is the only one npm has there
+    # Unix layout: <prefix>/bin/<cli> is a symlink into <prefix>/lib/node_modules/<pkg>.
+    # Anything that doesn't resolve into such a folder (Claude's native install is a
+    # symlink into ~/.local/share/claude) isn't npm's to update.
+    marker = os.sep + os.path.join("lib", "node_modules", *pkg.split("/")) + os.sep
+    real = os.path.realpath(exe)
+    return real[:real.index(marker)] if marker in real else None
 
 
 def npm_managed(cli="claude"):
@@ -84,7 +91,7 @@ def _find_npm():
     return shutil.which("npm")
 
 
-_ca_pem = None                             # the Windows-roots file, once written this run
+_ca_pem = None                             # the trusted-roots file, once written this run
 
 
 def _windows_ca_pem():
@@ -93,13 +100,17 @@ def _windows_ca_pem():
     site with the organisation's own root, which Windows trusts and Node.js's built-in list
     doesn't, so npm fails with UNABLE_TO_GET_ISSUER_CERT_LOCALLY (a field report on 1.25.2).
     Written once a run (rewritten if it went missing); imported lazily so a broken windowsca
-    can't cost us the module."""
+    can't cost us the module. On a Mac it is _mac_ca_pem's file, under the same once-a-run
+    rule."""
     global _ca_pem
     if _ca_pem == "":                    # couldn't be written this run: don't keep trying
         return None
     if _ca_pem and os.path.isfile(_ca_pem):
         return _ca_pem
     _ca_pem = ""
+    if sys.platform == "darwin":
+        _ca_pem = _mac_ca_pem() or ""
+        return _ca_pem or None
     if sys.platform != "win32":
         return None
     try:
@@ -110,11 +121,127 @@ def _windows_ca_pem():
     return _ca_pem or None
 
 
+_SECURITY = "/usr/bin/security"            # by path: a trust decision shouldn't ride on PATH
+_MAC_CA_BUDGET = 10                        # seconds, for one run's `security` calls together
+_PEM_CERT = re.compile(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", re.S)
+
+
+def _is_root_ca(der):
+    """True for a self-issued CA certificate that OpenSSL — Node.js's reader — can load: the
+    only kind worth handing over as an extra CA. macOS also verifies an ordinary certificate
+    issued under a trusted root (this Mac's own identity in the System keychain, say), and
+    that is not a root to trust anything by."""
+    import ssl
+    try:
+        # truststore (config.py) swaps ssl.SSLContext for a subclass that refuses to list
+        # what it loaded; the real class is the one right under it.
+        real = next(c for c in ssl.SSLContext.__mro__ if c.__module__ == "ssl")
+        ctx = real(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_verify_locations(cadata=der)
+        cas = ctx.get_ca_certs()         # lists CA certificates only
+        return len(cas) == 1 and cas[0]["subject"] == cas[0]["issuer"]
+    except Exception:
+        return False
+
+
+def _mac_trusts_for_ssl(pem_file, timeout=_MAC_CA_BUDGET):
+    """Whether macOS itself accepts the certificate in this PEM file for an HTTPS server.
+    A keychain only STORES certificates: one that sits there with no trust granted, or set to
+    "Never Trust", is not trusted, and `find-certificate` returns it all the same. So each
+    one goes through the system's own evaluation, which applies the admin's and the user's
+    trust settings for the SSL policy. -l: the certificate is a CA, not a site's; -L: nothing
+    is fetched from the network. Raises when `security` can't run or doesn't answer in time."""
+    r = subprocess.run([_SECURITY, "verify-cert", "-c", str(pem_file), "-p", "ssl",
+                        "-l", "-L", "-q"],
+                       capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    return r.returncode == 0
+
+
+def _mac_trusted_roots():
+    """DER of each root CA in the user's keychains that macOS trusts for HTTPS, in keychain
+    order. The default search list — login and System, where an organisation's or the user's
+    own root is installed — and not Apple's SystemRootCertificates: Node.js brings the public
+    roots itself, and NODE_EXTRA_CA_CERTS only adds to them. Raises on any failure, a timeout
+    included, so the caller writes every trusted root or no file — never a partial one."""
+    import ssl
+    import tempfile
+    deadline = time.monotonic() + _MAC_CA_BUDGET
+
+    def left():
+        t = deadline - time.monotonic()
+        if t <= 0:
+            raise TimeoutError("security")
+        return t
+
+    r = subprocess.run([_SECURITY, "find-certificate", "-a", "-p"], capture_output=True,
+                       timeout=left(), stdin=subprocess.DEVNULL)
+    if r.returncode != 0:
+        raise OSError("security find-certificate")
+    roots, seen = [], set()
+    with tempfile.TemporaryDirectory(prefix="claude-overlay-ca-") as tmp:
+        one = os.path.join(tmp, "cert.pem")
+        for block in _PEM_CERT.findall(r.stdout.decode("ascii", "replace")):
+            try:
+                der = ssl.PEM_cert_to_DER_cert(block)
+            except Exception:
+                continue
+            if der in seen or not _is_root_ca(der):
+                continue
+            seen.add(der)
+            with open(one, "w", encoding="ascii", newline="\n") as f:
+                f.write(ssl.DER_cert_to_PEM_cert(der))
+            if _mac_trusts_for_ssl(one, left()):
+                roots.append(der)
+    return roots
+
+
+def _mac_ca_pem():
+    """The macOS counterpart of windowsca: one PEM file of the roots the organisation or the
+    user installed AND this Mac trusts for HTTPS (see _mac_trusts_for_ssl) — an
+    HTTPS-inspecting proxy's root is one of those. A current Node.js reads the keychain itself
+    (NODE_USE_SYSTEM_CA) and takes these same roots from it, so the file adds nothing there;
+    it is for a Node.js too old for that, and is written either way rather than guess from a
+    version number which Node npm will run under. Read-only `security` calls. None — and no
+    file left behind, an earlier run's included — when nothing is trusted or anything fails."""
+    try:
+        import config
+        path = config._data_home() / "claude-overlay" / "mac-ca.pem"
+    except Exception:
+        return None
+    try:
+        import ssl
+        import tempfile
+        pem = "".join(ssl.DER_cert_to_PEM_cert(der) for der in _mac_trusted_roots())
+        if pem:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # A file of its own, then os.replace (as windowsca): an npm reading this moment
+            # sees the old file or the new one, never half of one.
+            fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".partial",
+                                       dir=path.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="ascii", newline="\n") as f:
+                    f.write(pem)
+                os.replace(tmp, path)
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            return str(path)
+    except Exception:
+        pass
+    try:
+        path.unlink()                    # what it held may no longer be trusted
+    except OSError:
+        pass
+    return None
+
+
 def _npm_env():
-    """The environment npm runs in: this one, plus Windows' certificates for Node.js —
+    """The environment npm runs in: this one, plus the system's certificates for Node.js —
     NODE_USE_SYSTEM_CA for a Node.js that reads the store itself, NODE_EXTRA_CA_CERTS (see
-    _windows_ca_pem) for one that doesn't. Nothing is switched off: npm still checks every
-    certificate. Either variable already set is kept."""
+    _windows_ca_pem; on a Mac, _mac_ca_pem) for one that doesn't. The file holds only roots
+    the system trusts for HTTPS, so it grants a current Node.js nothing its own reading of the
+    store doesn't. Nothing is switched off: npm still checks every certificate. Either
+    variable already set is kept."""
     env = dict(os.environ)
     env.setdefault("NODE_USE_SYSTEM_CA", "1")
     if not env.get("NODE_EXTRA_CA_CERTS"):
@@ -144,8 +271,17 @@ def _run(args, timeout, env_extra=None):
     try:
         env = _npm_env()
         env.update(env_extra or {})
-        r = subprocess.run("cmd /c " + _cmdline(args), capture_output=True, timeout=timeout,
-                           env=env, creationflags=_CREATE_NO_WINDOW)
+        if sys.platform == "win32":
+            r = subprocess.run("cmd /c " + _cmdline(args), capture_output=True,
+                               timeout=timeout, env=env, creationflags=_CREATE_NO_WINDOW)
+        else:
+            # No shell needed (or wanted) off Windows: npm and codex are executables there,
+            # and an argument list reaches them exactly as written.
+            exe = shutil.which(args[0], path=env.get("PATH"))
+            if not exe:
+                return None
+            r = subprocess.run([exe, *args[1:]], capture_output=True, timeout=timeout,
+                               env=env, stdin=subprocess.DEVNULL)
     except Exception:
         return None
     dec = lambda b: (b or b"").decode("utf-8", "replace")

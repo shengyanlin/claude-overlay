@@ -121,6 +121,7 @@ class TestFields:
     def test_os_build_never_raises(self, monkeypatch):
         import platform
         monkeypatch.setattr(platform, "version", lambda: (_ for _ in ()).throw(OSError("no")))
+        monkeypatch.setattr(platform, "mac_ver", lambda: (_ for _ in ()).throw(OSError("no")))
         assert telemetry._os_build() == ""
 
 

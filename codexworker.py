@@ -114,13 +114,28 @@ def codex_command():
 
 def _npm_native_exe(npm_dir):
     arch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
-    triple = "aarch64-pc-windows-msvc" if arch == "arm64" else "x86_64-pc-windows-msvc"
-    root = os.path.join(npm_dir, "node_modules", "@openai", "codex")
-    for base in (os.path.join(root, "node_modules", "@openai", f"codex-win32-{arch}", "vendor"),
-                 os.path.join(root, "vendor")):
-        exe = os.path.join(base, triple, "bin", "codex.exe")
-        if os.path.isfile(exe):
-            return exe
+    cpu = "aarch64" if arch == "arm64" else "x86_64"
+    # This OS's build and this OS's install layout, nothing else: on Windows exactly the
+    # lookup there has always been. Windows: the package sits beside the shim. Unix:
+    # <prefix>/bin/codex is a symlink to ../lib/node_modules/@openai/codex/bin/codex.js, so
+    # the package is two folders up from wherever that link really points.
+    if sys.platform == "win32":
+        osname, triple, binary = "win32", f"{cpu}-pc-windows-msvc", "codex.exe"
+        roots = [os.path.join(npm_dir, "node_modules", "@openai", "codex")]
+    else:
+        if sys.platform == "darwin":
+            osname, triple, binary = "darwin", f"{cpu}-apple-darwin", "codex"
+        else:
+            osname, triple, binary = "linux", f"{cpu}-unknown-linux-musl", "codex"
+        roots = [os.path.dirname(os.path.dirname(
+            os.path.realpath(os.path.join(npm_dir, "codex"))))]
+    for root in roots:
+        for base in (os.path.join(root, "node_modules", "@openai",
+                                  f"codex-{osname}-{arch}", "vendor"),
+                     os.path.join(root, "vendor")):
+            exe = os.path.join(base, triple, "bin", binary)
+            if os.path.isfile(exe):
+                return exe
     return None
 
 

@@ -11,6 +11,7 @@ import tkinter as tk
 import pytest
 
 import claude_overlay as co
+from config import CODEX_SETUP_SCRIPT
 from conftest import chat_text
 
 
@@ -113,7 +114,7 @@ def test_a_failed_install_says_how_to_do_it_by_hand(overlay, monkeypatch):
     assert "didn't install" in chat_text(overlay)
     assert "npm install -g @openai/codex" in chat_text(overlay)
     overlay._handle("codex_setup_result", (False, ""))
-    assert "Couldn't start install-codex.cmd" in chat_text(overlay)
+    assert f"Couldn't start {CODEX_SETUP_SCRIPT}" in chat_text(overlay)
 
 
 def test_a_second_offer_while_one_runs_does_not_stack_a_button(overlay, monkeypatch):

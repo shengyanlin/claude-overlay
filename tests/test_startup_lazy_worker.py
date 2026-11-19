@@ -6,6 +6,7 @@ the seam that move created: _make_worker must resolve the class from the right p
 each of its three worlds — patched (tests), imported (a real launch), failed (a machine
 with a broken claude_agent_sdk)."""
 import queue
+import sys
 
 import pytest
 
@@ -84,6 +85,7 @@ def test_a_non_ascii_interpreter_path_writes_nothing_and_truncates_nothing(
         "the existing record must survive a failed write untouched"
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="pythonw.exe and Windows paths")
 def test_only_a_windowless_interpreter_is_worth_caching():
     """The launcher's last-resort console fallback runs python.exe, which reaches
     __main__ like any launch. Caching THAT would pin a console flash onto every future
@@ -98,6 +100,7 @@ def test_only_a_windowless_interpreter_is_worth_caching():
     # windowless interpreter, it is a launcher — let the scan resolve it every time.
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Tk's -disabled attribute is Windows-only")
 def test_the_window_takes_input_again_after_build(overlay):
     """_build paints the window inside root.update() — a nested event loop that could
     dispatch a queued click to a handler touching the not-yet-created worker — so the

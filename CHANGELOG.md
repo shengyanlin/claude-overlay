@@ -3,6 +3,52 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Claude Overlay runs on macOS.
+
+### Added
+- **macOS support.** The same overlay, feature for feature, from the same code: a new
+  platform layer (`macutils.py`) answers the calls the window code used to make on Win32,
+  so nothing in the UI was forked. On a Mac the overlay floats over full-screen apps and
+  follows you across Spaces, asks macOS to leave it out of screenshots and screen shares
+  unless **Shareable** is on (best effort there — see below), captures every display (or only the window you were working in),
+  and collapses to the same free-floating Clawd. What differs is listed in the new
+  [macOS guide](docs/macos.md): the hotkey is `⌥⇧Space` (macOS keeps `⌃⌥Space` for input
+  sources), a menu-bar icon stands in for the taskbar button, `⌘` joins `Ctrl` for zoom /
+  paste / copy, a trackpad scrolls the chat, and Claude drives the app you have open with
+  AppleScript instead of PowerShell.
+- **`setup.command`, `update.command`, `Diagnose.command`, `install-codex.sh`** — the
+  macOS counterparts of the `.cmd` files, with the same steps and exit codes, so the
+  overlay's one-click update and Codex setup work the same way. `setup.command` builds the
+  app's own Python environment (installing Python into your user folder when the Mac has
+  none new enough) and **`Claude Overlay.app`**, a launcher you can keep in the Dock.
+  Updates leave that launcher untouched unless it has to change, so the Screen Recording
+  and Automation permissions macOS remembers for it carry over.
+- **Works on the Tk a Mac's Python actually has.** Tested on Tk 9.0 and on Tk 8.6, which
+  python.org's Python still ships.
+- **The allowance ring and the dead-login notice work on macOS**, where the `claude` CLI
+  keeps its login in the keychain rather than in `.credentials.json`.
+- **Hiding from screen shares is checked, not assumed, on macOS.** Windows guarantees that
+  a window marked hidden stays out of every capture; macOS only takes it as a request. So
+  the first time it takes a screenshot the overlay tests, with a 16-point window of its
+  own, whether this Mac honours the request. If it does, nothing changes; if it doesn't,
+  the overlay fades itself out for the length of each of its own screenshots instead and
+  says in the chat that **Shareable** off can't be relied on here.
+
+### Changed
+- The pure screen-geometry helpers moved out of `win32utils.py` into `screengeom.py`, which
+  both platform layers import. No behaviour change on Windows.
+- `requirements.txt` installs `keyboard` on Windows only, and `pyobjc` / `truststore` on
+  macOS only.
+- CI runs the suite on macOS as well as Windows, and on both it now also **starts the app
+  for real** (`python claude_overlay.py`, for 15 seconds) and fails if it exits, writes a
+  crash log or reports a Tk callback error — the check for "every test passes and the app
+  doesn't open".
+- **The README is a short landing page now.** Install, controls, configuration, updating,
+  troubleshooting and the full security note each moved, unchanged in substance, to their
+  own page under [`docs/`](docs/).
+
 ## [1.28.0] - 2026-11-11
 
 The collapsed icon is now a small desktop pet: Clawd blinks, looks around, and reacts to what

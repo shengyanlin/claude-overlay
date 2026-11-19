@@ -8,6 +8,9 @@ venv/
 
 # Machine-specific launchers / shortcuts (recreate locally)
 *.lnk
+# macOS: the launcher bundle mac-app.sh builds - it embeds this folder's absolute path
+Claude Overlay.app/
+.claude-overlay-app.*/
 
 # Logs & scratch
 *.log

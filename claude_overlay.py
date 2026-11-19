@@ -153,8 +153,13 @@ try:
     from config import *
     from config import __version__
     from debuglog import dbg, DEBUG_LOG
-    from win32utils import *
-    from win32utils import _user32, _gdi32
+    # The platform layer: the same names either way (see macutils' module docstring).
+    if sys.platform == "darwin":
+        from macutils import *
+        from macutils import _user32, _gdi32
+    else:
+        from win32utils import *
+        from win32utils import _user32, _gdi32
     import authstate
     import codexworker
     import modelresolve
@@ -674,6 +679,20 @@ class _WorkerSink:
                 self._q.put(item, *a, **k)
 
 
+# Tk's Windows-only cursor names, and what Tk's macOS port calls the same pointers.
+_MAC_CURSORS = {"size_ns": "resizeupdown", "size_we": "resizeleftright",
+                "size_nw_se": "resizebottomright", "size_ne_sw": "resizebottomleft"}
+_MAC_EDGE_CURSORS = {"nw": "resizetopleft", "ne": "resizetopright",
+                     "sw": "resizebottomleft", "se": "resizebottomright"}
+
+
+def _cursor(name, corner=None):
+    """A cursor name this platform's Tk accepts (an unknown one raises at widget creation)."""
+    if not IS_MAC:
+        return name
+    return _MAC_EDGE_CURSORS.get(corner) or _MAC_CURSORS.get(name, name)
+
+
 def round_rect(c, x1, y1, x2, y2, r, **kw):
     pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
            x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
@@ -910,21 +929,41 @@ class Overlay:
 
     # ── construction ──
     def _build(self):
+        if IS_MAC:
+            note_windows_before_root()         # so the root's NSWindow can be told apart
         self.root = tk.Tk()
         self.root.title(self._provider_name())
         self.s = max(1.0, self.root.winfo_fpixels("1i") / 96.0)   # DPI scale factor
-        self.root.overrideredirect(True)
+        if IS_MAC:
+            self.s = 1.0                       # Tk works in points there; the OS scales
+        else:
+            self.root.overrideredirect(True)   # (macOS: after the geometry, below)
         self._apply_app_icon()                 # Clawd icon for the taskbar button / alt-tab
         self.root.configure(bg=T["bg"])
         self.root.attributes("-topmost", True)
         if WINDOW_ALPHA < 1.0:   # avoid WS_EX_LAYERED, which ignores SetWindowRgn rounding
             self.root.attributes("-alpha", WINDOW_ALPHA)
         w, h = self.px(420), self.px(620)
-        wa = wt.RECT()                                  # primary monitor work area
-        _user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(wa), 0)
-        x = max(self.px(10), wa.right - w - self.px(28))
-        y = wa.top + self.px(56)
+        if IS_MAC:
+            _mons = enumerate_monitors()                # primary first
+            _l, wa_top, wa_right, _b = _mons[0]["work"] if _mons else (0, 0, 1440, 900)
+        else:
+            wa = wt.RECT()                              # primary monitor work area
+            _user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(wa), 0)
+            wa_right, wa_top = wa.right, wa.top
+        x = max(self.px(10), wa_right - w - self.px(28))
+        y = wa_top + self.px(56)
         self.root.geometry(f"{w}x{h}+{x}+{y}")
+        if IS_MAC:
+            # Order matters on Tk's macOS port: asked for before the window has a size,
+            # overrideredirect is ignored and the geometry with it (the window opens
+            # titled, at the screen corner). And dropping the title bar afterwards moves
+            # the window down by the bar's height, so the geometry is set again.
+            self.root.update_idletasks()
+            self.root.overrideredirect(True)
+            self.root.attributes("-topmost", True)    # Tk 8.6 drops it with the title bar
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
+            configure_window()
         self.root.minsize(self.px(330), self.px(300))
 
         avail = set(tkfont.families())
@@ -1016,14 +1055,18 @@ class Overlay:
         # millisecond-scale race nobody will ever lose, but disabled-while-building makes
         # it not a race at all, and it costs two lines. (-disabled is Windows-specific Tk,
         # which this whole app already is.)
-        self.root.attributes("-disabled", True)
+        if not IS_MAC:                         # Tk's macOS port has no -disabled
+            self.root.attributes("-disabled", True)
         try:
             self.root.update_idletasks()
             self.root.update()
             self.worker = self._make_worker(self._launch_mode)
             self.worker.start()
         finally:
-            self.root.attributes("-disabled", False)
+            if not IS_MAC:
+                self.root.attributes("-disabled", False)
+        if IS_MAC:
+            self._mac_setup()
 
         self.root.after(130, lambda: (self.root.focus_force(), self.entry.focus_set()))
         self.root.bind("<Configure>", self._on_configure)
@@ -1041,6 +1084,64 @@ class Overlay:
         if self.provider == "claude":   # Claude's allowance; Codex reports its own (codexworker)
             self._start_usage_poll()
         self._start_hang_watchdog()    # diagnostic: dumps all-thread stacks if the UI pump stalls
+
+    def _mac_setup(self):
+        """macOS-only wiring, once the window and the worker exist."""
+        # Two-finger scrolling: Tk 9 reports a trackpad as <TouchpadScroll> (pixel deltas),
+        # not <MouseWheel>. The chat's own handler keeps the follow-the-stream state in
+        # step, exactly as _on_wheel does; the bind_all catches the widgets embedded in the
+        # chat (bubbles, tables, chips), which would otherwise swallow the gesture.
+        try:
+            self.chat.bind("<TouchpadScroll>", self._on_touchpad)
+            self.root.bind_all("<TouchpadScroll>", self._on_touchpad_embedded, add="+")
+        except tk.TclError:
+            pass                                   # Tk 8.6: the wheel event covers both
+        # Launching an accessory app doesn't bring it forward by itself (there is no Dock
+        # tile to activate), so take the keyboard the way the hotkey path does — the
+        # window should be ready to type into the moment it appears, as on Windows.
+        self.root.after(160, lambda: (self._force_foreground(), self._safe_focus_entry()))
+        # An accessory app has no menu bar, so there is no Quit item to carry ⌘Q.
+        self.root.bind_all("<Command-q>", lambda e: self.quit())
+        try:
+            self.root.createcommand("::tk::mac::Quit", self.quit)
+        except Exception:
+            pass
+        # Without Screen Recording permission a capture doesn't fail — it comes back
+        # showing only the wallpaper. Say so up front, and let macOS show its prompt.
+        if not screen_capture_allowed():
+            self.add_sys(
+                "📷 macOS hasn't allowed this app to record the screen yet, so screenshots "
+                "are off until it does. Allow it in System Settings › Privacy & Security › "
+                "Screen & System Audio Recording — the entry is whatever you launched the "
+                "overlay from (Claude Overlay, or Terminal) — then restart the overlay.")
+            self.root.after(800, request_screen_capture)
+
+    def _on_touchpad(self, e):
+        """A trackpad scroll over the chat: the event carries (dx, dy) in pixels, packed
+        into one integer the way tk::PreciseScrollDeltas unpacks it."""
+        try:
+            low = int(e.delta) & 0xFFFF
+            dy = low if low < 0x8000 else low - 0x10000
+            if dy:
+                self.chat.yview_scroll(-dy, "pixels")
+                self._sync_follow()
+        except Exception:
+            pass
+        return "break"
+
+    def _on_touchpad_embedded(self, e):
+        """The same gesture landing on a widget embedded in the chat (or on its scrollbar
+        / jump button) — forwarded, like _fwd_wheel does for the mouse wheel. Anything
+        else (the input box) keeps Tk's own behaviour."""
+        try:
+            w = str(e.widget)
+            if w == str(self.chat):
+                return None                        # handled by the chat's own binding
+            if w.startswith(str(self.chat) + ".") or w.startswith(str(self.chat_wrap) + "."):
+                return self._on_touchpad(e)
+        except Exception:
+            pass
+        return None
 
     def _make_worker(self, mode):
         """The worker class, from wherever it is by now.
@@ -1175,9 +1276,10 @@ class Overlay:
             if provider == "codex":
                 return bool(codexworker.codex_command())
             import shutil
-            extra = [os.path.join(os.environ.get("USERPROFILE", ""), ".local", "bin"),
-                     os.path.join(os.environ.get("APPDATA", ""), "npm")]
-            path = os.pathsep.join([p for p in extra if p] + [os.environ.get("PATH", "")])
+            extra = [os.path.join(os.environ[v], *sub) for v, sub in
+                     (("USERPROFILE", (".local", "bin")), ("APPDATA", ("npm",)))
+                     if os.environ.get(v)]            # Windows' two; never a relative entry
+            path = os.pathsep.join(extra + [os.environ.get("PATH", "")])
             return bool(shutil.which("claude", path=path))
         except Exception:
             return True                  # never lock a switch on a lookup that broke
@@ -1815,9 +1917,18 @@ class Overlay:
             # Only claim exclusion when we asked for it AND the call succeeded. If anything
             # failed, treat the window as capturable so capture() still hides it via withdraw()
             # — never leak the overlay into the screenshots we send Claude.
-            self._capture_excluded = want_excluded and ok
+            # On macOS the call succeeding proves nothing (the system is free to ignore the
+            # request), so the claim also waits for capture() to have seen it work here.
+            self._capture_excluded = (want_excluded and ok
+                                      and (not IS_MAC or capture_exclusion_verified()))
         except Exception:
             self._capture_excluded = False
+        if IS_MAC:
+            # A type-ahead grab relies on the exclusion that was in force when it started
+            # (see _do_precapture). Whatever was just applied, a frame grabbed before it —
+            # cached, or still on its way back from the background thread — is void.
+            self._precapture_gen = getattr(self, "_precapture_gen", 0) + 1
+            self._precaptured = None
 
     # ── taskbar button (frameless windows get none by default) ──
     def _hwnd(self):
@@ -1843,6 +1954,12 @@ class Overlay:
         only writes when the bits actually need changing, so it's cheap to re-assert on
         every show/restore. No window-region / <Configure> work, so it's clear of the
         v1.1.9 freeze class."""
+        if IS_MAC:
+            # Nothing to stamp, but the same moments (every show/restore) are when Tk
+            # re-applies its own window style — so re-assert ours: frameless, on every
+            # Space, beside full-screen apps. Needed with or without a status item.
+            configure_window()
+            return
         if not TASKBAR_BUTTON:
             return
         try:
@@ -1870,6 +1987,14 @@ class Overlay:
         single withdraw→deiconify so it actually materializes the button (Windows only
         (re)evaluates taskbar membership when a window is shown). The brief hide/show is a
         one-shot at launch, not on the streaming path."""
+        if IS_MAC:
+            # The taskbar button's stand-in is a menu-bar icon: the overlay runs as an
+            # accessory app (the only kind allowed over full-screen apps), which has no
+            # Dock tile to click. It asks for the same thing the hotkey does.
+            self._set_taskbar_button()
+            if TASKBAR_BUTTON:
+                install_status_item(self._hotkey_fired, tooltip="Claude Overlay")
+            return
         if not TASKBAR_BUTTON:
             return
         self._set_taskbar_button()
@@ -2446,6 +2571,9 @@ class Overlay:
         self.entry.bind("<Control-v>", self._on_paste)
         self.entry.bind("<Control-V>", self._on_paste)
         self.entry.bind("<Shift-Insert>", self._on_paste)
+        if IS_MAC:
+            self.entry.bind("<Command-v>", self._on_paste)
+            self.entry.bind("<Command-V>", self._on_paste)
         self.entry.bind("<FocusIn>", self._ph_out)
         self.entry.bind("<FocusOut>", self._ph_in)
         self.entry.bind("<FocusIn>", self._precapture_soon, add="+")
@@ -2514,7 +2642,7 @@ class Overlay:
         st.bind("<Configure>", self._paint_modes, add="+")
         self._paint_modes()
         self.grip = tk.Label(st, text="◢", bg=T["bg"], fg=T["faint"], font=self.f_small,
-                             cursor="size_nw_se")
+                             cursor=_cursor("size_nw_se"))
         self.grip.pack(side="right", padx=(0, self.px(8)), pady=pad)
         self.grip.bind("<ButtonPress-1>", self._resize_start)
         self.grip.bind("<B1-Motion>", self._resize_move)
@@ -2584,7 +2712,13 @@ class Overlay:
             return cache[px_size]
         from PIL import ImageFont
         font = None
-        for path in (r"C:\Windows\Fonts\msjhbd.ttc",   # Microsoft JhengHei Bold (TC)
+        mac_fonts = ("/System/Library/Fonts/STHeiti Medium.ttc",        # Heiti (TC + SC)
+                     "/System/Library/Fonts/Hiragino Sans GB.ttc",
+                     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                     "/System/Library/Fonts/Helvetica.ttc")
+        for path in mac_fonts if IS_MAC else (
+                     r"C:\Windows\Fonts\msjhbd.ttc",   # Microsoft JhengHei Bold (TC)
                      r"C:\Windows\Fonts\msjh.ttc",     # Microsoft JhengHei
                      r"C:\Windows\Fonts\msyhbd.ttc",   # MS YaHei Bold (SC fallback)
                      r"C:\Windows\Fonts\segoeuib.ttf", # Segoe UI Bold (Latin)
@@ -3403,7 +3537,8 @@ class Overlay:
         Always ends by posting ("attach", …) so _paste_busy is cleared even on failure."""
         srcs = []
         try:
-            data = ImageGrab.grabclipboard()
+            # PIL's macOS grabclipboard only understands PNG data — no copied files.
+            data = grab_clipboard() if IS_MAC else ImageGrab.grabclipboard()
             if isinstance(data, Image.Image):
                 srcs.append(data)
             elif isinstance(data, list):
@@ -3809,7 +3944,7 @@ class Overlay:
         ]
         self._edge_widgets = []
         for place_kw, dirs, cur in edges:
-            f = tk.Frame(self.root, bg=T["bg"], cursor=cur)
+            f = tk.Frame(self.root, bg=T["bg"], cursor=_cursor(cur, dirs))
             f.place(**place_kw)
             f.bind("<ButtonPress-1>", lambda e, d=dirs: self._edge_resize_start(e, d))
             f.bind("<B1-Motion>", self._edge_resize_move)
@@ -3855,6 +3990,13 @@ class Overlay:
             for seq in ("<Control-minus>", "<Control-underscore>", "<Control-KP_Subtract>"):
                 w.bind(seq, lambda e: self._zoom_evt(-1))
             w.bind("<Control-0>", lambda e: self._zoom_evt(0))
+            if IS_MAC:                      # ⌘ +/−/0 is where a Mac user looks for zoom
+                for seq in ("<Command-plus>", "<Command-equal>", "<Command-KP_Add>"):
+                    w.bind(seq, lambda e: self._zoom_evt(1))
+                for seq in ("<Command-minus>", "<Command-underscore>",
+                            "<Command-KP_Subtract>"):
+                    w.bind(seq, lambda e: self._zoom_evt(-1))
+                w.bind("<Command-0>", lambda e: self._zoom_evt(0))
         self.chat.bind("<Control-MouseWheel>", lambda e: self._zoom_evt(1 if e.delta > 0 else -1))
         self.entry.bind("<Control-MouseWheel>", lambda e: self._zoom_evt(1 if e.delta > 0 else -1))
 
@@ -4343,6 +4485,9 @@ class Overlay:
         c.bind("<ButtonRelease-1>", on_release)
         c.bind("<Control-c>", on_ctrl_c)
         c.bind("<Control-C>", on_ctrl_c)
+        if IS_MAC:
+            c.bind("<Command-c>", on_ctrl_c)
+            c.bind("<Command-C>", on_ctrl_c)
         # Exposed for the same reason as _copy_btn's: Tk drops a synthesised <Button-1> on a
         # withdrawn widget and the suite runs withdrawn, so a test must call the handlers itself.
         c._on_click, c._on_ctrl_c = on_click, on_ctrl_c
@@ -4916,10 +5061,12 @@ class Overlay:
 
     def add_sys(self, text):
         self._md_finalize()
+        text = platform_text(text)          # this platform's script / key names
         self._ins("\n" + ("" if text is None else str(text)) + "\n", "sys")
 
     def add_err(self, text):
         self._md_finalize()
+        text = platform_text(text)
         self._ins("\n⚠  " + ("" if text is None else str(text)) + "\n", "err")
 
     # ── "your CLI is out of date" notice + one-click update (see cliupdate.py) ──────────
@@ -6004,6 +6151,9 @@ class Overlay:
         None when there is nothing to send. The screenshot is taken HERE — at the moment
         the user hit Enter — not when a queued message finally goes out: the screen they
         were looking at while typing is the one the message is about."""
+        if getattr(self, "_capturing", False):
+            return None     # macOS: a second Enter delivered while the first send is still
+                            # taking its screenshot. That send has the text; this is nothing.
         text = self._entry_text()
         shots = None
         if self.auto_shot:
@@ -6346,6 +6496,9 @@ class Overlay:
             return
         if self._capture_busy:                       # a grab is already in flight — don't pile up
             return
+        if IS_MAC and not self._capture_excluded:
+            return      # this grab never hides the window: without a PROVEN exclusion the
+                        # overlay would be in the frame. The send-time capture() hides it.
         pc = self._precaptured                       # a recent frame is still fresh enough —
         if pc and (time.monotonic() - pc[1]) < 2.5:  # skip the redundant grab while typing
             return
@@ -6353,9 +6506,10 @@ class Overlay:
         # so it does no Tk work and a slow/wedged display stack can't freeze typing. Result
         # comes back via ui_q as ("precapture_done", shots).
         self._capture_busy = True
-        threading.Thread(target=self._precapture_bg, daemon=True).start()
+        threading.Thread(target=self._precapture_bg, daemon=True,
+                         args=(getattr(self, "_precapture_gen", 0),)).start()
 
-    def _precapture_bg(self):
+    def _precapture_bg(self, gen=None):
         # enumerate_monitors() must be INSIDE the try: if it raises here (it used to be above
         # the guard), the thread dies without posting precapture_done, leaving _capture_busy
         # stuck True forever → type-ahead capture silently stops for the rest of the session.
@@ -6367,6 +6521,7 @@ class Overlay:
         except BaseException:
             shots = None
         finally:
+            self._precapture_for = gen       # which visibility this frame was grabbed under
             self.ui_q.put(("precapture_done", shots))
 
     def _build_prompt(self, text, shots, images=None, docs=None):
@@ -6474,6 +6629,11 @@ class Overlay:
     def _grab_shots_scoped(self, mons):
         """Scope dispatcher used by both the send-time and precapture paths: the active
         window when that scope is on AND a usable window exists, else every monitor."""
+        if IS_MAC and not screen_capture_allowed():
+            # macOS would hand back the wallpaper with nothing on it, and the model would
+            # confidently describe an empty desktop. No picture beats a wrong one.
+            return [], PermissionError("macOS Screen Recording permission isn't granted "
+                                       "(System Settings › Privacy & Security)")
         if self.window_shot:
             shots, err = self._grab_window_shot()
             if shots:
@@ -6502,6 +6662,62 @@ class Overlay:
         self._prune_shots()
         return shots, err
 
+    def _mac_hide_for_capture(self):
+        """Take the overlay out of the grab capture() is about to make, without unmapping it
+        (so no flicker and the keyboard focus stays put). Returns the function that undoes
+        it. Three ways, best first:
+
+        - excluding works on this Mac (checked the first time through, see
+          verify_capture_exclusion) → mark the window non-shareable for the length of the
+          grab. Nothing visible happens;
+        - it doesn't, or can't be checked → fade the window out. A brief blink, but it
+          depends on nothing except the window being invisible;
+        - the fade can't be confirmed either → unmap it, as Windows does."""
+        first_check = not capture_exclusion_verified()
+        works = verify_capture_exclusion(lambda b: ImageGrab.grab(bbox=b, all_screens=True))
+        if works:
+            if first_check:
+                self._apply_share_visibility()       # _capture_excluded may now be claimed
+            if self._capture_excluded:
+                return None                          # already out of every capture
+            if _user32.SetWindowDisplayAffinity(self._hwnd(), WDA_EXCLUDEFROMCAPTURE):
+                commit_window_changes()              # before the grab, not after
+                time.sleep(0.05)
+                return self._apply_share_visibility  # back to what the toggle says
+            # The request itself failed this time: hide the window the other ways.
+        else:
+            self._mac_warn_exclusion()
+        restore = fade_out()
+        if restore is not None:
+            time.sleep(0.05)                         # one frame drawn without the window
+            return restore
+        geo = self.root.geometry()
+        self.root.withdraw()
+        self.root.update()
+        time.sleep(0.15)
+
+        def remap():
+            self.root.deiconify()
+            self.root.overrideredirect(True)
+            self.root.geometry(geo)
+            self.root.attributes("-topmost", True)
+            self._set_taskbar_button()
+            self.root.lift()
+            self.root.after(20, self._apply_region)
+        return remap
+
+    def _mac_warn_exclusion(self):
+        """Say so, once, when Shareable is off but this Mac was seen putting a non-shareable
+        window into a capture anyway: "hidden from screen shares" isn't true here."""
+        if self.share_visible or getattr(self, "_share_warned", False):
+            return
+        if not capture_exclusion_tested() or capture_exclusion_verified():
+            return
+        self._share_warned = True
+        self.add_sys("⚠ Shareable is off, but this Mac's screen capture still shows windows "
+                     "marked hidden — so the overlay may be visible in a screen share. "
+                     "Claude's own screenshots leave it out regardless.")
+
     def capture(self, announce=True, hide=True, quiet=False):
         """Grab one screenshot per monitor; returns a list of
         {'path', 'primary', 'index'} dicts. Images are downscaled to
@@ -6510,12 +6726,32 @@ class Overlay:
         (send time); hide=False skips that to avoid a flicker during
         pre-capture-while-typing. quiet=True suppresses the in-chat error if a
         grab fails (used for the silent pre-capture path)."""
+        if IS_MAC:
+            # Getting the window out of the picture can turn the event loop here (see
+            # commit_window_changes), and a second Enter or a Snap waiting in the queue
+            # would start another capture inside this one — which, finishing first, would
+            # put the window back while this one is still about to grab. One at a time:
+            # the outer capture owns the hiding from start to finish.
+            if getattr(self, "_capturing", False):
+                return []
+            self._capturing = True
+            try:
+                return self._capture(announce, hide, quiet)
+            finally:
+                self._capturing = False
+        return self._capture(announce, hide, quiet)
+
+    def _capture(self, announce, hide, quiet):
         mons = enumerate_monitors() or [{"rect": None, "primary": True}]
         geo = self.root.geometry()
         # If the OS is excluding us from capture, the overlay is already invisible to
         # ImageGrab — no need to withdraw (which both flickers and freezes the UI for
         # the 0.15s settle). Only fall back to hiding if exclusion isn't active.
         do_hide = hide and not self._capture_excluded
+        mac_unhide = None
+        if do_hide and IS_MAC:
+            do_hide = False
+            mac_unhide = self._mac_hide_for_capture()
         if do_hide:
             self.root.withdraw()
             self.root.update()
@@ -6523,6 +6759,8 @@ class Overlay:
         try:
             shots, err = self._grab_shots_scoped(mons)
         finally:
+            if mac_unhide:
+                mac_unhide()
             if do_hide:
                 self.root.deiconify()
                 self.root.overrideredirect(True)
@@ -6544,6 +6782,8 @@ class Overlay:
         # A Snap is the user starting, like a send: capture() withdraws the window and pumps Tk
         # events (root.update), and an automatic overlay update finishing in there must not
         # restart before the shot lands in pending_shot (see _overlay_in_use).
+        if getattr(self, "_capturing", False):
+            return          # macOS: a screenshot is being taken this very moment
         self._acting = getattr(self, "_acting", 0) + 1
         try:
             self.capture(announce=True)
@@ -6636,13 +6876,24 @@ class Overlay:
         """Flip whether the overlay is visible in screen shares (Teams/Zoom/OBS). The change
         is invisible on your OWN screen — the window looks identical either way; it only
         affects what others see — so confirm it in-chat so you know the toggle took."""
+        if getattr(self, "_capturing", False):
+            # macOS: mid-screenshot the window's visibility belongs to the capture. Flip it
+            # once that is done rather than under it.
+            self.root.after(60, self.toggle_screen_share)
+            return
         self.share_visible = not self.share_visible
         self._apply_share_visibility()
         self._paint_share_toggle()
         if self.share_visible:
             self.add_sys("📺 Overlay will now appear in screen shares (Teams / Zoom / OBS).")
         else:
-            self.add_sys("🙈 Overlay hidden from screen shares again — private (only you can see it).")
+            self.add_sys(
+                "🙈 Overlay marked hidden from screen shares and screenshots again. macOS treats "
+                "that as a request, not a guarantee — check your share's preview before "
+                "relying on it." if IS_MAC else
+                "🙈 Overlay hidden from screen shares again — private (only you can see it).")
+            if IS_MAC:
+                self._mac_warn_exclusion()
 
     def reset(self):
         # Interrupt any in-flight turn FIRST. Otherwise the worker is blocked in
@@ -6797,7 +7048,12 @@ class Overlay:
     # ── visibility (hotkey) ──
     def _register_hotkey(self):
         try:
-            import keyboard
+            if IS_MAC:
+                # Carbon's hotkey API, behind the two calls used here. The `keyboard`
+                # library needs root on macOS; this needs no permission at all.
+                from macutils import hotkeys as keyboard
+            else:
+                import keyboard
             keyboard.add_hotkey(HOTKEY, self._hotkey_fired)
             self._keyboard = keyboard
         except Exception as e:
@@ -7762,6 +8018,12 @@ class Overlay:
         "the list goes 1, 2, 3, then 10" report. Scaled by the body font so it follows Ctrl +/-
         zoom, and a precision-touchpad delta (30, not 120) still moves instead of rounding to 0."""
         step = self.WHEEL_LINES * self.f_body.metrics("linespace")
+        if IS_MAC and tk.TkVersion < 9:
+            # Tk 8.6 on macOS doesn't count in 120ths: it hands over the scroll distance in
+            # units of about ten points, rounded, and never less than 1 per event — and a
+            # trackpad swipe is dozens of events. One unit is one line here (40 = 120 / 3
+            # lines); at a whole notch each, a short swipe flew a dozen screens.
+            delta *= 40
         n = int(round(-delta / 120 * step))
         if n == 0 and delta:
             n = -1 if delta > 0 else 1
@@ -8181,7 +8443,10 @@ class Overlay:
             self._refresh_attach()
         elif kind == "precapture_done":
             self._capture_busy = False
-            if payload:
+            stale = (getattr(self, "_precapture_for", None) is not None
+                     and self._precapture_for != getattr(self, "_precapture_gen", 0))
+            self._precapture_for = None
+            if payload and not stale:
                 self._precaptured = (payload, time.monotonic())
         elif kind == "sessions":
             store, rows = payload
@@ -8314,9 +8579,9 @@ class Overlay:
                  "at your screen to help.\n" if self.provider == "codex" else
                  "Hi — I float on top of everything. Ask me anything and I'll look at "
                  "your screen to help.\n")
-        self._ins(hello +
+        self._ins(hello + platform_text(
                   "Enter to send · Shift+Enter for a new line · Ctrl +/− to zoom text · "
-                  "drag an edge to resize.", "a")
+                  "drag an edge to resize."), "a")
         self._claude_header = True
 
     # ── shutdown ──
@@ -8329,6 +8594,8 @@ class Overlay:
                 self._keyboard.unhook_all()
         except Exception:
             pass
+        if IS_MAC:
+            remove_status_item()
         try:
             self.worker.interrupt()      # stop any in-flight turn so it can close cleanly
         except Exception:

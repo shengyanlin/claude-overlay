@@ -9,6 +9,7 @@ import tkinter as tk
 import pytest
 
 import claude_overlay as co
+from config import platform_text
 from conftest import FakeWorker, chat_text
 
 
@@ -316,7 +317,8 @@ def test_missing_claude_cli_when_in_codex_mode(overlay, monkeypatch):
     assert overlay.provider == "codex"
     text = chat_text(overlay)
     assert "Claude Code CLI (`claude`) isn't installed" in text
-    assert "irm https://claude.ai/install.ps1" in text
+    # the install one-liner for this platform (PowerShell's on Windows, curl's on macOS)
+    assert platform_text("irm https://claude.ai/install.ps1 | iex  in PowerShell") in text
 
 
 def test_missing_cli_wins_over_the_empty_conversation_rule(overlay, monkeypatch):

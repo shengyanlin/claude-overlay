@@ -94,11 +94,9 @@ def _access_token():
     if authstate.alt_auth_configured():
         return None
     try:
-        p = authstate.credentials_path()
-        if p.stat().st_size > _MAX_CRED_BYTES:
-            return None
-        with open(p, "r", encoding="utf-8", errors="replace") as fh:
-            oauth = json.load(fh).get("claudeAiOauth")
+        # The credential file — or, on macOS, the keychain record the CLI keeps instead.
+        # block=True: this runs on the poller's own thread, so it can wait for the read.
+        oauth = authstate.read_oauth(block=True)
         tok = oauth.get("accessToken")
         exp = oauth.get("expiresAt")              # ms since epoch, as the CLI writes it
         if not isinstance(tok, str) or not tok:
