@@ -61,7 +61,7 @@ rebuilding the launcher, makes it a new app to macOS, and it asks once more.
 | Zoom, paste, copy | `Ctrl` `+`/`−`/`0`, `Ctrl+V`, `Ctrl+C` | `⌘` `+`/`−`/`0`, `⌘V`, `⌘C` (the `Ctrl` ones work too) |
 | Quit | **✕** | **✕** or `⌘Q` |
 | Scroll | mouse wheel | mouse wheel or two fingers on the trackpad |
-| Hidden from screen shares (**Shareable** off) | guaranteed by Windows (display affinity) | **best effort**: the window is marked non-shareable, which current macOS honours (checked on macOS 26) but Apple doesn't guarantee. The overlay tests it on first use and tells you if your Mac ignores it — check your share's preview before relying on it. Claude's own screenshots leave the overlay out either way |
+| Hidden from screen shares (**Shareable** off) | Windows leaves the window out of what its capture APIs return (display affinity) | **best effort**: the window is marked non-shareable, which current macOS honours (checked on macOS 26) but Apple doesn't guarantee. The overlay tests it on first use and tells you if your Mac ignores it — check your share's preview before relying on it. Claude's own screenshots leave the overlay out either way |
 | Editing the app you have open | PowerShell + COM | AppleScript (`osascript`) |
 | `config.json`, `state.json`, `crash.log` | `%LOCALAPPDATA%\claude-overlay\` | `~/Library/Application Support/claude-overlay/` |
 | Setup · update · diagnose | `setup.cmd` · `update.cmd` · `Diagnose.cmd` | `setup.command` · `update.command` · `Diagnose.command` |

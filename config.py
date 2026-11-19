@@ -12,7 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-__version__ = "1.28.0"
+__version__ = "1.29.0"
 
 IS_MAC = sys.platform == "darwin"
 

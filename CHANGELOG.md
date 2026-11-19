@@ -3,7 +3,7 @@
 All notable changes to Claude Overlay are documented here.
 This project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.29.0] - 2026-11-19
 
 Claude Overlay runs on macOS.
 
@@ -29,8 +29,8 @@ Claude Overlay runs on macOS.
   python.org's Python still ships.
 - **The allowance ring and the dead-login notice work on macOS**, where the `claude` CLI
   keeps its login in the keychain rather than in `.credentials.json`.
-- **Hiding from screen shares is checked, not assumed, on macOS.** Windows guarantees that
-  a window marked hidden stays out of every capture; macOS only takes it as a request. So
+- **Hiding from screen shares is checked, not assumed, on macOS.** Windows leaves a window
+  marked hidden out of what its capture APIs return; macOS only takes it as a request. So
   the first time it takes a screenshot the overlay tests, with a 16-point window of its
   own, whether this Mac honours the request. If it does, nothing changes; if it doesn't,
   the overlay fades itself out for the length of each of its own screenshots instead and
