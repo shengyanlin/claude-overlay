@@ -17,7 +17,8 @@ the crash log go to the same temporary folder.
 
     python .github/scripts/smoke_launch.py [seconds]      (CI only; --force to run locally)
 
-tests/test_smoke_launch.py runs this on CI, so every workflow that runs pytest runs it.
+The workflow runs it as its own step. tests/test_smoke_launch.py covers the parts that
+need no window: that it refuses to open one unasked, and what the app's environment holds.
 """
 import json
 import os

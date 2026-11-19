@@ -41,10 +41,10 @@ Claude Overlay runs on macOS.
   both platform layers import. No behaviour change on Windows.
 - `requirements.txt` installs `keyboard` on Windows only, and `pyobjc` / `truststore` on
   macOS only.
-- CI runs the suite on macOS as well as Windows, and the suite, on CI, now also **starts
-  the app for real** (`python claude_overlay.py`) and fails if it exits, writes a crash log
-  or reports a Tk callback error — the check for "every test passes and the app doesn't
-  open".
+- CI runs the suite on macOS as well as Windows, and on both it now also **starts the app
+  for real** (`python claude_overlay.py`, for 15 seconds) and fails if it exits, writes a
+  crash log or reports a Tk callback error — the check for "every test passes and the app
+  doesn't open".
 - **The README is a short landing page now.** Install, controls, configuration, updating,
   troubleshooting and the full security note each moved, unchanged in substance, to their
   own page under [`docs/`](docs/).

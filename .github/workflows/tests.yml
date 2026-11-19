@@ -55,8 +55,13 @@ jobs:
       - name: Preflight (environment report)
         run: python preflight.py
 
-      # Includes tests/test_smoke_launch.py, which on CI starts the app the way a user does
-      # (`python claude_overlay.py`) and fails if it exits, writes a crash log or reports a
-      # Tk callback error - the check for "every test passes and the app doesn't open".
       - name: Run unit tests
         run: python -m pytest
+
+      # The suite builds the window inside pytest. This starts the app the way a user does
+      # (`python claude_overlay.py`, through __main__) and fails if it exits, writes a crash
+      # log or reports a Tk callback error in its first 15 seconds - the check for "every
+      # test passes and the app doesn't open", on both platforms. It prints the app's own
+      # output and an OK line, so the log of a release shows the app really started.
+      - name: Start the app for real
+        run: python .github/scripts/smoke_launch.py 15

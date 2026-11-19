@@ -1,20 +1,14 @@
-"""Start the real app, the way a user does, as part of the suite — on CI only.
+"""The launch smoke test's own safeguards (.github/scripts/smoke_launch.py).
 
-Everything else in tests/ builds the Overlay class inside pytest. This runs
-.github/scripts/smoke_launch.py, which starts `python claude_overlay.py` through its
-`__main__` block on the runner's real desktop session and fails if the process exits,
-writes a crash log or reports a Tk callback error. It is the check for "every test passes
-and the app doesn't open" on the platform a change was NOT written on, and it lives in the
-suite so that every workflow that runs `pytest` runs it.
-
-Skipped off CI: it opens a real window for a quarter of a minute. To run it by hand:
-    python .github/scripts/smoke_launch.py --force
+That script starts `python claude_overlay.py` on a CI runner's real desktop session and
+fails if the process exits, writes a crash log or reports a Tk callback error — the
+workflow runs it as a step of its own. It opens a real window, so it is not run from here;
+these tests cover what can be checked without one: it refuses to open a window unless it is
+on CI or told to, and the environment it gives the app holds no login and reaches nothing.
 """
 import os
 import subprocess
 import sys
-
-import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, ".github", "scripts", "smoke_launch.py")
@@ -46,12 +40,3 @@ def test_the_smoke_environment_carries_no_login_and_reaches_nothing(monkeypatch,
     proxies = {k.upper(): v for k, v in env.items() if k.upper().endswith("_PROXY")}
     assert proxies == {"HTTP_PROXY": smoke.NOWHERE, "HTTPS_PROXY": smoke.NOWHERE,
                        "ALL_PROXY": smoke.NOWHERE}                 # and no NO_PROXY left
-
-
-@pytest.mark.skipif(not os.environ.get("CI"), reason="opens the real app window: CI only")
-def test_the_app_starts_and_stays_up():
-    r = subprocess.run([sys.executable, SCRIPT, "12"], capture_output=True, text=True,
-                       timeout=180, stdin=subprocess.DEVNULL, encoding="utf-8",
-                       errors="replace")
-    assert r.returncode == 0, f"{r.stdout[-6000:]}\n{r.stderr[-2000:]}"
-    assert "OK: the app started and ran" in r.stdout
