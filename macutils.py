@@ -870,9 +870,10 @@ def request_screen_capture():
 
 
 # ───────────────────────────── leaving the overlay out of captures ─────────────────────────────
-# Windows' WDA_EXCLUDEFROMCAPTURE is a guarantee. Its macOS counterpart, NSWindowSharingNone,
-# is not: Apple documents it as a legacy value that "can cause content to not be available
-# in certain sharing situations" and says not to use it to keep content out of a capture.
+# Windows' WDA_EXCLUDEFROMCAPTURE is honoured by its capture APIs. Its macOS counterpart,
+# NSWindowSharingNone, is not promised to be: Apple documents it as a legacy value that
+# "can cause content to not be available in certain sharing situations" and says not to
+# use it to keep content out of a capture.
 # In practice current macOS honours it (checked on macOS 26 against both `screencapture`
 # and ScreenCaptureKit), so the overlay still asks for it — but nothing here TRUSTS it
 # until it has been seen working on this Mac, and the fallback (fading the window out for
