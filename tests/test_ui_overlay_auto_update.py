@@ -8,6 +8,7 @@ into a nag or a loop: a clone update.cmd would stop on gets the button, a folder
 didn't move is not restarted (and not retried for that version), and two windows can't run two
 updates at once. update.cmd is never spawned here.
 """
+import sys
 import os
 import shutil
 import subprocess
@@ -18,7 +19,10 @@ import pytest
 
 import claude_overlay as co
 import config
-import win32utils
+if sys.platform == "darwin":
+    import macutils as win32utils     # the same surface, on AppKit
+else:
+    import win32utils
 from conftest import chat_text
 
 

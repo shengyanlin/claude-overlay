@@ -11,7 +11,11 @@ import tkinter as tk
 import pytest
 
 import claude_overlay as co
-import win32utils
+if sys.platform == "darwin":
+    import macutils as win32utils     # the same surface, on AppKit
+else:
+    import win32utils
+from config import UPDATE_SCRIPT
 from conftest import chat_text
 
 
@@ -64,7 +68,7 @@ def test_notice_on_a_zip_install_falls_back_to_instructions(overlay, monkeypatch
     before = list(overlay.chat.window_names())
     overlay._handle("update", "1.18.0")
     txt = chat_text(overlay)
-    assert "update.cmd" in txt and "1.18.0" in txt
+    assert UPDATE_SCRIPT in txt and "1.18.0" in txt
     assert list(overlay.chat.window_names()) == before      # no button embedded
 
 
@@ -191,7 +195,7 @@ def test_failure_result_names_the_manual_route_and_does_not_restart(overlay, mon
     overlay._ov_update_btn_ref = btn
     overlay._handle("ov_update_result", (False, "git pull failed"))
     txt = chat_text(overlay)
-    assert "git pull failed" in txt and "update.cmd" in txt
+    assert "git pull failed" in txt and UPDATE_SCRIPT in txt
     assert btn._ustate == "error"
     assert restarts == []
 
@@ -200,7 +204,7 @@ def test_bad_result_payload_never_raises(overlay, monkeypatch):
     _reset_ov_flags(overlay)
     monkeypatch.setattr(overlay, "_restart_overlay", lambda: None)
     overlay._handle("ov_update_result", None)               # degrades to a failure line
-    assert "update.cmd" in chat_text(overlay)
+    assert UPDATE_SCRIPT in chat_text(overlay)
 
 
 # ── win32utils.can_self_update / run_overlay_update ────────────────────────────────
@@ -208,7 +212,7 @@ def test_bad_result_payload_never_raises(overlay, monkeypatch):
 def test_can_self_update_needs_a_clone_git_and_update_cmd(tmp_path, monkeypatch):
     monkeypatch.setattr(win32utils.shutil, "which", lambda _n: r"C:\git\git.exe")
     assert win32utils.can_self_update(str(tmp_path)) is False       # empty folder
-    (tmp_path / "update.cmd").write_text("rem")
+    (tmp_path / UPDATE_SCRIPT).write_text("rem")
     assert win32utils.can_self_update(str(tmp_path)) is False       # no .git yet
     (tmp_path / ".git").mkdir()
     assert win32utils.can_self_update(str(tmp_path)) is True
@@ -219,16 +223,17 @@ def test_can_self_update_needs_a_clone_git_and_update_cmd(tmp_path, monkeypatch)
 def test_can_self_update_accepts_a_worktree_dot_git_file(tmp_path, monkeypatch):
     # In a git worktree, .git is a FILE pointing at the real gitdir — still updatable.
     monkeypatch.setattr(win32utils.shutil, "which", lambda _n: r"C:\git\git.exe")
-    (tmp_path / "update.cmd").write_text("rem")
+    (tmp_path / UPDATE_SCRIPT).write_text("rem")
     (tmp_path / ".git").write_text("gitdir: ../.git/worktrees/x")
     assert win32utils.can_self_update(str(tmp_path)) is True
 
 
 def test_run_overlay_update_without_the_script_fails_cleanly(tmp_path):
     ok, msg = win32utils.run_overlay_update(str(tmp_path))
-    assert ok is False and "update.cmd" in msg
+    assert ok is False and UPDATE_SCRIPT in msg
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="the cmd.exe launch; macOS: test_macutils.py")
 def test_run_overlay_update_maps_the_exit_code(tmp_path, monkeypatch):
     (tmp_path / "update.cmd").write_text("rem")
     seen = {}
@@ -291,6 +296,7 @@ def test_the_codex_setup_is_told_which_python_to_use(tmp_path, monkeypatch):
         assert (tmp_path / "seen.txt").read_text().strip() == want
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="the cmd.exe launch; macOS: test_macutils.py")
 def test_run_codex_setup_without_the_script_or_on_a_failed_launch_is_none(tmp_path, monkeypatch):
     assert win32utils.run_codex_setup(str(tmp_path)) is None
     (tmp_path / "install-codex.cmd").write_text("rem")
@@ -301,6 +307,7 @@ def test_run_codex_setup_without_the_script_or_on_a_failed_launch_is_none(tmp_pa
     assert win32utils.run_codex_setup(str(tmp_path)) is None
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="the cmd.exe launch; macOS: test_macutils.py")
 def test_run_overlay_update_never_raises(tmp_path, monkeypatch):
     (tmp_path / "update.cmd").write_text("rem")
 

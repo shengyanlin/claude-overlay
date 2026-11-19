@@ -6,9 +6,142 @@ so anything may import it without a circular-import risk."""
 import difflib
 import json
 import os
+import re
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 __version__ = "1.28.0"
+
+IS_MAC = sys.platform == "darwin"
+
+
+def _data_home() -> Path:
+    """Where this machine's per-user app data lives: %LOCALAPPDATA% on Windows,
+    ~/Library/Application Support on macOS, else the home folder. The overlay keeps its
+    state, config.json and crash log in a "claude-overlay" folder under it — deliberately
+    outside the app folder, so machine state never dirties the git clone."""
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        return Path(base)
+    if IS_MAC:
+        return Path.home() / "Library" / "Application Support"
+    return Path.home()
+
+def _mac_fix_path():
+    """Give this process the PATH the user's terminal has.
+
+    An app started from Finder or the Dock inherits launchd's PATH — /usr/bin:/bin and
+    little else — not the one ~/.zshrc builds. `claude`, `codex`, `node` and `npm` all
+    live in folders only the shell knows about (~/.local/bin, Homebrew, an nvm/volta
+    shim), so without this the overlay would start and then report every CLI missing.
+
+    The shell is only asked when we weren't started from one (a terminal launch already
+    has the right PATH, and the test suite always runs from one). "Started from one" is
+    TERM set, or SHLVL of 1 or more — not merely SHLVL present: Claude Overlay.app's
+    launcher is a bash script that execs Python, and bash, started with no SHLVL, sets
+    it to 1 and then lowers it again for the exec, so a Finder launch arrives here with
+    SHLVL="0". The launcher also says so outright (CLAUDE_OVERLAY_FROM_APP=1), so the
+    answer doesn't rest on that arithmetic.
+
+    The shell's answer goes in front; the usual install folders are added behind as a
+    floor, for the case where the shell couldn't be asked. Nothing relative is ever
+    added. Nothing is dropped for not existing, though — the floor, or what the shell
+    listed: a PATH entry that isn't there costs nothing, while one filtered out here
+    stays out for the life of the process. ~/.local/node/bin only appears when the
+    "Set up Codex" button installs Node.js, and a custom npm prefix has no bin folder
+    until its first global install; the running app has to find `codex` there afterwards."""
+    current = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    # pop: the marker describes this process, not the CLIs and shells it goes on to start.
+    from_app = bool(os.environ.pop("CLAUDE_OVERLAY_FROM_APP", None))
+    try:
+        shlvl = int(os.environ.get("SHLVL", ""))
+    except ValueError:
+        shlvl = 0
+    from_shell = shlvl >= 1 or bool(os.environ.get("TERM"))
+    found = []
+    if from_app or not from_shell:
+        try:
+            shell = os.environ.get("SHELL") or "/bin/zsh"
+            out = subprocess.run(
+                [shell, "-ilc", 'printf "__OVPATH__%s__OVPATH__" "$PATH"'],
+                capture_output=True, timeout=6, stdin=subprocess.DEVNULL,
+                encoding="utf-8", errors="replace").stdout or ""
+            m = re.search(r"__OVPATH__(.*?)__OVPATH__", out, re.S)
+            if m:
+                found = [p for p in m.group(1).split(os.pathsep) if p]
+        except Exception:
+            found = []
+    home = str(Path.home())
+    floor = [os.path.join(home, ".local", "bin"),
+             os.path.join(home, ".local", "node", "bin"),   # install-codex.sh's Node.js
+             "/opt/homebrew/bin", "/usr/local/bin",
+             os.path.join(home, ".npm-global", "bin")]
+    merged = []
+    for p in found + current + floor:
+        if p not in merged and os.path.isabs(p):
+            merged.append(p)
+    os.environ["PATH"] = os.pathsep.join(merged)
+
+
+def _mac_system_trust():
+    """Verify HTTPS against the certificates macOS trusts.
+
+    Python on a Mac checks against a fixed bundle of public roots, not the keychain. On a
+    network that inspects HTTPS — where every site is re-signed with the organisation's own
+    root, which the keychain trusts and that bundle doesn't — the update check, the
+    allowance ring and the launch ping would all fail to connect. Windows' Python reads the
+    system store by itself; `truststore` makes this one do the same. Nothing is switched
+    off: every certificate is still verified, by the system's own verifier."""
+    import truststore
+    truststore.inject_into_ssl()
+
+
+if IS_MAC:
+    for _fix in (_mac_fix_path, _mac_system_trust):
+        try:
+            _fix()
+        except Exception:
+            pass
+
+
+# The names a message hands the user — a script to double-click, a key to press, a command
+# to paste — are Windows' in the source, because that is where every message was written.
+# On macOS the same things have other names; platform_text() swaps them in at the one
+# place a message reaches the screen, instead of forking each string.
+SETUP_SCRIPT = "setup.command" if IS_MAC else "setup.cmd"
+UPDATE_SCRIPT = "update.command" if IS_MAC else "update.cmd"
+CODEX_SETUP_SCRIPT = "install-codex.sh" if IS_MAC else "install-codex.cmd"
+_MAC_TEXT = (
+    ("irm https://claude.ai/install.ps1 | iex  in PowerShell",
+     "curl -fsSL https://claude.ai/install.sh | bash  in Terminal"),
+    ("`irm https://claude.ai/install.ps1 | iex`",
+     "`curl -fsSL https://claude.ai/install.sh | bash`"),
+    ("install-codex.cmd", "install-codex.sh"),
+    ("setup.cmd", "setup.command"),
+    ("update.cmd", "update.command"),
+    ("Diagnose.cmd", "Diagnose.command"),
+    ("Start Claude Overlay.cmd", "Start Claude Overlay.command"),
+    ("Ctrl +/−", "⌘ +/−"),
+    ("Ctrl+V", "⌘V"),
+    ("its Windows sandbox", "its sandbox"),
+)
+
+
+def platform_text(text):
+    """A user-facing message with this platform's names in it. Identity on Windows."""
+    if not IS_MAC or not text:
+        return text
+    try:
+        out = str(text)
+        for old, new in _MAC_TEXT:
+            if old in out:
+                out = out.replace(old, new)
+        return out
+    except Exception:
+        return text
+
 
 def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     try:
@@ -147,6 +280,11 @@ SHOW_IN_SCREEN_SHARE_DEFAULT = False  # False (default) = the overlay is exclude
                                   # the status-bar "shareable" toggle; no restart needed.
 HIDE_SCREENSHOT_TOOL = True       # hide the noisy "⚙ Read …shot_*.png" lines every turn
 HOTKEY = "ctrl+alt+space"
+if IS_MAC:
+    # Ctrl+Option+Space is macOS's own "select next input source" shortcut (on by default
+    # on any Mac with two keyboard layouts), and the system keeps it for itself — so the
+    # same chord would silently never reach the overlay there.
+    HOTKEY = "alt+shift+space"   # ⌥⇧Space
 THEME = "light"                  # "light" (Claude paper) or "dark" (warm dark)
 WINDOW_ALPHA = 1.0
 CORNER_RADIUS = 18
@@ -189,7 +327,16 @@ ORB_PET_IMAGE = "claude_overlay_2.png"  # the artwork orbpet.py knows how to red
 FONT_SANS = ["Noto Sans TC", "Inter", "Segoe UI Variable Text", "Segoe UI"]
 FONT_SERIF = ["Noto Serif TC", "Georgia", "Cambria"]   # the "Claude" wordmark
 FONT_MONO = ["Consolas", "Cascadia Mono", "Courier New"]
-SHOT_DIR = Path(os.environ.get("TEMP", str(Path.home()))) / "claude_overlay_shots"
+if IS_MAC:
+    # Same preference order, with the faces macOS actually ships as the fallbacks:
+    # PingFang TC covers Chinese + English in one family, as Noto Sans TC does.
+    FONT_SANS = ["Noto Sans TC", "Inter", "PingFang TC", "Helvetica Neue"]
+    FONT_SERIF = ["Noto Serif TC", "Georgia", "Songti TC"]
+    FONT_MONO = ["Menlo", "SF Mono", "Monaco", "Courier New"]
+# %TEMP% on Windows. macOS has no TEMP variable — the per-user temp folder there comes
+# from tempfile (it resolves $TMPDIR), not the home folder the old fallback pointed at.
+SHOT_DIR = Path(os.environ.get("TEMP")
+                or (tempfile.gettempdir() if IS_MAC else str(Path.home()))) / "claude_overlay_shots"
 KEEP_SHOTS = 24                  # retain a few captures worth (one file per monitor)
 SHOT_MAX_EDGE = 1568             # downscale captures to this long edge before sending.
 SHOT_FORMAT = os.environ.get("CLAUDE_OVERLAY_SHOT_FORMAT", "auto").strip().lower()
@@ -225,7 +372,7 @@ SHOT_SCOPE = os.environ.get("CLAUDE_OVERLAY_SHOT_SCOPE", "screens").strip().lowe
 SHOT_SCOPE_FORCED = "CLAUDE_OVERLAY_SHOT_SCOPE" in os.environ
                                  # an EXPLICIT env var is a per-launch decision, so it beats the
                                  # remembered toggle state below; unset → last toggle choice wins
-STATE_FILE = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "claude-overlay" / "state.json"
+STATE_FILE = _data_home() / "claude-overlay" / "state.json"
                                  # tiny per-machine store for UI-toggle state the user expects to
                                  # survive a relaunch (Window-only and Read-only). Deliberately
                                  # OUTSIDE the app folder: machine state must not dirty the git
@@ -409,6 +556,37 @@ SYSTEM_APPEND = (
     "purely-textual edits where the live open document isn't needed, python-pptx/openpyxl "
     "on the file is far faster than COM — but only when the file is NOT open in Office."
 )
+if IS_MAC:
+    # The same brief for macOS. The automation paragraph is the part that differs: there
+    # is no COM on a Mac, and the scripting bridge the Office apps expose is AppleScript.
+    SYSTEM_APPEND = (
+        "You are running as an always-on-top floating overlay assistant on the user's "
+        "macOS desktop. The user talks to you without leaving their current app. "
+        "Messages may include live screenshots of the user's screen — attached directly "
+        "as images, or (legacy) as an [ATTACHMENTS] path you open with the Read tool. "
+        "Use them to see what the user is looking at, then help. "
+        "Keep replies concise and skimmable since they render in a small floating window; "
+        "expand only when asked. "
+        "If you need to ask the user something, ask it inline as plain text and wait for "
+        "their typed reply. This overlay is a plain chat with no interactive question UI, so "
+        "never use a structured multiple-choice question tool — such a tool has no way to be "
+        "answered here and would just stall the turn. "
+        "When automating the app the user has open (PowerPoint/Excel/Word, Keynote/Numbers/"
+        "Pages, a browser), drive it with AppleScript or JXA through `osascript`; optimize "
+        "for speed: a NEW osascript process runs per tool call and no state persists across "
+        "calls, and every property access is a slow cross-process Apple Event. So: "
+        "(1) BATCH — do all inspection in ONE script (return what you need, e.g. as JSON), "
+        "then apply ALL edits in ONE script; never one tool call per shape/cell/slide. "
+        "(2) Within a script hold object references in variables (grab the slide/shape/table "
+        "once) instead of re-walking the object model, and don't re-read everything to verify "
+        "after each write. (3) For Excel bulk writes, set `screen updating` to false around "
+        "them and write whole ranges at once, then restore. (4) For large purely-textual "
+        "edits where the live open document isn't needed, python-pptx/openpyxl on the file "
+        "is far faster than scripting the app — but only when the file is NOT open in it. "
+        "The first time a script targets an app, macOS asks the user to allow it "
+        "(Automation); if a script fails with error -1743, tell them to allow it in System "
+        "Settings > Privacy & Security > Automation."
+    )
 
 THEMES = {
     "light": {
@@ -494,6 +672,8 @@ CODEX_THEMES = {
     },
 }
 FONT_CODEX_TITLE = ["Segoe UI Variable Display", "Segoe UI Semibold", "Segoe UI"]
+if IS_MAC:
+    FONT_CODEX_TITLE = ["Helvetica Neue", "PingFang TC"]
 
 # ── per-machine overrides: config.json ──────────────────────────────────────
 # Every constant above is a COMMITTED default — editing this file to taste dirties the
@@ -501,7 +681,8 @@ FONT_CODEX_TITLE = ["Segoe UI Variable Display", "Segoe UI Semibold", "Segoe UI"
 # personal settings go in a tiny JSON file OUTSIDE the repo instead, in the same
 # per-machine home that already holds the toggle state (STATE_FILE):
 #
-#     %LOCALAPPDATA%\claude-overlay\config.json
+#     %LOCALAPPDATA%\claude-overlay\config.json                       (Windows)
+#     ~/Library/Application Support/claude-overlay/config.json         (macOS)
 #     e.g.  { "PERMISSION_MODE": "plan", "THEME": "dark" }
 #
 # (or set CLAUDE_OVERLAY_CONFIG to any path — also how the tests isolate themselves).
@@ -513,8 +694,7 @@ FONT_CODEX_TITLE = ["Segoe UI Variable Display", "Segoe UI Semibold", "Segoe UI"
 # USER_CONFIG_WARNINGS and the overlay surfaces them in-chat at startup, so a typo can't
 # silently launch a misconfigured (say, full-access) session.
 USER_CONFIG_FILE = Path(os.environ.get("CLAUDE_OVERLAY_CONFIG")
-                        or Path(os.environ.get("LOCALAPPDATA") or Path.home())
-                        / "claude-overlay" / "config.json")
+                        or _data_home() / "claude-overlay" / "config.json")
 USER_CONFIG_WARNINGS: list = []   # human-readable; shown in-chat by the overlay at startup
 
 _BAD = object()   # sentinel: a validator rejected the value

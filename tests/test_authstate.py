@@ -6,10 +6,13 @@ CLI writes AND reads back as dead (a blank refreshToken). Most of these tests th
 pin the NEGATIVES — every state that must NOT be called dead — because a false positive
 would refuse to send messages that would have worked.
 
-No network, no CLI, no GUI: every test points CLAUDE_CONFIG_DIR at a tmp dir.
+No network, no CLI, no GUI: every test points CLAUDE_CONFIG_DIR at a tmp dir (or, for the
+macOS keychain cases, at a fake keychain — the real one is never read).
 """
 
+import hashlib
 import json
+import threading
 
 import pytest
 
@@ -176,6 +179,137 @@ class TestSignature:
         assert authstate.signature() != before
 
 
+# ── signature: the macOS keychain record ──────────────────────────────────────
+
+@pytest.fixture
+def keychain(monkeypatch, tmp_path):
+    """A Mac with no credential file and a keychain whose record the test controls. The
+    `security` call is replaced outright, so this never touches the real keychain."""
+    record = {"blob": None, "reads": 0}
+
+    def read():
+        record["reads"] += 1
+        return record["blob"]
+    monkeypatch.setattr(authstate.sys, "platform", "darwin")
+    monkeypatch.setattr(authstate, "_keychain_read", read)
+    monkeypatch.setattr(authstate, "_kc", {"at": None, "blob": None, "busy": False})
+    monkeypatch.setattr(authstate.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    return record
+
+
+def _blob(token):
+    return json.dumps({"claudeAiOauth": {**LIVE, "accessToken": token}})
+
+
+def _sig(blob):
+    return ("keychain", hashlib.sha256(blob.encode("utf-8")).hexdigest())
+
+
+class _ThreadThatNeverRuns:
+    """Stands in for threading.Thread: the background keychain read stays pending."""
+    started = 0
+
+    def __init__(self, target=None, **kw):
+        pass
+
+    def start(self):
+        type(self).started += 1
+
+
+class TestKeychainSignature:
+
+    def test_pending_first_read_is_none_unless_asked_to_wait(self, keychain, monkeypatch):
+        """The worker pins its baseline right after connecting, usually before any keychain
+        read has landed. Unblocked that is None — and a None baseline can't be compared
+        with anything — so the baseline call waits for the record instead."""
+        monkeypatch.setattr(_ThreadThatNeverRuns, "started", 0)
+        monkeypatch.setattr(authstate.threading, "Thread", _ThreadThatNeverRuns)
+        keychain["blob"] = _blob("at-1")
+        assert authstate.signature() is None                 # read still pending...
+        assert _ThreadThatNeverRuns.started == 1 and keychain["reads"] == 0
+        assert authstate.signature(block=True) == _sig(keychain["blob"])   # ...waited for
+        assert keychain["reads"] == 1
+        assert authstate.signature() == _sig(keychain["blob"])   # and cached for the rest
+        assert _ThreadThatNeverRuns.started == 1 and keychain["reads"] == 1
+
+    def test_block_rereads_past_a_fresh_cache(self, keychain):
+        """A cached record can predate the token refresh the CLI did while starting up;
+        pinned as the baseline, that refresh would later look like a rotation."""
+        keychain["blob"] = _blob("at-before-connect")
+        before = authstate.signature(block=True)
+        keychain["blob"] = _blob("at-refreshed-during-connect")
+        assert authstate.signature() == before               # cache is fresh: no re-read
+        assert keychain["reads"] == 1
+        assert authstate.signature(block=True) == _sig(keychain["blob"]) != before
+        assert keychain["reads"] == 2
+        assert authstate.signature() == _sig(keychain["blob"])
+
+    def test_block_with_nothing_in_the_keychain_is_none(self, keychain):
+        assert authstate.signature(block=True) is None
+        assert keychain["reads"] == 1
+
+    def test_reads_never_overlap_so_the_newest_one_lands_last(self, keychain, monkeypatch):
+        """A slow background read that started first must not finish after — and overwrite
+        — the blocking read that started second: the cache would go back to the older
+        record and signature() would report a rotation that never happened."""
+        in_first, release_first = threading.Event(), threading.Event()
+        order = []
+
+        def read():
+            order.append("start")
+            if len(order) == 1:
+                in_first.set()
+                release_first.wait(5)
+                order.append("end")
+                return _blob("at-old")
+            order.append("end")
+            return _blob("at-new")
+        monkeypatch.setattr(authstate, "_keychain_read", read)
+        got = []
+        slow = threading.Thread(target=authstate._keychain_refresh, daemon=True)
+        slow.start()
+        assert in_first.wait(5)
+        waiter = threading.Thread(target=lambda: got.append(authstate.signature(block=True)),
+                                  daemon=True)
+        waiter.start()
+        waiter.join(0.2)
+        assert waiter.is_alive() and order == ["start"]      # queued behind the first read
+        release_first.set()
+        slow.join(5)
+        waiter.join(5)
+        assert not slow.is_alive() and not waiter.is_alive()
+        assert order == ["start", "end", "start", "end"]
+        assert got == [_sig(_blob("at-new"))]
+        assert authstate.signature() == _sig(_blob("at-new"))
+
+    def test_a_waiter_reuses_the_read_it_queued_behind(self, keychain):
+        # read_oauth(block=True) only needs a record younger than the TTL; signature
+        # (block=True) needs one read after it asked. Same queue, different answers.
+        keychain["blob"] = _blob("at-1")
+        authstate._keychain_refresh()
+        assert authstate._keychain_refresh(authstate._KEYCHAIN_TTL) == keychain["blob"]
+        assert keychain["reads"] == 1
+        assert authstate._keychain_refresh() == keychain["blob"]
+        assert keychain["reads"] == 2
+
+    def test_the_credential_file_makes_block_irrelevant(self, keychain, tmp_path):
+        # Windows/Linux shape: the file is the fingerprint, block or not, keychain unread.
+        keychain["blob"] = _blob("at-1")
+        (tmp_path / ".claude").mkdir()
+        write_creds(tmp_path / ".claude", LIVE)
+        sig = authstate.signature()
+        assert sig is not None and sig[0] != "keychain"
+        assert authstate.signature(block=True) == sig
+        assert keychain["reads"] == 0
+
+    def test_block_never_reads_a_keychain_off_macos(self, keychain, monkeypatch):
+        keychain["blob"] = _blob("at-1")
+        monkeypatch.setattr(authstate.sys, "platform", "win32")
+        assert authstate.signature(block=True) is None
+        assert keychain["reads"] == 0
+
+
 # ── is_auth_error_text ────────────────────────────────────────────────────────
 
 class TestIsAuthErrorText:
@@ -207,3 +341,18 @@ class TestIsAuthErrorText:
         # _open_once passes the exception itself, not str(e).
         assert authstate.is_auth_error_text(
             RuntimeError("OAuth session expired and could not be refreshed"))
+
+
+def test_the_keychain_is_read_by_the_systems_own_tool_not_one_found_on_path(monkeypatch):
+    """What `security … -w` prints is the stored login. The app runs with the user's whole
+    shell PATH in front, so the command is named by full path: a same-named program in some
+    tool's bin folder must never be the one handed that request."""
+    seen = []
+
+    class R:
+        returncode, stdout = 0, b'{"claudeAiOauth": {}}'
+
+    monkeypatch.setattr(authstate.subprocess, "run", lambda args, **kw: seen.append(args) or R())
+    # conftest swaps the reader out for the whole session; it keeps the real one here.
+    assert authstate._real_keychain_read() == '{"claudeAiOauth": {}}'
+    assert [a[:2] for a in seen] == [["/usr/bin/security", "find-generic-password"]]

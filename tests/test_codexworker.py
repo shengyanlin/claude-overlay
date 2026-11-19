@@ -228,6 +228,7 @@ def test_probe_waits_out_a_first_time_sandbox_setup():
     assert cw._PROBE_TIMEOUT >= 30
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Codex's sandbox self-test is a Windows-only step")
 def test_broken_workspace_sandbox_falls_back_to_read_only(harness, monkeypatch):
     monkeypatch.setenv("FAKE_CODEX_POLICY", "managed")
     monkeypatch.setenv("FAKE_CODEX_WS", "hang")
@@ -243,6 +244,7 @@ def test_broken_workspace_sandbox_falls_back_to_read_only(harness, monkeypatch):
     assert json.loads(cw._PROBE_FILE.read_text("utf-8")) == {"version": "9.9.9", "ok": False}
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Codex's sandbox self-test is a Windows-only step")
 def test_a_slow_probe_doesnt_hold_the_first_turn(harness, monkeypatch):
     # A first-time sandbox setup can take most of a minute. A turn sent meanwhile goes out
     # read-only after a short wait instead of stalling; auto-review covers what it can't do.
@@ -261,6 +263,7 @@ def test_a_slow_probe_doesnt_hold_the_first_turn(harness, monkeypatch):
     assert not cw._PROBE_FILE.exists()                 # no verdict yet, so none cached
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Codex's sandbox self-test is a Windows-only step")
 def test_probe_verdict_is_cached_per_cli_version(harness, monkeypatch):
     monkeypatch.setenv("FAKE_CODEX_POLICY", "managed")
     cw._PROBE_FILE.write_text(json.dumps({"version": "9.9.9", "ok": False}), "utf-8")
@@ -419,6 +422,7 @@ def test_no_codex_cli_says_how_to_install(monkeypatch):
         w.join(5)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="npm's Windows layout and Windows build")
 def test_npm_shim_resolves_to_the_native_binary(tmp_path, monkeypatch):
     npm = tmp_path / "npm"
     exe = (npm / "node_modules" / "@openai" / "codex" / "node_modules" / "@openai"

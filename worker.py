@@ -19,9 +19,16 @@ from pathlib import Path
 # Make sure both common `claude` install locations are on PATH, in case it was just
 # installed this session (PATH not yet refreshed): the native installer drops it in
 # %USERPROFILE%\.local\bin, and a global npm install in %APPDATA%\npm.
+def _env_dir(var, *sub):
+    base = os.environ.get(var)
+    return os.path.join(base, *sub) if base else ""   # never a relative PATH entry
+
+
+# (Off Windows neither variable exists and nothing is added: config.py has already given
+# the process the login shell's PATH there.)
 os.environ["PATH"] = os.pathsep.join(filter(None, [
-    os.path.join(os.environ.get("USERPROFILE", ""), ".local", "bin"),
-    os.path.join(os.environ.get("APPDATA", ""), "npm"),
+    _env_dir("USERPROFILE", ".local", "bin"),
+    _env_dir("APPDATA", "npm"),
     os.environ.get("PATH", ""),
 ]))
 
@@ -778,7 +785,10 @@ class ClaudeWorker(threading.Thread):
             # Pin the credential fingerprint to THIS subprocess's view of the tokens. Taken
             # after the connect so a refresh the CLI performs during startup is already
             # included — otherwise every first turn would look like "credentials changed".
-            self._creds_sig = authstate.signature()
+            # block=True: on macOS the fingerprint comes from the keychain, which is read in
+            # the background and cached — an unread or pre-connect copy is no baseline. We
+            # are on the worker thread, so waiting for the read costs the UI nothing.
+            self._creds_sig = authstate.signature(block=True)
             await self._fix_rejected_effort_flag()
             self.ui.put(("ready", None))
             # Context usage is informative only; do not block the first queued prompt on
@@ -922,6 +932,14 @@ class ClaudeWorker(threading.Thread):
             that case is what the UI's auth gate reports instead.
         Both reconnects carry --resume, so the conversation survives either way."""
         sig = authstate.signature()
+        if self._creds_sig is None and sig is not None and sig[0] == "keychain":
+            # No baseline: the keychain couldn't be read when we connected (locked, or slow
+            # to answer). Take the first fingerprint that does arrive as the baseline —
+            # there is nothing to compare it with, so it is not a rotation and must not
+            # reconnect — or no later change could ever be noticed. Keychain only: where
+            # the credentials are a file, "no file at connect" keeps meaning what it always
+            # has (a login that isn't this kind — API key, Bedrock — and is never recycled).
+            self._creds_sig = sig
         rotated = (sig is not None and self._creds_sig is not None and sig != self._creds_sig)
         if rotated:
             self._creds_sig = sig

@@ -45,8 +45,10 @@ _installed = False
 def log_dir():
     """The per-machine app directory (same one config.py keeps state.json in), resolved
     WITHOUT importing config — config may be what failed."""
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    return os.path.join(base, "claude-overlay")
+    base = os.environ.get("LOCALAPPDATA")
+    if not base and sys.platform == "darwin":       # mirrors config._data_home()
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    return os.path.join(base or os.path.expanduser("~"), "claude-overlay")
 
 
 def log_path():
@@ -80,11 +82,14 @@ def environment_lines(app_version=""):
         out.append(f"platform     : {sys.platform}")
         out.append(f"script       : {os.path.abspath(sys.argv[0]) if sys.argv else '?'}")
         out.append(f"cwd          : {os.getcwd()}")
-        out.append(f"console      : {'yes' if has_console() else 'no (pythonw)'}")
+        no_console = "no" if sys.platform == "darwin" else "no (pythonw)"
+        out.append(f"console      : {'yes' if has_console() else no_console}")
         # python-docx/python-pptx are OPTIONAL (requirements-docs.txt), so "not installed"
         # is a normal reading here rather than a fault. Reported anyway: "attaching my deck
         # does nothing" is answered by this line and unanswerable without it.
-        for dist in ("claude-agent-sdk", "pillow", "keyboard", "anyio",
+        platform_dists = (("pyobjc-framework-Cocoa", "pyobjc-framework-Quartz", "truststore")
+                          if sys.platform == "darwin" else ("keyboard",))
+        for dist in ("claude-agent-sdk", "pillow", *platform_dists, "anyio",
                      "python-docx", "python-pptx"):
             out.append(f"{dist:<13}: {_pkg_version(dist)}")
     except Exception:                                          # pragma: no cover - defensive
@@ -96,6 +101,13 @@ def has_console():
     """True when this process owns a console we can print to. Under pythonw there is
     none, which is precisely when a silent death is invisible and a dialog is the only
     channel left."""
+    if sys.platform != "win32":
+        # A Finder / Dock launch still has a stderr object — it just goes nowhere. Only a
+        # terminal is somebody to print to.
+        try:
+            return bool(sys.stderr and sys.stderr.isatty())
+        except Exception:
+            return False
     try:
         import ctypes
         if ctypes.windll.kernel32.GetConsoleWindow():
@@ -130,12 +142,32 @@ def _append_log(text):
 def _dialog(title, body):
     """Native MessageBox. Best-effort: if user32 isn't reachable we simply lose the
     dialog — the log is still written, and the caller still exits."""
+    if sys.platform == "darwin":
+        return _mac_dialog(title, body)
     try:
         import ctypes
         MB_OK, MB_ICONERROR, MB_SETFOREGROUND, MB_TOPMOST = 0x0, 0x10, 0x10000, 0x40000
         ctypes.windll.user32.MessageBoxW(
             None, str(body)[:3500], str(title)[:200],
             MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST)
+        return True
+    except Exception:
+        return False
+
+
+def _mac_dialog(title, body):
+    """The same dialog on macOS, through osascript — stdlib-only like the rest of this
+    module, and still there when pyobjc is the thing that failed to import. The text
+    travels as arguments, never inside the script, so nothing in a traceback can be read
+    as AppleScript."""
+    try:
+        import subprocess
+        script = ('on run argv\n'
+                  'display dialog (item 2 of argv) with title (item 1 of argv) '
+                  'buttons {"OK"} default button 1 with icon stop\n'
+                  'end run')
+        subprocess.run(["/usr/bin/osascript", "-e", script, str(title)[:200], str(body)[:3500]],
+                       capture_output=True, timeout=600)
         return True
     except Exception:
         return False

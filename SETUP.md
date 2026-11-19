@@ -7,6 +7,10 @@ else.**
 
 > 每個人都是用自己電腦上、自己登入的 `claude` CLI（自己的訂閱），不會用到別人的額度，也不用 API key。
 
+> **On a Mac?** This page is the Windows walkthrough. The macOS steps are shorter —
+> clone the repo and double-click **`setup.command`** — and are in the
+> [macOS guide](docs/macos.md).
+
 ## Prerequisites (per person, one time)
 
 1. **Claude Code CLI** — installed and logged in with your own subscription.
@@ -70,7 +74,7 @@ else.**
 
 ## Heads-up: permission mode
 
-By default `PERMISSION_MODE = "bypassPermissions"` (top of `claude_overlay.py`):
+By default `PERMISSION_MODE = "bypassPermissions"` (top of `config.py`):
 a **fully autonomous agent** that can edit files and run commands in your home
 folder **without asking**, and it can see your screen. If a colleague isn't
 comfortable with that, change it to:
@@ -94,4 +98,4 @@ instead. Read-only always means Codex's `read-only` sandbox, and there the card 
 - The global hotkey uses the `keyboard` package; if it can't register, the app
   still runs (you just lose the hotkey) and prints a note.
 - Working folder, model, theme, etc. are all constants at the top of
-  `claude_overlay.py` — see `README.md` for the full list.
+  `config.py` — see [`docs/configuration.md`](docs/configuration.md) for the full list.

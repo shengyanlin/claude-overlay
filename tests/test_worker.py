@@ -673,7 +673,7 @@ class TestEffortFlagRefused:
         launches = []
         monkeypatch.setattr(worker_module, "ClaudeSDKClient",
                             lambda options: _StrictEffortClient(options, launches, fail_always))
-        monkeypatch.setattr(worker_module.authstate, "signature", lambda: None)
+        monkeypatch.setattr(worker_module.authstate, "signature", lambda block=False: None)
         return launches
 
     def test_refused_flag_relaunches_at_the_cli_default(self, monkeypatch):
@@ -1494,7 +1494,7 @@ class TestAuthRecycle:
             calls.append(note)
         w._reconnect = _fake_reconnect
         w._client = object() if connected else None
-        worker_module.authstate.signature = lambda: sig
+        worker_module.authstate.signature = lambda block=False: sig
         return calls
 
     def setup_method(self):
@@ -1565,6 +1565,119 @@ class TestAuthRecycle:
         asyncio.run(w._auth_recycle())
         assert calls == []                    # _run_turn opens a fresh client itself
         assert w._creds_sig == (999, 33)      # still re-pinned so the next turn is quiet
+
+    def test_missing_baseline_is_adopted_without_reconnecting(self):
+        """The credentials couldn't be read at connect (macOS: keychain not answering yet).
+        The first fingerprint that does arrive has nothing to be compared with, so it only
+        becomes the baseline — and the change after it is then caught like any other.
+        Leaving the baseline at None would switch rotation detection off for good."""
+        w = make_worker()
+        w._creds_sig = None
+        sig_a, sig_b = ("keychain", "a" * 64), ("keychain", "b" * 64)
+        calls = self._prep(w, sig_a)
+        asyncio.run(w._auth_recycle())
+        assert calls == []                    # A is the first sighting, not a rotation
+        assert w._creds_sig == sig_a
+        asyncio.run(w._auth_recycle())
+        assert calls == []                    # ...and stays quiet while nothing changes
+        worker_module.authstate.signature = lambda block=False: sig_b
+        asyncio.run(w._auth_recycle())
+        assert len(calls) == 1 and "refreshed elsewhere" in calls[0]
+        assert w._creds_sig == sig_b
+        asyncio.run(w._auth_recycle())
+        assert len(calls) == 1                # re-pinned: once per rotation
+
+    def test_missing_baseline_stays_missing_while_nothing_is_readable(self):
+        w = make_worker()
+        w._creds_sig = None
+        calls = self._prep(w, None)
+        asyncio.run(w._auth_recycle())
+        assert calls == [] and w._creds_sig is None
+
+    def test_missing_baseline_is_adopted_even_with_no_client(self):
+        w = make_worker()
+        w._creds_sig = None
+        sig = ("keychain", "a" * 64)
+        calls = self._prep(w, sig, connected=False)
+        asyncio.run(w._auth_recycle())
+        assert calls == [] and w._creds_sig == sig
+
+    def test_a_credential_file_appearing_later_is_not_adopted(self):
+        """Where the credentials are a file (Windows, and a Mac that has one), no file at
+        connect means a login of another kind, and it stays unwatched exactly as before
+        the keychain existed: only an unread KEYCHAIN is a baseline waiting to arrive."""
+        w = make_worker()
+        w._creds_sig = None
+        calls = self._prep(w, (111, 22))
+        asyncio.run(w._auth_recycle())
+        assert calls == [] and w._creds_sig is None
+        worker_module.authstate.signature = lambda block=False: (333, 44)
+        asyncio.run(w._auth_recycle())
+        assert calls == [] and w._creds_sig is None
+
+    def test_adopting_a_baseline_does_not_spend_the_auth_error_retry(self):
+        """Adoption and the one-shot auth-error recycle are separate: a first fingerprint
+        arriving on the turn after an auth failure still gets that single retry."""
+        w = make_worker()
+        w._creds_sig = None
+        w._auth_error_seen = True
+        sig = ("keychain", "a" * 64)
+        calls = self._prep(w, sig)
+        asyncio.run(w._auth_recycle())
+        assert len(calls) == 1 and "stale login" in calls[0]
+        assert w._creds_sig == sig
+
+    class _ConnectsFine:
+        def __init__(self, options):
+            pass
+
+        async def connect(self):
+            pass
+
+    def test_connect_takes_the_baseline_with_a_blocking_read(self, monkeypatch):
+        """_open_once runs on the worker thread, so it waits for the real fingerprint
+        instead of pinning whatever (possibly nothing) happens to be cached."""
+        asked = []
+
+        def signature(block=False):
+            asked.append(block)
+            return ("keychain", "a" * 64) if block else None
+        monkeypatch.setattr(worker_module, "ClaudeSDKClient", self._ConnectsFine)
+        worker_module.authstate.signature = signature     # teardown_method restores it
+        w = make_worker()
+        assert asyncio.run(w._open_once()) is True
+        assert asked == [True]
+        assert w._creds_sig == ("keychain", "a" * 64)
+
+    def test_keychain_unread_at_connect_still_catches_the_next_rotation(self, monkeypatch,
+                                                                        tmp_path):
+        """The reported failure, through the real authstate on a (faked) Mac keychain that
+        nobody has read yet when the worker connects: the baseline came back None, and the
+        login then changing — A, later B — never reconnected anything."""
+        authstate = worker_module.authstate
+        record = {"blob": '{"claudeAiOauth": {"accessToken": "at-a", "refreshToken": "rt-a"}}'}
+        monkeypatch.setattr(authstate.sys, "platform", "darwin")
+        monkeypatch.setattr(authstate, "_keychain_read", lambda: record["blob"])
+        monkeypatch.setattr(authstate, "_kc", {"at": None, "blob": None, "busy": False})
+        monkeypatch.setattr(authstate.Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(worker_module, "ClaudeSDKClient", self._ConnectsFine)
+        w = make_worker()
+        assert asyncio.run(w._open_once()) is True
+        sig_a = w._creds_sig
+        assert sig_a is not None and sig_a[0] == "keychain"   # pinned, not left at None
+        calls = []
+
+        async def _fake_reconnect(note=None):
+            calls.append(note)
+        w._reconnect = _fake_reconnect
+        asyncio.run(w._auth_recycle())
+        assert calls == []                    # same record: nothing to do
+        record["blob"] = '{"claudeAiOauth": {"accessToken": "at-b", "refreshToken": "rt-b"}}'
+        authstate._keychain_refresh()         # the cache's background re-read lands
+        asyncio.run(w._auth_recycle())
+        assert len(calls) == 1 and "refreshed elsewhere" in calls[0]
+        assert w._creds_sig not in (None, sig_a)
 
 
 # ---------------------------------------------------------------------------

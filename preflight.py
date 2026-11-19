@@ -171,6 +171,11 @@ def launcher_python():
 
     Returns the console twin (the python.exe beside that pythonw) when it exists,
     because every caller builds runnable advice out of the answer."""
+    if sys.platform == "darwin":
+        # The macOS launchers (the app bundle, Start Claude Overlay.command) all run the
+        # virtual environment setup.command builds in the app folder — nothing to search.
+        venv = os.path.join(repo_dir(), ".venv", "bin", "python")
+        return venv if os.path.isfile(venv) else None
     import shutil
     pyw = shutil.which("pythonw") or _scan_programs_python("pythonw.exe")
     if not pyw:
@@ -190,17 +195,18 @@ def _claude_cli_path():
     PATH (native installer → ~/.local/bin, global npm → %APPDATA%\\npm) so this agrees with
     what the app will actually find at run time."""
     import shutil
-    extra = [os.path.join(os.environ.get("USERPROFILE", ""), ".local", "bin"),
-             os.path.join(os.environ.get("APPDATA", ""), "npm")]
-    path = os.pathsep.join([p for p in extra if p] + [os.environ.get("PATH", "")])
+    extra = [os.path.join(os.environ[v], *sub) for v, sub in
+             (("USERPROFILE", (".local", "bin")), ("APPDATA", ("npm",)))
+             if os.environ.get(v)]                    # never a relative PATH entry
+    path = os.pathsep.join(extra + [os.environ.get("PATH", "")])
     return shutil.which("claude", path=path)
 
 
 def _codex_cli_path():
     """Where the `codex` CLI is, with the global-npm folder codexworker.py adds to PATH."""
     import shutil
-    extra = os.path.join(os.environ.get("APPDATA", ""), "npm")
-    return shutil.which("codex", path=os.pathsep.join([extra, os.environ.get("PATH", "")]))
+    extra = [os.path.join(os.environ["APPDATA"], "npm")] if os.environ.get("APPDATA") else []
+    return shutil.which("codex", path=os.pathsep.join(extra + [os.environ.get("PATH", "")]))
 
 
 def check():
@@ -219,9 +225,10 @@ def check():
     # A manual ZIP "update" that replaced only claude_overlay.py leaves the sibling
     # modules at their old version or absent; the app then dies on `import authstate`
     # with no window. Checked as files, so it reports even when nothing is importable.
-    missing = [m for m in ("config.py", "worker.py", "debuglog.py", "win32utils.py",
-                           "modelresolve.py", "cliupdate.py", "authstate.py",
-                           "crashreport.py", "usage.py")
+    platform_layer = "macutils.py" if sys.platform == "darwin" else "win32utils.py"
+    missing = [m for m in ("config.py", "worker.py", "debuglog.py", platform_layer,
+                           "screengeom.py", "modelresolve.py", "cliupdate.py",
+                           "authstate.py", "crashreport.py", "usage.py")
                if not os.path.isfile(os.path.join(repo_dir(), m))]
     if missing:
         problems.append(Problem(
@@ -239,6 +246,19 @@ def check():
             FAIL, "tkinter", f"This Python has no working tkinter ({e.__class__.__name__}: {e})",
             "Re-install Python from python.org with the 'tcl/tk and IDLE' option ticked "
             "(the Microsoft Store build and some slim installs omit it)."))
+    else:
+        # macOS only: the Python Apple ships (/usr/bin/python3) is linked against Tk 8.5,
+        # which Apple deprecated years ago and which misdraws on current macOS.
+        try:
+            if sys.platform == "darwin" and tkinter.TkVersion < 8.6:
+                problems.append(Problem(
+                    FAIL, "tk-old",
+                    f"This Python's Tk is {tkinter.TkVersion} - too old to draw the overlay "
+                    f"correctly ({sys.executable})",
+                    "Run setup.command: it builds the app's own Python environment with a "
+                    "current Tk."))
+        except Exception:                                      # pragma: no cover - defensive
+            pass
 
     # --- third-party dependencies ----------------------------------------------
     try:
@@ -268,14 +288,26 @@ def check():
             f"metadata says {sdk_ver or 'not installed'}",
             pip_command()))
 
-    try:
-        import keyboard  # noqa: F401
-    except Exception as e:
-        problems.append(Problem(
-            WARN, "keyboard",
-            f"the `keyboard` package isn't usable ({e.__class__.__name__}) - the overlay "
-            f"still runs, but the Ctrl+Alt+Space global hotkey won't work",
-            pip_command()))
+    if sys.platform == "darwin":
+        # The whole platform layer (window shape, capture exclusion, hotkey, monitors) is
+        # built on these three; without them the app cannot start at all.
+        try:
+            import objc, AppKit, Quartz  # noqa: F401,E401
+        except Exception as e:
+            problems.append(Problem(
+                FAIL, "pyobjc",
+                f"pyobjc is missing or broken ({e.__class__.__name__}: {e}); metadata says "
+                f"{_dist_version('pyobjc-framework-Cocoa') or 'not installed'}",
+                pip_command()))
+    else:
+        try:
+            import keyboard  # noqa: F401
+        except Exception as e:
+            problems.append(Problem(
+                WARN, "keyboard",
+                f"the `keyboard` package isn't usable ({e.__class__.__name__}) - the overlay "
+                f"still runs, but the Ctrl+Alt+Space global hotkey won't work",
+                pip_command()))
 
     # Optional by design, so WARN not FAIL - and the remedy points at the file these two
     # actually live in (requirements-docs.txt), which is NOT the one the default command

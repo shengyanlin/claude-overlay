@@ -19,7 +19,16 @@
 # it - with the failure named in a comment here - not a standing freeze.
 claude-agent-sdk>=0.2.87
 pillow>=10.0
-keyboard>=0.13.5
+# The global hotkey on Windows. Not installed on macOS: there it needs root, and the
+# platform layer (macutils.py) registers the hotkey through Carbon instead.
+keyboard>=0.13.5; sys_platform == "win32"
+
+# macOS only - what macutils.py is built on. pyobjc gives it AppKit / Quartz (the window's
+# shape and Space behaviour, capture exclusion, monitors, the clipboard); truststore makes
+# Python verify HTTPS against the keychain, as it does against the system store on Windows.
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
+truststore>=0.9; sys_platform == "darwin"
 
 # Word/PowerPoint attachment support is in requirements-docs.txt, NOT here, and is
 # installed by a separate non-fatal pass. See that file for why it isn't in this one.

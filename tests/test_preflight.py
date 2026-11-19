@@ -232,6 +232,7 @@ def test_launcher_python_scans_where_setup_installs(monkeypatch, tmp_path):
     (tree / "python.exe").write_bytes(b"")
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(preflight.sys, "platform", "win32")   # the Windows launcher's search
 
     got = preflight.launcher_python()
     assert got is not None
@@ -455,3 +456,15 @@ def test_telemetry_line_never_raises(monkeypatch):
     import telemetry as tl
     monkeypatch.setattr(tl, "state", lambda *a: (_ for _ in ()).throw(RuntimeError("nope")))
     assert "could not be determined" in preflight.telemetry_line()
+
+
+def test_launcher_python_on_macos_is_the_app_folders_environment(monkeypatch, tmp_path):
+    """Every macOS launcher runs <app folder>/.venv, so that is the whole answer there —
+    and None (not a guess) while setup.command hasn't built it yet."""
+    monkeypatch.setattr(preflight.sys, "platform", "darwin")
+    monkeypatch.setattr(preflight, "repo_dir", lambda: str(tmp_path))
+    assert preflight.launcher_python() is None
+    py = tmp_path / ".venv" / "bin" / "python"
+    py.parent.mkdir(parents=True)
+    py.write_bytes(b"")
+    assert preflight.launcher_python() == str(py)

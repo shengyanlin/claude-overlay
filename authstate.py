@@ -40,8 +40,13 @@ Leaf module: stdlib only, no project imports. Every function degrades to None/Fa
 ANY failure and never raises into the caller.
 """
 
+import hashlib
 import json
 import os
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 
 _CRED_FILE = ".credentials.json"
@@ -90,22 +95,136 @@ def credentials_path() -> Path:
     return config_dir() / _CRED_FILE
 
 
-def signature():
+def signature(block=False):
     """A cheap (mtime_ns, size) fingerprint of the credential file, or None if it can't be
     stat'ed. Used to detect "the tokens changed under a long-lived CLI subprocess" — a
     successful refresh by any process rewrites this file, and the subprocess that has been
     running since before that may still be holding the superseded copy. One stat() call, so
-    it's safe on the send path."""
+    it's safe on the send path. (macOS, where there is no file: a digest of the keychain
+    record instead — see _keychain_blob — which changes on exactly the same occasions.)
+
+    block=True is for taking a BASELINE, off the UI thread: on macOS it reads the keychain
+    record now and waits for it, cache or no cache. The default hands back the cached copy,
+    which is None until the first background read lands and may predate whatever the CLI
+    stored a moment ago — fine for a later comparison, wrong for the value everything is
+    compared against. No difference where the file exists: stat() is always current."""
     try:
         st = credentials_path().stat()
         return (st.st_mtime_ns, st.st_size)
+    except Exception:
+        pass
+    blob = _keychain_blob(block=block, max_age=0.0 if block else None)
+    if blob:
+        return ("keychain", hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest())
+    return None
+
+
+# ── macOS: the same record, in the login keychain ───────────────────────────────────────
+# On a Mac the CLI doesn't write .credentials.json: it keeps the identical JSON in the login
+# keychain, as a generic password it stores and reads with /usr/bin/security. Reading it the
+# same way needs no prompt (the item's access list names `security`, which created it) and
+# gives every check in this module the evidence it has on Windows — without it the Mac
+# overlay would be blind to a dead login, and the allowance ring would stay empty.
+#
+# `security` is a process spawn, and dead_reason() runs on the UI thread, so the record is
+# cached and refreshed in the background: a caller gets the last known copy at once and a
+# stale one triggers a re-read for next time (block=True, for callers already off the UI
+# thread, waits for a fresh one instead). A custom CLAUDE_CONFIG_DIR changes the item's
+# name in ways this doesn't try to follow — that case stays "no evidence", as before.
+_KEYCHAIN_SERVICE = "Claude Code-credentials"
+_SECURITY = "/usr/bin/security"
+_KEYCHAIN_TTL = 30.0
+_kc = {"at": None, "blob": None, "busy": False}
+_kc_lock = threading.Lock()
+# One `security` at a time, so reads land in the cache in the order they were made. Two
+# overlapping ones could finish out of order and leave the OLDER record cached as the
+# newest — which signature() would then report as the tokens changing, twice (there and
+# back). Held across the spawn, so only ever taken off the UI thread.
+_kc_read_lock = threading.Lock()
+
+
+def _keychain_read():
+    try:
+        # By full path: what this prints is the login itself, and config.py has just put
+        # the user's shell PATH — every folder a tool was ever installed into — in front.
+        # A stray `security` there must not be the program that gets asked for it.
+        r = subprocess.run([_SECURITY, "find-generic-password", "-s", _KEYCHAIN_SERVICE, "-w"],
+                           capture_output=True, timeout=8, stdin=subprocess.DEVNULL)
+        if r.returncode != 0 or not (0 < len(r.stdout) <= _MAX_CRED_BYTES):
+            return None
+        return r.stdout.decode("utf-8", "replace").strip() or None
+    except Exception:
+        return None
+
+
+def _keychain_cached(max_age):
+    """(fresh, blob) for the cached record. Caller holds _kc_lock."""
+    at = _kc["at"]
+    return at is not None and (time.monotonic() - at) < max_age, _kc["blob"]
+
+
+def _keychain_refresh(max_age=0.0):
+    with _kc_read_lock:
+        if max_age > 0:             # the read we queued behind may be all this caller needed
+            with _kc_lock:
+                fresh, blob = _keychain_cached(max_age)
+            if fresh:
+                return blob
+        blob = _keychain_read()
+        with _kc_lock:
+            _kc["blob"], _kc["at"], _kc["busy"] = blob, time.monotonic(), False
+    return blob
+
+
+def _keychain_blob(block=False, max_age=None):
+    """The keychain's copy of the credential JSON (a string), or None: not macOS, a custom
+    config dir, no such item, or not read yet. Never raises. max_age is how old a cached
+    copy may be and still be served (default: _KEYCHAIN_TTL); block=True with max_age=0
+    always re-reads."""
+    if sys.platform != "darwin" or (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip():
+        return None
+    if max_age is None:
+        max_age = _KEYCHAIN_TTL
+    with _kc_lock:
+        fresh, blob = _keychain_cached(max_age)
+        if fresh:
+            return blob
+        if block:
+            _kc["busy"] = True
+        elif not _kc["busy"]:
+            _kc["busy"] = True
+            threading.Thread(target=_keychain_refresh, name="keychain-read",
+                             daemon=True).start()
+    return _keychain_refresh(max_age) if block else blob
+
+
+def read_oauth(block=False):
+    """The stored claudeAiOauth record wherever this platform keeps it — the credential
+    file, else (macOS) the keychain — or None when there is nothing readable. block=True
+    waits for a fresh keychain read; only for callers that are off the UI thread."""
+    oauth = _read_oauth_file()
+    if oauth is not None:
+        return oauth
+    blob = _keychain_blob(block=block)
+    if not blob:
+        return None
+    try:
+        data = json.loads(blob)
+        oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+        return oauth if isinstance(oauth, dict) else None
     except Exception:
         return None
 
 
 def _read_oauth():
     """The stored claudeAiOauth record as a dict, or None when there is nothing readable
-    (no file, too big, bad JSON, different shape). None means "no evidence", never "bad"."""
+    (no file or keychain item, too big, bad JSON, different shape). None means "no
+    evidence", never "bad"."""
+    return read_oauth()
+
+
+def _read_oauth_file():
+    """The record from .credentials.json, or None."""
     try:
         p = credentials_path()
         if p.stat().st_size > _MAX_CRED_BYTES:
