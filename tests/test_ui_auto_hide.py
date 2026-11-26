@@ -2,7 +2,8 @@
 
 Auto-hide: the overlay hides itself after N seconds unused — never while it has the
 keyboard, has the pointer over it, or Claude is still replying — and the hotkey brings it
-back with a fresh countdown. A hidden start launches with no window until the hotkey.
+back with a fresh countdown; the title-bar pin holds it up. A hidden start launches with
+no window until the hotkey.
 No test here shows a real window."""
 import time
 
@@ -133,3 +134,46 @@ def test_first_show_after_a_hidden_start_stamps_the_taskbar_style_before_mapping
     monkeypatch.setattr(overlay, "_raise_to_front", lambda focus=False: None)
     overlay._show_window()
     assert calls[:2] == ["style", "map"] and overlay._taskbar_nudge_pending is False
+
+
+# ── the title-bar pin: auto-hide paused while it's on ─────────────────────────────────────
+
+def test_pin_holds_the_overlay_up(auto, monkeypatch):
+    ov, calls = auto
+    monkeypatch.setattr(ov, "pinned", True)
+    monkeypatch.setattr(ov.root, "winfo_containing", lambda *a: None)   # pointer elsewhere
+    monkeypatch.setattr(co._user32, "GetForegroundWindow", lambda: 0)    # keyboard elsewhere
+    assert ov._auto_hide_paused() is True
+    ov._auto_hide_check(now=5000.0)
+    assert calls == []
+
+
+def test_toggling_the_pin_remembers_it_and_restarts_the_countdown(overlay, monkeypatch):
+    monkeypatch.setattr(overlay, "pinned", False)
+    monkeypatch.setattr(overlay, "_idle_since", 0.0)
+    overlay.toggle_pin()
+    assert overlay.pinned is True and co._load_state().get("pinned") is True
+    overlay.toggle_pin()
+    assert overlay.pinned is False and co._load_state().get("pinned") is False
+    assert time.monotonic() - overlay._idle_since < 1.0
+
+
+def test_no_pin_button_while_auto_hide_is_off(overlay):
+    # The suite builds the overlay with the committed default (auto-hide off).
+    assert config.AUTO_HIDE_SECONDS == 0 and overlay.pin_btn is None
+    overlay._paint_pin()                     # a harmless no-op then
+
+
+def test_pin_paints_its_state(overlay, monkeypatch):
+    import tkinter as tk
+    btn = tk.Label(overlay.root)
+    monkeypatch.setattr(overlay, "pin_btn", btn)
+    try:
+        monkeypatch.setattr(overlay, "pinned", True)
+        overlay._paint_pin()
+        assert btn.cget("text") == overlay.pin_glyphs[1] and btn.cget("fg") == co.T["accent"]
+        overlay.pinned = False
+        overlay._paint_pin()
+        assert btn.cget("text") == overlay.pin_glyphs[0] and btn.cget("fg") == co.T["muted"]
+    finally:
+        btn.destroy()

@@ -790,6 +790,7 @@ class Overlay:
         # overlay is collapsed with the setting on: the timer is armed on collapse and
         # cancelled on expand, so none of it can cost the expanded overlay anything.
         self.orb_pet = bool(_load_state().get("orb_pet", ORB_PET_DEFAULT))
+        self.pinned = bool(_load_state().get("pinned", False))   # title-bar pin: pauses auto-hide
         self._pet_brain = orbpet.PetBrain()
         self._pet_frames = None         # {pose: PIL image}, drawn once on a background thread
         self._pet_rendering = False     # that thread is running
@@ -1017,8 +1018,11 @@ class Overlay:
         _icon_fam = next((f for f in ("Segoe Fluent Icons", "Segoe MDL2 Assets") if f in avail), None)
         if _icon_fam:
             self.f_icon, self.gear_glyph = mk(_icon_fam, 13), "\uE713"
+            self.pin_glyphs = ("\uE840", "\uE842")    # the same tilted pin, outline / filled,
+                                                      # in both Fluent Icons and MDL2 Assets
         else:
             self.f_icon, self.gear_glyph = self.f_small, "⚙"
+            self.pin_glyphs = ("pin", "pin")          # no icon font: the colour carries the state
 
         self._build_titlebar()
         self.hairline = tk.Frame(self.root, bg=T["border"], height=1)
@@ -1556,6 +1560,7 @@ class Overlay:
                 pass
         for paint in (self._layout_input, self._paint_send, self._paint_gear,
                       self._paint_screen_toggle, self._paint_provider_switch, self._sb_redraw,
+                      self._paint_pin,
                       self._update_jump, self._refresh_queue, self._refresh_attach,
                       self._refresh_statusline):
             try:
@@ -2206,6 +2211,14 @@ class Overlay:
         self.title_hint.bind("<Button-1>", lambda e: self._begin_rename())
         self._title_btn(bar, "✕", self.quit)
         self._title_btn(bar, "—", self.toggle_collapse)
+        # The pin sits just left of the window buttons, and only where auto-hide is on, since
+        # pausing it is all the pin does.
+        self.pin_btn = None
+        if AUTO_HIDE_SECONDS > 0:
+            self.pin_btn = self._title_btn(bar, "", self.toggle_pin)
+            self.pin_btn.configure(font=self.f_icon, width=2)
+            self.pin_btn.bind("<Leave>", lambda e: self._paint_pin())   # back to the state colour
+            self._paint_pin()
         self._build_provider_switch(bar)
         bar.bind("<Configure>", lambda e: self._update_title_hint(), add="+")
         self._update_title_hint()
@@ -7135,9 +7148,9 @@ class Overlay:
     def _auto_hide_paused(self):
         """Is the overlay being used right now? Claude replying (or compacting), the pointer
         over any of our windows, or the keyboard in one of them (the overlay, a menu, a
-        dialog). Anything that can't be checked counts as in use: hiding while someone reads
-        is worse than hiding late."""
-        if self.busy or getattr(self, "_compacting", False):
+        dialog). The title-bar pin holds it the same way. Anything that can't be checked counts
+        as in use: hiding while someone reads is worse than hiding late."""
+        if self.pinned or self.busy or getattr(self, "_compacting", False):
             return True
         try:
             if self.root.winfo_containing(*self.root.winfo_pointerxy()) is not None:
@@ -7149,6 +7162,22 @@ class Overlay:
             return bool(fg) and (fg == self._hwnd() or window_is_own(fg))
         except Exception:
             return True
+
+    def toggle_pin(self):
+        """The title-bar pin: while it is on, auto-hide leaves the overlay up. The hotkey still
+        hides it (a deliberate press). Remembered across launches, like the other toggles."""
+        self.pinned = not self.pinned
+        _save_state(pinned=self.pinned)
+        self._idle_since = time.monotonic()   # unpinning starts a full countdown
+        self._paint_pin()
+
+    def _paint_pin(self):
+        b = getattr(self, "pin_btn", None)
+        if b is None:
+            return
+        off, on = self.pin_glyphs
+        b.configure(text=on if self.pinned else off, bg=T["bg"],
+                    fg=T["accent"] if self.pinned else T["muted"])
 
     def _auto_hide_check(self, now=None):
         """One countdown step: it restarts while hidden or in use, and hides the overlay
