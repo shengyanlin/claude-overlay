@@ -807,6 +807,8 @@ class Overlay:
         self.expanded = True
         self._toggle_request = False
         self._hotkey_last = 0.0           # monotonic time of the last hotkey callback (repeat filter)
+        self._idle_since = time.monotonic()   # auto-hide countdown start (AUTO_HIDE_SECONDS)
+        self._taskbar_nudge_pending = False   # started hidden: taskbar style not yet stamped
         self._model = None
         self._chosen_model = None   # the model the user picked this session (menu value), if any
         self._resume_started = None # monotonic time a Resume click went to the worker, until it lands
@@ -923,6 +925,8 @@ class Overlay:
 
         self._build()
         self._register_hotkey()
+        if AUTO_HIDE_SECONDS > 0:
+            self.root.after(1000, self._auto_hide_tick)
         self.root.after(60, self._poll)
 
     def px(self, v):
@@ -944,6 +948,9 @@ class Overlay:
         self.root.attributes("-topmost", True)
         if WINDOW_ALPHA < 1.0:   # avoid WS_EX_LAYERED, which ignores SetWindowRgn rounding
             self.root.attributes("-alpha", WINDOW_ALPHA)
+        if START_HIDDEN:                       # a sign-in launch: wait for the hotkey. Withdrawn
+            self.root.withdraw()               # before the first update() below can map it, and
+            self.visible = False               # every startup step that shows it checks this flag
         w, h = self.px(420), self.px(620)
         if IS_MAC:
             _mons = enumerate_monitors()                # primary first
@@ -1069,7 +1076,7 @@ class Overlay:
         if IS_MAC:
             self._mac_setup()
 
-        self.root.after(130, lambda: (self.root.focus_force(), self.entry.focus_set()))
+        self.root.after(130, lambda: self.visible and (self.root.focus_force(), self.entry.focus_set()))
         self.root.bind("<Configure>", self._on_configure)
         self.root.bind("<Map>", self._on_map, add="+")   # restore (incl. from taskbar) re-asserts the frameless look
         self.root.bind("<FocusIn>", self._on_focus_in, add="+")  # taskbar-click / alt-tab activation → raise above topmost peers
@@ -1997,6 +2004,9 @@ class Overlay:
                 install_status_item(self._hotkey_fired, tooltip="Claude Overlay")
             return
         if not TASKBAR_BUTTON:
+            return
+        if not self.visible:
+            self._taskbar_nudge_pending = True   # started hidden: _show_window does it on first show
             return
         self._set_taskbar_button()
         try:
@@ -7083,6 +7093,10 @@ class Overlay:
 
     def _show_window(self):
         self.visible = True          # first: _raise_to_front below refuses to raise a hidden window
+        self._idle_since = time.monotonic()   # summoned: the auto-hide countdown starts over
+        if self._taskbar_nudge_pending:      # first show after a hidden start: stamp the app-window
+            self._taskbar_nudge_pending = False   # style BEFORE mapping, so the shell gives it a
+            self._set_taskbar_button()            # taskbar button on this very show
         self.root.deiconify()
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
@@ -7090,6 +7104,10 @@ class Overlay:
         self._force_foreground()     # hotkey path: WE initiate activation, push past the fg lock
         self._raise_to_front(focus=True)   # lift above topmost peers + focus the input
         self.root.after(60, self._apply_region)
+
+    def _hide_window(self):
+        self.visible = False         # before withdraw: the <FocusIn> it triggers must see "hidden"
+        self.root.withdraw()
 
     def toggle_visible(self):
         # Hidden → always show. Visible → hide whenever the user can SEE the overlay, focused
@@ -7109,10 +7127,46 @@ class Overlay:
         except Exception:
             in_front = True    # can't tell → still toggle; a hotkey that never hides is the bug
         if in_front:
-            self.visible = False     # before withdraw: the <FocusIn> it triggers must see "hidden"
-            self.root.withdraw()
+            self._hide_window()
         else:
             self._show_window()
+
+    # ── auto-hide (AUTO_HIDE_SECONDS > 0) ──
+    def _auto_hide_paused(self):
+        """Is the overlay being used right now? Claude replying (or compacting), the pointer
+        over any of our windows, or the keyboard in one of them (the overlay, a menu, a
+        dialog). Anything that can't be checked counts as in use: hiding while someone reads
+        is worse than hiding late."""
+        if self.busy or getattr(self, "_compacting", False):
+            return True
+        try:
+            if self.root.winfo_containing(*self.root.winfo_pointerxy()) is not None:
+                return True
+        except Exception:
+            return True
+        try:
+            fg = _user32.GetForegroundWindow()
+            return bool(fg) and (fg == self._hwnd() or window_is_own(fg))
+        except Exception:
+            return True
+
+    def _auto_hide_check(self, now=None):
+        """One countdown step: it restarts while hidden or in use, and hides the overlay
+        once it has been idle for AUTO_HIDE_SECONDS. The hotkey brings it back."""
+        now = time.monotonic() if now is None else now
+        if not self.visible or self._auto_hide_paused():
+            self._idle_since = now
+        elif now - self._idle_since >= AUTO_HIDE_SECONDS:
+            self._hide_window()
+            self._idle_since = now
+
+    def _auto_hide_tick(self):
+        try:
+            self._auto_hide_check()
+        except Exception:
+            pass
+        finally:
+            self.root.after(500, self._auto_hide_tick)
 
     # ── status / busy ──
     def _set_status(self, text):

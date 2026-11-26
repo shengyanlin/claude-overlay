@@ -285,7 +285,14 @@ if IS_MAC:
     # on any Mac with two keyboard layouts), and the system keeps it for itself — so the
     # same chord would silently never reach the overlay there.
     HOTKEY = "alt+shift+space"   # ⌥⇧Space
-THEME = "light"                  # "light" (Claude paper) or "dark" (warm dark)
+AUTO_HIDE_SECONDS = 0            # hide the overlay after this many seconds unused: not focused,
+                                 # pointer not over it, Claude not replying. 0 = never. The
+                                 # hotkey brings it back. Usually set per machine in config.json.
+START_HIDDEN = _env_bool("CLAUDE_OVERLAY_START_HIDDEN", False)   # launch without showing the
+                                 # window; the hotkey brings it up. Meant for a sign-in launch
+                                 # (set CLAUDE_OVERLAY_START_HIDDEN=1 there), so opening the app by
+                                 # hand still shows it.
+THEME = "light"                 # "light" (Claude paper) or "dark" (warm dark)
 WINDOW_ALPHA = 1.0
 CORNER_RADIUS = 18
 TASKBAR_BUTTON = True            # show a real, clickable Windows taskbar button (with the
@@ -820,6 +827,8 @@ _USER_CONFIG_KEYS = {
     "SHOW_IN_SCREEN_SHARE_DEFAULT": _v_bool,
     "TASKBAR_BUTTON": _v_bool,
     "HOTKEY": _v_str,
+    "AUTO_HIDE_SECONDS": _v_num(0, 3600, int),
+    "START_HIDDEN": _v_bool,
     "WINDOW_ALPHA": _v_num(0.3, 1.0, float),   # floor 0.3: an ~invisible window looks broken
     "CORNER_RADIUS": _v_num(0, 40, int),
     "ORB_SIZE": _v_num(24, 160, int),
@@ -839,6 +848,7 @@ _ENV_BEATS_JSON = {
     "CLI_UPDATE_CHECK": "CLAUDE_OVERLAY_CLI_UPDATE_CHECK",
     "CLI_AUTO_UPDATE": "CLAUDE_OVERLAY_CLI_AUTO_UPDATE",
     "OVERLAY_AUTO_UPDATE": "CLAUDE_OVERLAY_AUTO_UPDATE",
+    "START_HIDDEN": "CLAUDE_OVERLAY_START_HIDDEN",
     "TELEMETRY": "CLAUDE_OVERLAY_TELEMETRY",
     "TELEMETRY_URL": "CLAUDE_OVERLAY_TELEMETRY_URL",
 }
