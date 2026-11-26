@@ -790,6 +790,7 @@ class Overlay:
         # overlay is collapsed with the setting on: the timer is armed on collapse and
         # cancelled on expand, so none of it can cost the expanded overlay anything.
         self.orb_pet = bool(_load_state().get("orb_pet", ORB_PET_DEFAULT))
+        self.pinned = bool(_load_state().get("pinned", False))   # title-bar pin: pauses auto-hide
         self._pet_brain = orbpet.PetBrain()
         self._pet_frames = None         # {pose: PIL image}, drawn once on a background thread
         self._pet_rendering = False     # that thread is running
@@ -806,6 +807,9 @@ class Overlay:
         self.visible = True
         self.expanded = True
         self._toggle_request = False
+        self._hotkey_last = 0.0           # monotonic time of the last hotkey callback (repeat filter)
+        self._idle_since = time.monotonic()   # auto-hide countdown start (AUTO_HIDE_SECONDS)
+        self._taskbar_nudge_pending = False   # started hidden: taskbar style not yet stamped
         self._model = None
         self._chosen_model = None   # the model the user picked this session (menu value), if any
         self._resume_started = None # monotonic time a Resume click went to the worker, until it lands
@@ -922,6 +926,8 @@ class Overlay:
 
         self._build()
         self._register_hotkey()
+        if AUTO_HIDE_SECONDS > 0:
+            self.root.after(1000, self._auto_hide_tick)
         self.root.after(60, self._poll)
 
     def px(self, v):
@@ -943,6 +949,9 @@ class Overlay:
         self.root.attributes("-topmost", True)
         if WINDOW_ALPHA < 1.0:   # avoid WS_EX_LAYERED, which ignores SetWindowRgn rounding
             self.root.attributes("-alpha", WINDOW_ALPHA)
+        if START_HIDDEN:                       # a sign-in launch: wait for the hotkey. Withdrawn
+            self.root.withdraw()               # before the first update() below can map it, and
+            self.visible = False               # every startup step that shows it checks this flag
         w, h = self.px(420), self.px(620)
         if IS_MAC:
             _mons = enumerate_monitors()                # primary first
@@ -1009,8 +1018,11 @@ class Overlay:
         _icon_fam = next((f for f in ("Segoe Fluent Icons", "Segoe MDL2 Assets") if f in avail), None)
         if _icon_fam:
             self.f_icon, self.gear_glyph = mk(_icon_fam, 13), "\uE713"
+            self.pin_glyphs = ("\uE840", "\uE842")    # the same tilted pin, outline / filled,
+                                                      # in both Fluent Icons and MDL2 Assets
         else:
             self.f_icon, self.gear_glyph = self.f_small, "⚙"
+            self.pin_glyphs = ("pin", "pin")          # no icon font: the colour carries the state
 
         self._build_titlebar()
         self.hairline = tk.Frame(self.root, bg=T["border"], height=1)
@@ -1068,7 +1080,7 @@ class Overlay:
         if IS_MAC:
             self._mac_setup()
 
-        self.root.after(130, lambda: (self.root.focus_force(), self.entry.focus_set()))
+        self.root.after(130, lambda: self.visible and (self.root.focus_force(), self.entry.focus_set()))
         self.root.bind("<Configure>", self._on_configure)
         self.root.bind("<Map>", self._on_map, add="+")   # restore (incl. from taskbar) re-asserts the frameless look
         self.root.bind("<FocusIn>", self._on_focus_in, add="+")  # taskbar-click / alt-tab activation → raise above topmost peers
@@ -1548,6 +1560,7 @@ class Overlay:
                 pass
         for paint in (self._layout_input, self._paint_send, self._paint_gear,
                       self._paint_screen_toggle, self._paint_provider_switch, self._sb_redraw,
+                      self._paint_pin,
                       self._update_jump, self._refresh_queue, self._refresh_attach,
                       self._refresh_statusline):
             try:
@@ -1997,6 +2010,9 @@ class Overlay:
             return
         if not TASKBAR_BUTTON:
             return
+        if not self.visible:
+            self._taskbar_nudge_pending = True   # started hidden: _show_window does it on first show
+            return
         self._set_taskbar_button()
         try:
             geo = self.root.geometry()
@@ -2051,8 +2067,14 @@ class Overlay:
         buried under another always-on-top window (or just unfocused). This does the z-order
         raise the activation skips. Pure z-order (no SetWindowRgn / <Configure>), so it's
         idempotent, flicker-free when already on top, and clear of the v1.1.9 freeze class.
-        Guarded against the focus churn it can itself trigger."""
-        if self._fronting:
+        Guarded against the focus churn it can itself trigger.
+
+        Never while hidden by the hotkey. SWP_SHOWWINDOW below makes a withdrawn window
+        visible at the Win32 level behind Tk's back, and Tk fires <FocusIn> on the root right
+        after `wm withdraw` — so the hotkey's hide ran _on_focus_in → here → straight back on
+        screen, with self.visible still False, and the next press then "showed" a window that
+        was already showing (the hide-flash / dead-press alternation)."""
+        if self._fronting or not self.visible:
             return
         self._fronting = True
         try:
@@ -2189,6 +2211,14 @@ class Overlay:
         self.title_hint.bind("<Button-1>", lambda e: self._begin_rename())
         self._title_btn(bar, "✕", self.quit)
         self._title_btn(bar, "—", self.toggle_collapse)
+        # The pin sits just left of the window buttons, and only where auto-hide is on, since
+        # pausing it is all the pin does.
+        self.pin_btn = None
+        if AUTO_HIDE_SECONDS > 0:
+            self.pin_btn = self._title_btn(bar, "", self.toggle_pin)
+            self.pin_btn.configure(font=self.f_icon, width=2)
+            self.pin_btn.bind("<Leave>", lambda e: self._paint_pin())   # back to the state colour
+            self._paint_pin()
         self._build_provider_switch(bar)
         bar.bind("<Configure>", lambda e: self._update_title_hint(), add="+")
         self._update_title_hint()
@@ -7060,10 +7090,26 @@ class Overlay:
             self._keyboard = None
             self.root.after(300, lambda: self.add_sys(f"(global hotkey unavailable: {e})"))
 
+    # Longer than the slowest Windows key-repeat interval (~400 ms), so a held combo's
+    # auto-repeats always fall inside it.
+    HOTKEY_REPEAT_GAP = 0.5
+
     def _hotkey_fired(self):
-        self._toggle_request = True
+        # Runs on the hook thread. The `keyboard` library calls this on EVERY key-down while
+        # the combo matches, auto-repeat included, so a press held past the repeat delay
+        # queued hide → show → hide… and the window popped straight back. Only a press that
+        # follows a quiet gap counts; every repeat refreshes the gap, so a hold fires once.
+        now = time.monotonic()
+        last, self._hotkey_last = self._hotkey_last, now
+        if now - last >= self.HOTKEY_REPEAT_GAP:
+            self._toggle_request = True
 
     def _show_window(self):
+        self.visible = True          # first: _raise_to_front below refuses to raise a hidden window
+        self._idle_since = time.monotonic()   # summoned: the auto-hide countdown starts over
+        if self._taskbar_nudge_pending:      # first show after a hidden start: stamp the app-window
+            self._taskbar_nudge_pending = False   # style BEFORE mapping, so the shell gives it a
+            self._set_taskbar_button()            # taskbar button on this very show
         self.root.deiconify()
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
@@ -7071,26 +7117,85 @@ class Overlay:
         self._force_foreground()     # hotkey path: WE initiate activation, push past the fg lock
         self._raise_to_front(focus=True)   # lift above topmost peers + focus the input
         self.root.after(60, self._apply_region)
-        self.visible = True
+
+    def _hide_window(self):
+        self.visible = False         # before withdraw: the <FocusIn> it triggers must see "hidden"
+        self.root.withdraw()
 
     def toggle_visible(self):
-        # Hidden → always show. Visible → only hide if we're already the foreground
-        # window; if we're visible-but-behind/unfocused, pressing the hotkey means
-        # "bring Claude to me", so raise+focus instead of making it vanish (the old
-        # behaviour, which felt like the hotkey "couldn't summon" the app).
+        # Hidden → always show. Visible → hide whenever the user can SEE the overlay, focused
+        # or not. It is always-on-top, so while you work in another app it usually sits in
+        # plain view without the keyboard. Gating the hide on focus alone (as before) made the
+        # hotkey look dead there: each press only re-focused a window that was already on
+        # top, nothing visibly changed, and it never hid. Only when it can't be seen (another
+        # always-on-top window covers it, or it's off-screen / minimized) does the hotkey mean
+        # "bring Claude to me" and raise+focus instead. macOS keeps the focus-only rule
+        # (its window_in_view is always False).
         if not self.visible:
             self._show_window()
             return
         try:
-            hwnd = _user32.GetAncestor(self.root.winfo_id(), 2) or self.root.winfo_id()
-            fg = _user32.GetForegroundWindow()
+            hwnd = self._hwnd()
+            in_front = _user32.GetForegroundWindow() == hwnd or window_in_view(hwnd)
         except Exception:
-            hwnd, fg = 1, 0
-        if fg == hwnd:
-            self.root.withdraw()
-            self.visible = False
+            in_front = True    # can't tell → still toggle; a hotkey that never hides is the bug
+        if in_front:
+            self._hide_window()
         else:
             self._show_window()
+
+    # ── auto-hide (AUTO_HIDE_SECONDS > 0) ──
+    def _auto_hide_paused(self):
+        """Is the overlay being used right now? Claude replying (or compacting), the pointer
+        over any of our windows, or the keyboard in one of them (the overlay, a menu, a
+        dialog). The title-bar pin holds it the same way. Anything that can't be checked counts
+        as in use: hiding while someone reads is worse than hiding late."""
+        if self.pinned or self.busy or getattr(self, "_compacting", False):
+            return True
+        try:
+            if self.root.winfo_containing(*self.root.winfo_pointerxy()) is not None:
+                return True
+        except Exception:
+            return True
+        try:
+            fg = _user32.GetForegroundWindow()
+            return bool(fg) and (fg == self._hwnd() or window_is_own(fg))
+        except Exception:
+            return True
+
+    def toggle_pin(self):
+        """The title-bar pin: while it is on, auto-hide leaves the overlay up. The hotkey still
+        hides it (a deliberate press). Remembered across launches, like the other toggles."""
+        self.pinned = not self.pinned
+        _save_state(pinned=self.pinned)
+        self._idle_since = time.monotonic()   # unpinning starts a full countdown
+        self._paint_pin()
+
+    def _paint_pin(self):
+        b = getattr(self, "pin_btn", None)
+        if b is None:
+            return
+        off, on = self.pin_glyphs
+        b.configure(text=on if self.pinned else off, bg=T["bg"],
+                    fg=T["accent"] if self.pinned else T["muted"])
+
+    def _auto_hide_check(self, now=None):
+        """One countdown step: it restarts while hidden or in use, and hides the overlay
+        once it has been idle for AUTO_HIDE_SECONDS. The hotkey brings it back."""
+        now = time.monotonic() if now is None else now
+        if not self.visible or self._auto_hide_paused():
+            self._idle_since = now
+        elif now - self._idle_since >= AUTO_HIDE_SECONDS:
+            self._hide_window()
+            self._idle_since = now
+
+    def _auto_hide_tick(self):
+        try:
+            self._auto_hide_check()
+        except Exception:
+            pass
+        finally:
+            self.root.after(500, self._auto_hide_tick)
 
     # ── status / busy ──
     def _set_status(self, text):
