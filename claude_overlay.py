@@ -806,6 +806,7 @@ class Overlay:
         self.visible = True
         self.expanded = True
         self._toggle_request = False
+        self._hotkey_last = 0.0           # monotonic time of the last hotkey callback (repeat filter)
         self._model = None
         self._chosen_model = None   # the model the user picked this session (menu value), if any
         self._resume_started = None # monotonic time a Resume click went to the worker, until it lands
@@ -2051,8 +2052,14 @@ class Overlay:
         buried under another always-on-top window (or just unfocused). This does the z-order
         raise the activation skips. Pure z-order (no SetWindowRgn / <Configure>), so it's
         idempotent, flicker-free when already on top, and clear of the v1.1.9 freeze class.
-        Guarded against the focus churn it can itself trigger."""
-        if self._fronting:
+        Guarded against the focus churn it can itself trigger.
+
+        Never while hidden by the hotkey. SWP_SHOWWINDOW below makes a withdrawn window
+        visible at the Win32 level behind Tk's back, and Tk fires <FocusIn> on the root right
+        after `wm withdraw` — so the hotkey's hide ran _on_focus_in → here → straight back on
+        screen, with self.visible still False, and the next press then "showed" a window that
+        was already showing (the hide-flash / dead-press alternation)."""
+        if self._fronting or not self.visible:
             return
         self._fronting = True
         try:
@@ -7060,10 +7067,22 @@ class Overlay:
             self._keyboard = None
             self.root.after(300, lambda: self.add_sys(f"(global hotkey unavailable: {e})"))
 
+    # Longer than the slowest Windows key-repeat interval (~400 ms), so a held combo's
+    # auto-repeats always fall inside it.
+    HOTKEY_REPEAT_GAP = 0.5
+
     def _hotkey_fired(self):
-        self._toggle_request = True
+        # Runs on the hook thread. The `keyboard` library calls this on EVERY key-down while
+        # the combo matches, auto-repeat included, so a press held past the repeat delay
+        # queued hide → show → hide… and the window popped straight back. Only a press that
+        # follows a quiet gap counts; every repeat refreshes the gap, so a hold fires once.
+        now = time.monotonic()
+        last, self._hotkey_last = self._hotkey_last, now
+        if now - last >= self.HOTKEY_REPEAT_GAP:
+            self._toggle_request = True
 
     def _show_window(self):
+        self.visible = True          # first: _raise_to_front below refuses to raise a hidden window
         self.root.deiconify()
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
@@ -7071,24 +7090,27 @@ class Overlay:
         self._force_foreground()     # hotkey path: WE initiate activation, push past the fg lock
         self._raise_to_front(focus=True)   # lift above topmost peers + focus the input
         self.root.after(60, self._apply_region)
-        self.visible = True
 
     def toggle_visible(self):
-        # Hidden → always show. Visible → only hide if we're already the foreground
-        # window; if we're visible-but-behind/unfocused, pressing the hotkey means
-        # "bring Claude to me", so raise+focus instead of making it vanish (the old
-        # behaviour, which felt like the hotkey "couldn't summon" the app).
+        # Hidden → always show. Visible → hide whenever the user can SEE the overlay, focused
+        # or not. It is always-on-top, so while you work in another app it usually sits in
+        # plain view without the keyboard. Gating the hide on focus alone (as before) made the
+        # hotkey look dead there: each press only re-focused a window that was already on
+        # top, nothing visibly changed, and it never hid. Only when it can't be seen (another
+        # always-on-top window covers it, or it's off-screen / minimized) does the hotkey mean
+        # "bring Claude to me" and raise+focus instead. macOS keeps the focus-only rule
+        # (its window_in_view is always False).
         if not self.visible:
             self._show_window()
             return
         try:
-            hwnd = _user32.GetAncestor(self.root.winfo_id(), 2) or self.root.winfo_id()
-            fg = _user32.GetForegroundWindow()
+            hwnd = self._hwnd()
+            in_front = _user32.GetForegroundWindow() == hwnd or window_in_view(hwnd)
         except Exception:
-            hwnd, fg = 1, 0
-        if fg == hwnd:
+            in_front = True    # can't tell → still toggle; a hotkey that never hides is the bug
+        if in_front:
+            self.visible = False     # before withdraw: the <FocusIn> it triggers must see "hidden"
             self.root.withdraw()
-            self.visible = False
         else:
             self._show_window()
 
