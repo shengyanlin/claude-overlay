@@ -1133,6 +1133,13 @@ def window_title(hwnd):
         return ""
 
 
+def window_in_view(hwnd):
+    """win32utils' "can the user see it?" test, used by the hotkey toggle. Always False
+    here, which keeps the macOS hotkey on its focus-only rule: hide while the overlay is
+    the key window, otherwise bring it forward."""
+    return False
+
+
 @_pooled
 def window_bbox(hwnd):
     """Screen-space (l,t,r,b) of a window, clipped to the desktop, in the points that

@@ -639,6 +639,48 @@ def foreground_capture_window():
         return None
 
 
+_user32.WindowFromPoint.argtypes = [wt.POINT]
+_user32.WindowFromPoint.restype = wt.HWND
+_user32.MonitorFromPoint.argtypes = [wt.POINT, wt.DWORD]
+_user32.MonitorFromPoint.restype = wt.HMONITOR
+MONITOR_DEFAULTTONULL = 0
+
+
+def window_in_view(hwnd):
+    """True when the user can actually see the window: shown, not minimized, and on top
+    at most of five points sampled across it (the centre and the four quarter points,
+    which sit inside the rounded region and inside the collapsed orb's ellipse too).
+    WindowFromPoint answers "whose pixel is this?" the way a click would, so a covering
+    always-on-top window or an off-screen position both read as NOT in view, while
+    click-through overlays (WS_EX_TRANSPARENT) are skipped as they should be. A point
+    landing on one of our own windows (a menu or tooltip over the overlay) still counts.
+    WindowFromPoint only compares window rectangles and never asks whether a monitor is
+    there, so a point must also lie on a monitor: a window stranded where an unplugged
+    screen used to be still "owns" its points, but nobody can see them.
+    Any failure reads as False, so the caller falls back to "bring it forward"."""
+    try:
+        if not window_capturable(hwnd):
+            return False
+        rc = wt.RECT()
+        if not _user32.GetWindowRect(hwnd, ctypes.byref(rc)):
+            return False
+        w, h = rc.right - rc.left, rc.bottom - rc.top
+        if w <= 0 or h <= 0:
+            return False
+        hits = 0
+        for fx, fy in ((.5, .5), (.25, .25), (.75, .25), (.25, .75), (.75, .75)):
+            pt = wt.POINT(rc.left + int(w * fx), rc.top + int(h * fy))
+            if not _user32.MonitorFromPoint(pt, MONITOR_DEFAULTTONULL):
+                continue
+            hit = _user32.WindowFromPoint(pt)
+            top = (_user32.GetAncestor(hit, GA_ROOT) or hit) if hit else None
+            if top and (top == hwnd or window_is_own(top)):
+                hits += 1
+        return hits >= 3
+    except Exception:
+        return False
+
+
 def window_title(hwnd):
     """The window's title bar text ('' on failure) — labels the shot for the model."""
     try:
